@@ -361,6 +361,8 @@ void mesh_free(Mesh *m)
     free(m->p); free(m->c); free(m->vs);
     free(m->fo); free(m->fi); free(m->fs);
     free(m->ev); free(m->ef); free(m->es); free(m->eh);
+    free(m->uv);
+    tex_release(m->tex);
     memset(m, 0, sizeof *m);
 }
 
@@ -385,6 +387,8 @@ Mesh mesh_copy(const Mesh *s)
     m.ef = dup_mem(s->ef, 2 * s->ne * sizeof(int));
     m.es = dup_mem(s->es, s->ne);
     m.eh = s->eh ? dup_mem(s->eh, s->ne) : xcalloc(s->ne, 1);
+    m.uv = s->uv ? dup_mem(s->uv, 2 * ni * sizeof(float)) : NULL;
+    m.tex = tex_retain(s->tex);
     return m;
 }
 
@@ -496,12 +500,1014 @@ int mesh_vmask(const Mesh *m, int comp, unsigned char *mask)
     return n;
 }
 
+/* ---------------------------------------------------------------- textures and uvs */
+
+static unsigned texSeq, uvSeq;
+
+Tex *tex_new(int w, int h)
+{
+    Tex *t = xcalloc(1, sizeof *t);
+    t->w = w > 0 ? w : 1;
+    t->h = h > 0 ? h : 1;
+    t->refs = 1;
+    t->id = ++texSeq;
+    t->px = xcalloc((size_t)t->w * t->h, 4);
+    return t;
+}
+
+Tex *tex_retain(Tex *t)
+{
+    if (t) t->refs++;
+    return t;
+}
+
+void tex_release(Tex *t)
+{
+    if (t && --t->refs <= 0) {
+        free(t->px);
+        free(t);
+    }
+}
+
+Tex *tex_own(Mesh *m)
+{
+    Tex *t = m->tex;
+    if (!t || t->refs <= 1) return t;
+    Tex *c = tex_new(t->w, t->h);
+    memcpy(c->px, t->px, (size_t)t->w * t->h * 4);
+    tex_release(t);
+    return m->tex = c;
+}
+
+void mesh_uv_changed(Mesh *m) { m->uvid = ++uvSeq; }
+
+void mesh_uv_scale(Mesh *m, float sx, float sy)
+{
+    if (!m->uv) return;
+    for (int c = 0; c < m->fo[m->nf]; c++) {
+        m->uv[2 * c] *= sx;
+        m->uv[2 * c + 1] *= sy;
+    }
+    mesh_uv_changed(m);
+}
+
+static float sdiv(float a, float b) { return b != 0 ? a / b : 0; }
+
+/* closest point to p on triangle a b c (Ericson); w gets its barycentric weights */
+static V3 tri_closest(V3 p, V3 a, V3 b, V3 c, float w[3])
+{
+    V3 ab = v3sub(b, a), ac = v3sub(c, a), ap = v3sub(p, a);
+    float d1 = v3dot(ab, ap), d2 = v3dot(ac, ap);
+    if (d1 <= 0 && d2 <= 0) { w[0] = 1; w[1] = w[2] = 0; return a; }
+    V3 bp = v3sub(p, b);
+    float d3 = v3dot(ab, bp), d4 = v3dot(ac, bp);
+    if (d3 >= 0 && d4 <= d3) { w[1] = 1; w[0] = w[2] = 0; return b; }
+    float vc = d1 * d4 - d3 * d2;
+    if (vc <= 0 && d1 >= 0 && d3 <= 0) {
+        float v = sdiv(d1, d1 - d3);
+        w[0] = 1 - v; w[1] = v; w[2] = 0;
+        return v3add(a, v3mul(ab, v));
+    }
+    V3 cp = v3sub(p, c);
+    float d5 = v3dot(ab, cp), d6 = v3dot(ac, cp);
+    if (d6 >= 0 && d5 <= d6) { w[2] = 1; w[0] = w[1] = 0; return c; }
+    float vb = d5 * d2 - d1 * d6;
+    if (vb <= 0 && d2 >= 0 && d6 <= 0) {
+        float t = sdiv(d2, d2 - d6);
+        w[0] = 1 - t; w[1] = 0; w[2] = t;
+        return v3add(a, v3mul(ac, t));
+    }
+    float va = d3 * d6 - d5 * d4;
+    if (va <= 0 && d4 - d3 >= 0 && d5 - d6 >= 0) {
+        float t = sdiv(d4 - d3, (d4 - d3) + (d5 - d6));
+        w[0] = 0; w[1] = 1 - t; w[2] = t;
+        return v3add(b, v3mul(v3sub(c, b), t));
+    }
+    float den = sdiv(1, va + vb + vc), v = vb * den, t = vc * den;
+    w[0] = 1 - v - t; w[1] = v; w[2] = t;
+    return v3add(a, v3add(v3mul(ab, v), v3mul(ac, t)));
+}
+
+/* closest point on face f (its fan triangles) to p: returns the squared distance; *tk gets the fan
+   triangle (corners fo[f], fo[f] + tk, fo[f] + tk + 1) and w the weights in it */
+static float face_closest(const Mesh *m, int f, V3 p, int *tk, float w[3])
+{
+    int s = m->fo[f], n = m->fo[f + 1] - s;
+    float best = 1e30f;
+    V3 a = m->p[m->fi[s]];
+    *tk = 1;
+    w[0] = 1; w[1] = w[2] = 0;
+    for (int k = 1; k + 1 < n; k++) {
+        float ww[3];
+        V3 d = v3sub(tri_closest(p, a, m->p[m->fi[s + k]], m->p[m->fi[s + k + 1]], ww), p);
+        float dd = v3dot(d, d);
+        if (dd < best) { best = dd; *tk = k; memcpy(w, ww, sizeof ww); }
+    }
+    return best;
+}
+
+static void face_uv_at(const Mesh *m, int f, int tk, const float w[3], float out[2])
+{
+    int s = m->fo[f], c[3] = { s, s + tk, s + tk + 1 };
+    out[0] = out[1] = 0;
+    for (int j = 0; j < 3; j++) {
+        out[0] += w[j] * m->uv[2 * c[j]];
+        out[1] += w[j] * m->uv[2 * c[j] + 1];
+    }
+}
+
+/* squared size (bounding box diagonal) of face f */
+static float face_size2(const Mesh *m, int f)
+{
+    V3 lo = m->p[m->fi[m->fo[f]]], hi = lo;
+    for (int c = m->fo[f] + 1; c < m->fo[f + 1]; c++) {
+        V3 p = m->p[m->fi[c]];
+        lo = v3(fminf(lo.x, p.x), fminf(lo.y, p.y), fminf(lo.z, p.z));
+        hi = v3(fmaxf(hi.x, p.x), fmaxf(hi.y, p.y), fmaxf(hi.z, p.z));
+    }
+    V3 d = v3sub(hi, lo);
+    return v3dot(d, d);
+}
+
+static int same_pos(V3 a, V3 b) { return a.x == b.x && a.y == b.y && a.z == b.z; }
+
+static int uv_same(const float *a, const float *b) { return fabsf(a[0] - b[0]) < 1e-3f && fabsf(a[1] - b[1]) < 1e-3f; }
+
+/* do the two faces of edge e meet with the same uvs along it? */
+static int uv_cont(const Mesh *m, int e)
+{
+    int f0 = m->ef[2 * e], f1 = m->ef[2 * e + 1];
+    if (f0 < 0 || f1 < 0 || !m->uv) return 0;
+    for (int k = 0; k < 2; k++) {
+        int v = m->ev[2 * e + k], c0 = corner_at(m, f0, v), c1 = corner_at(m, f1, v);
+        if (c0 < 0 || c1 < 0 || !uv_same(m->uv + 2 * c0, m->uv + 2 * c1)) return 0;
+    }
+    return 1;
+}
+
+/* the edge from each corner to the next one in its face (-1 for a repeated vertex) */
+static int *corner_edges(const Mesh *m)
+{
+    int nc = m->fo[m->nf], *ce = xrealloc(NULL, (nc + 1) * sizeof(int));
+    HMap h;
+    edge_map(&h, m);
+    for (int f = 0; f < m->nf; f++)
+        for (int c = m->fo[f]; c < m->fo[f + 1]; c++) {
+            int nx = c + 1 < m->fo[f + 1] ? c + 1 : m->fo[f];
+            ce[c] = m->fi[c] == m->fi[nx] ? -1 : edge_at(&h, m->fi[c], m->fi[nx]);
+        }
+    hm_free(&h);
+    return ce;
+}
+
+int mesh_uv_islands(const Mesh *m, int *fisl)
+{
+    int *par = xrealloc(NULL, (m->nf + 1) * sizeof(int)), *id = xrealloc(NULL, (m->nf + 1) * sizeof(int)), n = 0;
+    for (int f = 0; f < m->nf; f++) { par[f] = f; id[f] = -1; }
+    for (int e = 0; e < m->ne; e++)
+        if (uv_cont(m, e)) par[find_root(par, m->ef[2 * e])] = find_root(par, m->ef[2 * e + 1]);
+    for (int f = 0; f < m->nf; f++) {
+        int r = find_root(par, f);
+        if (id[r] < 0) id[r] = n++;
+        fisl[f] = id[r];
+    }
+    free(par);
+    free(id);
+    return n;
+}
+
+typedef void (*TexelFn)(void *ctx, int x, int y, const float w[3]);
+
+/* calls fn for each pixel whose center is inside triangle a b c (pixel coordinates; a center right on
+   an edge counts), with the center's barycentric weights */
+static void raster_tri(const float *a, const float *b, const float *c, int W, int H, TexelFn fn, void *ctx)
+{
+    float area = (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0]);
+    if (!(fabsf(area) >= 1e-8f)) return;   /* also NaN */
+    float x0f = fminf(a[0], fminf(b[0], c[0])), x1f = fmaxf(a[0], fmaxf(b[0], c[0]));
+    float y0f = fminf(a[1], fminf(b[1], c[1])), y1f = fmaxf(a[1], fmaxf(b[1], c[1]));
+    if (x1f < 0 || y1f < 0 || x0f > W || y0f > H) return;
+    int x0 = x0f < 0 ? 0 : (int)floorf(x0f), x1 = x1f > W ? W : (int)ceilf(x1f);
+    int y0 = y0f < 0 ? 0 : (int)floorf(y0f), y1 = y1f > H ? H : (int)ceilf(y1f);
+    float ia = 1 / area;
+    for (int y = y0; y < y1; y++)
+        for (int x = x0; x < x1; x++) {
+            float px = x + 0.5f, py = y + 0.5f, w[3];
+            w[0] = ((b[0] - px) * (c[1] - py) - (b[1] - py) * (c[0] - px)) * ia;
+            w[1] = ((c[0] - px) * (a[1] - py) - (c[1] - py) * (a[0] - px)) * ia;
+            w[2] = 1 - w[0] - w[1];
+            if (w[0] >= -1e-5f && w[1] >= -1e-5f && w[2] >= -1e-5f) fn(ctx, x, y, w);
+        }
+}
+
+typedef struct { int *out, W, f; } TFCtx;
+
+static void tf_put(void *ctx, int x, int y, const float w[3])
+{
+    TFCtx *c = ctx;
+    (void)w;
+    c->out[y * c->W + x] = c->f;
+}
+
+void mesh_texel_faces(const Mesh *m, int *out)
+{
+    if (!m->tex || !m->uv) return;
+    int W = m->tex->w, H = m->tex->h;
+    for (int i = 0; i < W * H; i++) out[i] = -1;
+    TFCtx c = { out, W, 0 };
+    for (c.f = 0; c.f < m->nf; c.f++) {
+        int s = m->fo[c.f];
+        for (int k = 1; s + k + 1 < m->fo[c.f + 1]; k++)
+            raster_tri(m->uv + 2 * s, m->uv + 2 * (s + k), m->uv + 2 * (s + k + 1), W, H, tf_put, &c);
+    }
+}
+
+/* the pixel of t at (u, v); a point just outside every face (on an island's edge, or a face squashed
+   to a line) takes the nearest pixel a face covers */
+static const unsigned char *tex_at(const Tex *t, const int *cov, float u, float v)
+{
+    int W = t->w, H = t->h;
+    if (u != u) u = 0;
+    if (v != v) v = 0;
+    u = u < -2 ? -2 : u > W + 2 ? W + 2 : u;
+    v = v < -2 ? -2 : v > H + 2 ? H + 2 : v;
+    int x = (int)floorf(u), y = (int)floorf(v);
+    x = x < 0 ? 0 : x >= W ? W - 1 : x;
+    y = y < 0 ? 0 : y >= H ? H - 1 : y;
+    if (!cov || cov[y * W + x] >= 0) return t->px + 4 * ((size_t)y * W + x);
+    int best = -1;
+    float bd = 1e30f;
+    for (int yy = y - 2; yy <= y + 2; yy++)
+        for (int xx = x - 2; xx <= x + 2; xx++) {
+            if (xx < 0 || yy < 0 || xx >= W || yy >= H || cov[yy * W + xx] < 0) continue;
+            float dx = xx + 0.5f - u, dy = yy + 0.5f - v, d = dx * dx + dy * dy;
+            if (d < bd) { bd = d; best = yy * W + xx; }
+        }
+    return t->px + 4 * (size_t)(best >= 0 ? best : y * W + x);
+}
+
+static int px_same(const unsigned char *a, const unsigned char *b) { return (a[3] == 0 && b[3] == 0) || !memcmp(a, b, 4); }
+
+int tex_fill(Tex *t, const int *tf, int x, int y, const unsigned char rgba[4])
+{
+    int W = t->w, H = t->h, n = 0;
+    if (x < 0 || y < 0 || x >= W || y >= H || tf[y * W + x] < 0) return 0;
+    unsigned char old[4];
+    memcpy(old, t->px + 4 * ((size_t)y * W + x), 4);
+    if (px_same(old, rgba)) return 0;
+    int *st = xrealloc(NULL, (size_t)W * H * sizeof(int)), ns = 0;
+    st[ns++] = y * W + x;
+    memcpy(t->px + 4 * (size_t)st[0], rgba, 4);
+    n++;
+    while (ns) {
+        int i = st[--ns], cx = i % W, cy = i / W;
+        int nb[4] = { cx > 0 ? i - 1 : -1, cx < W - 1 ? i + 1 : -1, cy > 0 ? i - W : -1, cy < H - 1 ? i + W : -1 };
+        for (int k = 0; k < 4; k++) {
+            int j = nb[k];
+            if (j < 0 || tf[j] < 0 || !px_same(t->px + 4 * (size_t)j, old)) continue;
+            memcpy(t->px + 4 * (size_t)j, rgba, 4);
+            st[ns++] = j;
+            n++;
+        }
+    }
+    free(st);
+    t->ver++;
+    return n;
+}
+
+/* ---- carrying uvs through mesh ops
+
+   When an op rebuilds a textured mesh, every new face looks for the old face it lies on (the closest
+   one around its corners). Corners where an old corner was keep that corner's uv; new corners (cuts,
+   bevels) get the uv of the spot they sit on. A face that lies on no old face (a filled hole, a
+   bridge) shows the one pixel nearest its middle until Pixel Unwrap gives it pixels of its own. */
+
+typedef struct { const Mesh *m; int *ord, n; float *key; } CornerIx;   /* old corners sorted along a slant */
+
+static const float *sortKey;
+static int cmp_key(const void *a, const void *b)
+{
+    float d = sortKey[*(const int *)a] - sortKey[*(const int *)b];
+    return d > 0 ? 1 : d < 0 ? -1 : 0;
+}
+
+static V3 slant(void) { return v3norm(v3(0.5773503f, 0.6157731f, 0.5360563f)); }
+
+static void ix_build(CornerIx *ix, const Mesh *m)
+{
+    int nc = m->fo[m->nf];
+    float *k = xrealloc(NULL, (nc + 1) * sizeof(float));
+    V3 s = slant();
+    ix->m = m;
+    ix->n = nc;
+    ix->ord = xrealloc(NULL, (nc + 1) * sizeof(int));
+    for (int c = 0; c < nc; c++) { ix->ord[c] = c; k[c] = v3dot(m->p[m->fi[c]], s); }
+    sortKey = k;
+    qsort(ix->ord, nc, sizeof(int), cmp_key);
+    ix->key = xrealloc(NULL, (nc + 1) * sizeof(float));
+    for (int i = 0; i < nc; i++) ix->key[i] = k[ix->ord[i]];
+    free(k);
+}
+
+/* the old corners at the old position nearest to p (up to max of them) */
+static int ix_nearest(const CornerIx *ix, V3 p, int *out, int max)
+{
+    const Mesh *m = ix->m;
+    float k = v3dot(p, slant()), best = 1e30f;
+    int lo = 0, hi = ix->n, bi = -1, n = 0;
+    while (lo < hi) {
+        int mid = (lo + hi) / 2;
+        if (ix->key[mid] < k) lo = mid + 1;
+        else hi = mid;
+    }
+    for (int dir = -1; dir <= 1; dir += 2)
+        for (int i = dir < 0 ? lo - 1 : lo; i >= 0 && i < ix->n; i += dir) {
+            float dk = ix->key[i] - k;
+            if (dk * dk > best) break;
+            V3 d = v3sub(m->p[m->fi[ix->ord[i]]], p);
+            float dd = v3dot(d, d);
+            if (dd < best) { best = dd; bi = i; }
+        }
+    if (bi < 0) return 0;
+    V3 bp = m->p[m->fi[ix->ord[bi]]];
+    int i0 = bi;
+    while (i0 > 0 && ix->key[i0 - 1] == ix->key[bi]) i0--;
+    for (int i = i0; i < ix->n && ix->key[i] == ix->key[bi] && n < max; i++)
+        if (same_pos(m->p[m->fi[ix->ord[i]]], bp)) out[n++] = ix->ord[i];
+    return n;
+}
+
+/* uvs for n, which a mesh op rebuilt from o */
+static float *uv_transfer(const Mesh *o, const Mesh *n)
+{
+    enum { MAXC = 48, MAXH = 64 };
+    int nnc = n->fo[n->nf], onc = o->fo[o->nf];
+    float *uv = xcalloc(2 * (size_t)nnc + 2, sizeof(float));
+    if (!o->nf || !onc || !o->uv) return uv;
+    CornerIx ix;
+    ix_build(&ix, o);
+    int *ce = corner_edges(o), *cface = xrealloc(NULL, (onc + 1) * sizeof(int));
+    unsigned char *cont = xcalloc(o->ne + 1, 1);
+    for (int e = 0; e < o->ne; e++) cont[e] = (unsigned char)uv_cont(o, e);
+    for (int f = 0; f < o->nf; f++)
+        for (int c = o->fo[f]; c < o->fo[f + 1]; c++) cface[c] = f;
+    int cand[MAXC], inS[MAXC], hits[MAXH];
+    for (int F = 0; F < n->nf; F++) {
+        int s = n->fo[F], cnt = n->fo[F + 1] - s, nc = 0;
+        V3 cen = mesh_fcenter(n, F);
+        for (int k = 0; k < cnt; k++) {
+            int h = ix_nearest(&ix, n->p[n->fi[s + k]], hits, MAXH);
+            for (int j = 0; j < h; j++) {
+                int g = cface[hits[j]], dup = 0;
+                for (int i = 0; i < nc && !dup; i++) dup = cand[i] == g;
+                if (!dup && nc < MAXC) cand[nc++] = g;
+            }
+        }
+        if (!nc) continue;
+        /* the old face the new one lies on: nearest to its middle, then the one sharing most corners */
+        V3 nn = v3norm(newell(n->p, n->fi + s, cnt));
+        float fs2 = face_size2(n, F), bd = 1e30f, bdot = -2, bw[3] = { 1, 0, 0 };
+        int bi = 0, bm = -1, btk = 1;
+        for (int i = 0; i < nc; i++) {
+            int g = cand[i], tk, match = 0;
+            float w[3], d = face_closest(o, g, cen, &tk, w), dt = v3dot(nn, mesh_fnormal(o, g));
+            for (int k = 0; k < cnt; k++)
+                for (int c = o->fo[g]; c < o->fo[g + 1]; c++)
+                    if (same_pos(o->p[o->fi[c]], n->p[n->fi[s + k]])) { match++; break; }
+            float eps = 1e-10f + 1e-8f * fs2;
+            if (d < bd - eps || (fabsf(d - bd) <= eps && (match > bm || (match == bm && dt > bdot)))) {
+                bd = d; bi = i; bm = match; bdot = dt; btk = tk;
+                memcpy(bw, w, sizeof w);
+            }
+        }
+        int best = cand[bi];
+        /* faces joined to it without a seam can lend their corners too */
+        memset(inS, 0, sizeof inS);
+        inS[bi] = 1;
+        for (int changed = 1; changed;) {
+            changed = 0;
+            for (int i = 0; i < nc; i++) {
+                if (inS[i]) continue;
+                int g = cand[i];
+                for (int c = o->fo[g]; c < o->fo[g + 1] && !inS[i]; c++) {
+                    int e = ce[c];
+                    if (e < 0 || !cont[e]) continue;
+                    int other = o->ef[2 * e] == g ? o->ef[2 * e + 1] : o->ef[2 * e];
+                    for (int j = 0; j < nc; j++)
+                        if (inS[j] && cand[j] == other) { inS[i] = changed = 1; break; }
+                }
+            }
+        }
+        /* it keeps real pixels if it faces the same way and is made of those faces' corners (a
+           dissolved edge, a filled hole) or lies on the face (a cut); otherwise one flat pixel */
+        int all = 1;
+        for (int k = 0; k < cnt && all; k++) {
+            V3 p = n->p[n->fi[s + k]];
+            int found = 0;
+            for (int i = 0; i < nc && !found; i++)
+                for (int c = o->fo[cand[i]]; inS[i] && c < o->fo[cand[i] + 1] && !found; c++) found = same_pos(o->p[o->fi[c]], p);
+            all = found;
+        }
+        V3 raw = newell(n->p, n->fi + s, cnt);
+        int facing = v3dot(raw, raw) < 1e-24f || v3dot(nn, mesh_fnormal(o, best)) > 0;
+        if (!facing || (!all && bd > 0.0025f * face_size2(o, best) + 1e-12f)) {
+            float u[2];
+            face_uv_at(o, best, btk, bw, u);
+            for (int k = 0; k < cnt; k++) memcpy(uv + 2 * (s + k), u, sizeof u);
+            continue;
+        }
+        for (int k = 0; k < cnt; k++) {
+            V3 p = n->p[n->fi[s + k]];
+            int found = 0;
+            for (int pass = 0; pass < 2 && !found; pass++)
+                for (int i = 0; i < nc && !found; i++) {
+                    if (!inS[i] || (pass == 0) != (i == bi)) continue;
+                    int g = cand[i];
+                    for (int c = o->fo[g]; c < o->fo[g + 1]; c++)
+                        if (same_pos(o->p[o->fi[c]], p)) { memcpy(uv + 2 * (s + k), o->uv + 2 * c, 2 * sizeof(float)); found = 1; break; }
+                }
+            if (!found) {
+                int tk;
+                float w[3];
+                face_closest(o, best, p, &tk, w);
+                face_uv_at(o, best, tk, w, uv + 2 * (s + k));
+            }
+        }
+    }
+    free(ix.ord); free(ix.key); free(ce); free(cface); free(cont);
+    return uv;
+}
+
+/* ---- Pixel Unwrap */
+
+#define UV_GAP 2   /* empty pixels between islands, so nothing bleeds across */
+
+typedef struct { int first, n, w, h, x, y; } Isl;   /* faces list[first .. first + n - 1] */
+
+static float face_uv_area(const Mesh *m, int f)
+{
+    int s = m->fo[f], n = m->fo[f + 1] - s;
+    float a = 0;
+    for (int k = 0; k < n; k++) {
+        const float *p = m->uv + 2 * (s + k), *q = m->uv + 2 * (s + (k + 1) % n);
+        a += p[0] * q[1] - q[0] * p[1];
+    }
+    return fabsf(a) * 0.5f;
+}
+
+static V3 *world_pts(const Mesh *m, M4 xf)
+{
+    V3 *wp = xrealloc(NULL, (m->nv + 1) * sizeof(V3));
+    for (int v = 0; v < m->nv; v++) wp[v] = m4_pt(xf, m->p[v]);
+    return wp;
+}
+
+static int cmp_float(const void *a, const void *b)
+{
+    float d = *(const float *)a - *(const float *)b;
+    return d > 0 ? 1 : d < 0 ? -1 : 0;
+}
+
+float mesh_uv_density(const Mesh *m, M4 xf)
+{
+    if (!m->uv || !m->nf) return 0;
+    V3 *wp = world_pts(m, xf);
+    float *d = xrealloc(NULL, (m->nf + 1) * sizeof(float)), r = 0;
+    int n = 0;
+    for (int f = 0; f < m->nf; f++) {
+        float ua = face_uv_area(m, f), wa = 0.5f * v3len(newell(wp, m->fi + m->fo[f], m->fo[f + 1] - m->fo[f]));
+        if (ua > 0.5f && wa > 1e-12f) d[n++] = sqrtf(ua / wa);
+    }
+    if (n) {
+        qsort(d, n, sizeof(float), cmp_float);
+        r = d[n / 2];
+    }
+    free(wp);
+    free(d);
+    return r;
+}
+
+int mesh_uv_needy(const Mesh *m, M4 xf, unsigned char *fmask)
+{
+    float dens = mesh_uv_density(m, xf);
+    int n = 0;
+    memset(fmask, 0, m->nf);
+    if (!m->uv || dens <= 0) return 0;
+    V3 *wp = world_pts(m, xf);
+    for (int f = 0; f < m->nf; f++) {
+        float wa = 0.5f * v3len(newell(wp, m->fi + m->fo[f], m->fo[f + 1] - m->fo[f])), want = wa * dens * dens;
+        if (want >= 1 && face_uv_area(m, f) < 0.05f * want) { fmask[f] = 1; n++; }
+    }
+    free(wp);
+    return n;
+}
+
+/* up and right on a face facing n: walls stand upright, floors have -Z up and ceilings +Z */
+static void face_frame(V3 n, V3 *R, V3 *U)
+{
+    V3 up = fabsf(n.y) < 0.99f ? v3(0, 1, 0) : v3(0, 0, n.y > 0 ? -1.0f : 1.0f);
+    *U = v3norm(v3sub(up, v3mul(n, v3dot(up, n))));
+    *R = v3cross(*U, n);
+}
+
+static int runs(const Mesh *m, int f, int a, int b)   /* does face f go from a to b? */
+{
+    int s = m->fo[f], n = m->fo[f + 1] - s;
+    for (int k = 0; k < n; k++)
+        if (m->fi[s + k] == a && m->fi[s + (k + 1) % n] == b) return 1;
+    return 0;
+}
+
+static void face_bb(const Mesh *m, const float *c2, int f, float *bb)
+{
+    float *b = bb + 4 * f;
+    b[0] = b[1] = 1e30f;
+    b[2] = b[3] = -1e30f;
+    for (int c = m->fo[f]; c < m->fo[f + 1]; c++) {
+        b[0] = fminf(b[0], c2[2 * c]); b[1] = fminf(b[1], c2[2 * c + 1]);
+        b[2] = fmaxf(b[2], c2[2 * c]); b[3] = fmaxf(b[3], c2[2 * c + 1]);
+    }
+}
+
+/* do two 2D triangles overlap? (separating axes; touching is not overlapping) */
+static int tri2_overlap(const float *a, const float *b)
+{
+    const float *t[2] = { a, b };
+    for (int i = 0; i < 2; i++)
+        for (int k = 0; k < 3; k++) {
+            const float *p = t[i] + 2 * k, *q = t[i] + 2 * ((k + 1) % 3);
+            float nx = q[1] - p[1], ny = p[0] - q[0], mn[2] = { 1e30f, 1e30f }, mx[2] = { -1e30f, -1e30f };
+            for (int j = 0; j < 2; j++)
+                for (int v = 0; v < 3; v++) {
+                    float d = t[j][2 * v] * nx + t[j][2 * v + 1] * ny;
+                    mn[j] = fminf(mn[j], d);
+                    mx[j] = fmaxf(mx[j], d);
+                }
+            if (mx[0] <= mn[1] || mx[1] <= mn[0]) return 0;
+        }
+    return 1;
+}
+
+/* would face f (corners in cf, shrunk a hair so shared edges don't count) cover part of face g
+   (corners in cg)? */
+static int face2_overlap(const Mesh *m, const float *cf, int f, const float *cg, int g)
+{
+    int sf = m->fo[f], nf = m->fo[f + 1] - sf, sg = m->fo[g], ng = m->fo[g + 1] - sg;
+    float cx = 0, cy = 0, t[6], u[6];
+    for (int k = 0; k < nf; k++) { cx += cf[2 * (sf + k)]; cy += cf[2 * (sf + k) + 1]; }
+    cx /= nf;
+    cy /= nf;
+    for (int i = 1; i + 1 < nf; i++) {
+        int ci[3] = { sf, sf + i, sf + i + 1 };
+        for (int j = 0; j < 3; j++) {
+            t[2 * j] = cx + (cf[2 * ci[j]] - cx) * 0.9999f;
+            t[2 * j + 1] = cy + (cf[2 * ci[j] + 1] - cy) * 0.9999f;
+        }
+        for (int j = 1; j + 1 < ng; j++) {
+            int cj[3] = { sg, sg + j, sg + j + 1 };
+            for (int q = 0; q < 3; q++) { u[2 * q] = cg[2 * cj[q]]; u[2 * q + 1] = cg[2 * cj[q] + 1]; }
+            if (tri2_overlap(t, u)) return 1;
+        }
+    }
+    return 0;
+}
+
+/* an island while it grows: its faces are a list through nextf */
+typedef struct { int head, tail, n, folded; float fold[2], box[4]; } Grow;
+
+static int cmp_key_idx(const void *a, const void *b)
+{
+    int r = cmp_key(a, b);
+    return r ? r : *(const int *)a - *(const int *)b;
+}
+
+/* face f alone, laid flat as its own frame sees it */
+static void grow_seed(const Mesh *m, const V3 *wp, const V3 *fn, float *c2, float *bb, int *isl, int *nextf, Grow *gr, int id, int f)
+{
+    V3 R, U;
+    face_frame(fn[f], &R, &U);
+    for (int c = m->fo[f]; c < m->fo[f + 1]; c++) {
+        c2[2 * c] = v3dot(wp[m->fi[c]], R);
+        c2[2 * c + 1] = v3dot(wp[m->fi[c]], U);
+    }
+    face_bb(m, c2, f, bb);
+    isl[f] = id;
+    nextf[f] = -1;
+    gr[id].head = gr[id].tail = f;
+    gr[id].n = 1;
+    gr[id].folded = 0;
+    gr[id].fold[0] = gr[id].fold[1] = 0;
+    memcpy(gr[id].box, bb + 4 * f, sizeof gr[id].box);
+}
+
+static int box_hit(const float *a, const float *b) { return a[0] < b[2] && b[0] < a[2] && a[1] < b[3] && b[1] < a[3]; }
+
+/* join the islands on the two sides of edge e: the smaller one turns and moves so its copy of the
+   edge lands on the bigger one's. 0 if they would overlap, or a bend would make the island fork. */
+static int grow_join(const Mesh *m, float *c2, float *t2, float *bb, int *isl, int *nextf, Grow *gr, int e, int bent)
+{
+    int a = m->ev[2 * e], b = m->ev[2 * e + 1], fx = m->ef[2 * e], fy = m->ef[2 * e + 1];
+    if (gr[isl[fy]].n > gr[isl[fx]].n) { int t = fx; fx = fy; fy = t; }
+    Grow *X = &gr[isl[fx]], *Y = &gr[isl[fy]];
+    int ax = corner_at(m, fx, a), bx = corner_at(m, fx, b), ay = corner_at(m, fy, a), by = corner_at(m, fy, b);
+    if (ax < 0 || bx < 0 || ay < 0 || by < 0) return 0;
+    float px = c2[2 * bx] - c2[2 * ax], py = c2[2 * bx + 1] - c2[2 * ax + 1], qx = c2[2 * by] - c2[2 * ay], qy = c2[2 * by + 1] - c2[2 * ay + 1];
+    float lp = sqrtf(px * px + py * py), lq = sqrtf(qx * qx + qy * qy);
+    if (lp < 1e-12f || lq < 1e-12f) return 0;
+    float th = atan2f(py, px) - atan2f(qy, qx), cs = cosf(th), sn = sinf(th), dx = px / lp, dy = py / lp;
+    float tx = c2[2 * ax] - (cs * c2[2 * ay] - sn * c2[2 * ay + 1]), ty = c2[2 * ax + 1] - (sn * c2[2 * ay] + cs * c2[2 * ay + 1]);
+    float yf[2] = { cs * Y->fold[0] - sn * Y->fold[1], sn * Y->fold[0] + cs * Y->fold[1] };
+    if (bent) {
+        if (X->folded && fabsf(X->fold[0] * dx + X->fold[1] * dy) < 0.866f) return 0;
+        if (Y->folded && fabsf(yf[0] * dx + yf[1] * dy) < 0.866f) return 0;
+    } else if (X->folded && Y->folded && fabsf(X->fold[0] * yf[0] + X->fold[1] * yf[1]) < 0.866f) {
+        return 0;
+    }
+    float ybox[4] = { 1e30f, 1e30f, -1e30f, -1e30f };
+    for (int f = Y->head; f >= 0; f = nextf[f])
+        for (int c = m->fo[f]; c < m->fo[f + 1]; c++) {
+            float x = c2[2 * c], y = c2[2 * c + 1];
+            t2[2 * c] = cs * x - sn * y + tx;
+            t2[2 * c + 1] = sn * x + cs * y + ty;
+            ybox[0] = fminf(ybox[0], t2[2 * c]); ybox[1] = fminf(ybox[1], t2[2 * c + 1]);
+            ybox[2] = fmaxf(ybox[2], t2[2 * c]); ybox[3] = fmaxf(ybox[3], t2[2 * c + 1]);
+        }
+    /* flat joins can't overlap (they are the real shape); bends are checked face by face */
+    if (bent && box_hit(ybox, X->box))
+        for (int f = Y->head; f >= 0; f = nextf[f]) {
+            float fb[4];
+            face_bb(m, t2, f, bb);
+            memcpy(fb, bb + 4 * f, sizeof fb);
+            for (int g = X->head; g >= 0; g = nextf[g])
+                if (box_hit(fb, bb + 4 * g) && face2_overlap(m, t2, f, c2, g)) {
+                    for (int r = Y->head; r >= 0; r = nextf[r]) face_bb(m, c2, r, bb);
+                    return 0;
+                }
+        }
+    int xi = isl[fx];
+    for (int f = Y->head; f >= 0; f = nextf[f]) {
+        memcpy(c2 + 2 * m->fo[f], t2 + 2 * m->fo[f], 2 * (m->fo[f + 1] - m->fo[f]) * sizeof(float));
+        face_bb(m, c2, f, bb);
+        isl[f] = xi;
+    }
+    nextf[X->tail] = Y->head;
+    X->tail = Y->tail;
+    X->n += Y->n;
+    Y->n = 0;
+    for (int k = 0; k < 2; k++) { X->box[k] = fminf(X->box[k], ybox[k]); X->box[k + 2] = fmaxf(X->box[k + 2], ybox[k + 2]); }
+    if (!X->folded && (Y->folded || bent)) {
+        X->fold[0] = Y->folded ? yf[0] : dx;
+        X->fold[1] = Y->folded ? yf[1] : dy;
+        X->folded = 1;
+    }
+    return 1;
+}
+
+/* turn an island so face f sits the way its own frame sees it (walls upright) */
+static void upright(const Mesh *m, const V3 *wp, const V3 *fn, float *c2, int f, const int *faces, int nfaces)
+{
+    V3 R, U;
+    face_frame(fn[f], &R, &U);
+    int s = m->fo[f], n = m->fo[f + 1] - s;
+    for (int k = 0; k < n; k++) {
+        int c0 = s + k, c1 = s + (k + 1) % n;
+        V3 d = v3sub(wp[m->fi[c1]], wp[m->fi[c0]]);
+        float qx = v3dot(d, R), qy = v3dot(d, U), px = c2[2 * c1] - c2[2 * c0], py = c2[2 * c1 + 1] - c2[2 * c0 + 1];
+        if (qx * qx + qy * qy < 1e-18f || px * px + py * py < 1e-18f) continue;
+        float th = atan2f(qy, qx) - atan2f(py, px), cs = cosf(th), sn = sinf(th);
+        for (int i = 0; i < nfaces; i++)
+            for (int c = m->fo[faces[i]]; c < m->fo[faces[i] + 1]; c++) {
+                float x = c2[2 * c], y = c2[2 * c + 1];
+                c2[2 * c] = x * cs - y * sn;
+                c2[2 * c + 1] = x * sn + y * cs;
+            }
+        return;
+    }
+}
+
+/* turn an island so the pixel grid runs along its first face: unless one of that face's edges is
+   already level or upright, its longest edge becomes so */
+static void straighten(const Mesh *m, float *c2, int sd, const int *faces, int nfaces)
+{
+    int s = m->fo[sd], n = m->fo[sd + 1] - s;
+    float best = 0, ang = 0, q = PI_F / 2;
+    for (int k = 0; k < n; k++) {
+        const float *p = c2 + 2 * (s + k), *r = c2 + 2 * (s + (k + 1) % n);
+        float dx = r[0] - p[0], dy = r[1] - p[1], len = sqrtf(dx * dx + dy * dy);
+        if (len < 1e-9f) continue;
+        float a = atan2f(dy, dx);
+        a -= q * roundf(a / q);
+        if (fabsf(a) < 0.5f * DEG2RAD) return;
+        if (len > best) { best = len; ang = a; }
+    }
+    if (best <= 0) return;
+    float cs = cosf(-ang), sn = sinf(-ang);
+    for (int i = 0; i < nfaces; i++)
+        for (int c = m->fo[faces[i]]; c < m->fo[faces[i] + 1]; c++) {
+            float x = c2[2 * c], y = c2[2 * c + 1];
+            c2[2 * c] = x * cs - y * sn;
+            c2[2 * c + 1] = x * sn + y * cs;
+        }
+}
+
+static int pot(int x)
+{
+    int p = 1;
+    while (p < x && p < (1 << 28)) p *= 2;
+    return p;
+}
+
+static const Isl *sortIsl;
+static int cmp_isl(const void *a, const void *b)
+{
+    const Isl *p = &sortIsl[*(const int *)a], *q = &sortIsl[*(const int *)b];
+    if (p->h != q->h) return q->h - p->h;
+    if (p->w != q->w) return q->w - p->w;
+    return *(const int *)a - *(const int *)b;
+}
+
+/* rows of islands, tallest first, across width W; returns the height used */
+static int shelf(Isl *is, const int *io, int n, int W, int place)
+{
+    int x = 0, y = 0, rh = 0;
+    for (int i = 0; i < n; i++) {
+        Isl *I = &is[io[i]];
+        if (I->w > W) return 1 << 29;
+        if (x && x + I->w > W) { y += rh + UV_GAP; x = 0; rh = 0; }
+        if (place) { I->x = x; I->y = y; }
+        x += I->w + UV_GAP;
+        if (I->h > rh) rh = I->h;
+    }
+    return y + rh;
+}
+
+static void sat_build(const unsigned char *occ, int W, int H, int *sat)
+{
+    for (int x = 0; x <= W; x++) sat[x] = 0;
+    for (int y = 0; y < H; y++) {
+        int row = 0;
+        sat[(y + 1) * (W + 1)] = 0;
+        for (int x = 0; x < W; x++) {
+            row += occ[y * W + x];
+            sat[(y + 1) * (W + 1) + x + 1] = sat[y * (W + 1) + x + 1] + row;
+        }
+    }
+}
+
+/* first spot, row by row, where a w x h island and the gap around it are free */
+static int find_free(const int *sat, int W, int H, int w, int h, int *ox, int *oy)
+{
+    for (int y = 0; y + h <= H; y++)
+        for (int x = 0; x + w <= W; x++) {
+            int x0 = x - UV_GAP < 0 ? 0 : x - UV_GAP, y0 = y - UV_GAP < 0 ? 0 : y - UV_GAP;
+            int x1 = x + w + UV_GAP > W ? W : x + w + UV_GAP, y1 = y + h + UV_GAP > H ? H : y + h + UV_GAP;
+            int W1 = W + 1;
+            if (!(sat[y1 * W1 + x1] - sat[y0 * W1 + x1] - sat[y1 * W1 + x0] + sat[y0 * W1 + x0])) { *ox = x; *oy = y; return 1; }
+        }
+    return 0;
+}
+
+typedef struct { unsigned char *occ; int W; } OccCtx;
+
+static void occ_put(void *ctx, int x, int y, const float w[3])
+{
+    OccCtx *c = ctx;
+    (void)w;
+    c->occ[y * c->W + x] = 1;
+}
+
+typedef struct {
+    const Mesh *m; const Tex *old; const int *ocov; const float *nuv; Tex *nt; int c[3], bake;
+} FillCtx;
+
+static void fill_put(void *ctx, int x, int y, const float w[3])
+{
+    FillCtx *k = ctx;
+    const Mesh *m = k->m;
+    unsigned char *out = k->nt->px + 4 * ((size_t)y * k->nt->w + x);
+    V3 col = v3(0, 0, 0);
+    for (int j = 0; j < 3; j++) col = v3add(col, v3mul(m->c[m->fi[k->c[j]]], w[j]));
+    float cc[3] = { col.x, col.y, col.z };
+    if (k->old && m->uv) {
+        float u = 0, v = 0;
+        for (int j = 0; j < 3; j++) { u += w[j] * m->uv[2 * k->c[j]]; v += w[j] * m->uv[2 * k->c[j] + 1]; }
+        memcpy(out, tex_at(k->old, k->ocov, u, v), 4);
+        if (k->bake)
+            for (int j = 0; j < 3; j++) {
+                float f = out[j] * (cc[j] < 0 ? 0 : cc[j] > 1 ? 1 : cc[j]);
+                out[j] = (unsigned char)(f + 0.5f);
+            }
+    } else {
+        for (int j = 0; j < 3; j++) out[j] = (unsigned char)((cc[j] < 0 ? 0 : cc[j] > 1 ? 1 : cc[j]) * 255 + 0.5f);
+        out[3] = 255;
+    }
+}
+
+int mesh_pixel_unwrap(Mesh *m, M4 xf, float density, float angle, const unsigned char *fmask, int maxsize)
+{
+    int nf = m->nf, nc = m->fo[nf], partial = fmask && m->uv && m->tex, nuse = 0;
+    if (!nf || !(density > 0)) return 0;
+    unsigned char *use = xcalloc(nf + 1, 1);
+    for (int f = 0; f < nf; f++) nuse += use[f] = (unsigned char)(partial ? fmask[f] != 0 : 1);
+    if (!nuse) { free(use); return 0; }
+
+    V3 *wp = world_pts(m, xf), *fn = xrealloc(NULL, (nf + 1) * sizeof(V3));
+    float *fa = xrealloc(NULL, (nf + 1) * sizeof(float));
+    for (int f = 0; f < nf; f++) {
+        V3 nn = newell(wp, m->fi + m->fo[f], m->fo[f + 1] - m->fo[f]);
+        fa[f] = 0.5f * v3len(nn);
+        fn[f] = v3norm(nn);
+    }
+    /* edges an island may unfold across */
+    int *ce = corner_edges(m);
+    unsigned char *join = xcalloc(m->ne + 1, 1);
+    float ct = angle >= 180 ? -2.0f : cosf(fmaxf(angle, 0.5f) * DEG2RAD) - 1e-6f;
+    for (int e = 0; e < m->ne; e++) {
+        int f0 = m->ef[2 * e], f1 = m->ef[2 * e + 1], a = m->ev[2 * e], b = m->ev[2 * e + 1];
+        int h = m->eh ? m->eh[e] : EH_AUTO;
+        if (f0 < 0 || f1 < 0 || f0 == f1 || !use[f0] || !use[f1] || h == EH_HARD) continue;
+        if (h != EH_SOFT && v3dot(fn[f0], fn[f1]) < ct) continue;
+        join[e] = (unsigned char)(runs(m, f0, a, b) != runs(m, f1, a, b));
+    }
+
+    /* islands: joinable edges go gentlest bend first (flat ones before any bend). Each joins the
+       islands on its two sides if they fit together without overlapping, and an island only bends
+       across edges parallel to its earlier bends, so curved surfaces unfold into strips. */
+    float *c2 = xrealloc(NULL, (2 * (size_t)nc + 2) * sizeof(float)), *t2 = xrealloc(NULL, (2 * (size_t)nc + 2) * sizeof(float));
+    float *bb = xrealloc(NULL, (4 * (size_t)nf + 4) * sizeof(float)), *bend = xrealloc(NULL, (m->ne + 1) * sizeof(float));
+    int *isl = xrealloc(NULL, (nf + 1) * sizeof(int)), *nextf = xrealloc(NULL, (nf + 1) * sizeof(int));
+    int *eo = xrealloc(NULL, (m->ne + 1) * sizeof(int)), *list = xrealloc(NULL, (nf + 1) * sizeof(int));
+    int neo = 0, nl = 0, nis = 0, nb = 0;
+    Grow *gr = xrealloc(NULL, (nf + 1) * sizeof(Grow));
+    for (int f = 0; f < nf; f++) isl[f] = -1;
+    for (int e = 0; e < m->ne; e++)
+        if (join[e]) {
+            bend[e] = 1 - v3dot(fn[m->ef[2 * e]], fn[m->ef[2 * e + 1]]);
+            eo[neo++] = e;
+        }
+    sortKey = bend;
+    qsort(eo, neo, sizeof(int), cmp_key_idx);
+    for (int i = 0; i < neo; i++) {
+        int e = eo[i], f[2] = { m->ef[2 * e], m->ef[2 * e + 1] };
+        for (int k = 0; k < 2; k++)
+            if (isl[f[k]] < 0) grow_seed(m, wp, fn, c2, bb, isl, nextf, gr, nb++, f[k]);
+        if (isl[f[0]] != isl[f[1]]) grow_join(m, c2, t2, bb, isl, nextf, gr, e, bend[e] > 4e-5f);
+    }
+    for (int f = 0; f < nf; f++)
+        if (use[f] && isl[f] < 0) grow_seed(m, wp, fn, c2, bb, isl, nextf, gr, nb++, f);
+    Isl *is = xrealloc(NULL, (nb + 1) * sizeof(Isl));
+    for (int g = 0; g < nb; g++) {
+        if (!gr[g].n) continue;
+        Isl *I = &is[nis++];
+        int big = gr[g].head;
+        I->first = nl;
+        for (int f = gr[g].head; f >= 0; f = nextf[f]) {
+            list[nl++] = f;
+            if (fa[f] > fa[big]) big = f;
+        }
+        I->n = nl - I->first;
+        /* the biggest face sets which way is up, then the pixel grid lines up with it */
+        upright(m, wp, fn, c2, big, list + I->first, I->n);
+        straighten(m, c2, big, list + I->first, I->n);
+        /* to pixels, y down, every corner on a pixel corner */
+        float mnx = 1e30f, mny = 1e30f;
+        for (int j = 0; j < I->n; j++)
+            for (int c = m->fo[list[I->first + j]]; c < m->fo[list[I->first + j] + 1]; c++) {
+                c2[2 * c] *= density;
+                c2[2 * c + 1] *= -density;
+                mnx = fminf(mnx, c2[2 * c]);
+                mny = fminf(mny, c2[2 * c + 1]);
+            }
+        I->w = I->h = 1;
+        for (int j = 0; j < I->n; j++)
+            for (int c = m->fo[list[I->first + j]]; c < m->fo[list[I->first + j] + 1]; c++) {
+                c2[2 * c] = roundf(c2[2 * c] - mnx);
+                c2[2 * c + 1] = roundf(c2[2 * c + 1] - mny);
+                if (c2[2 * c] > I->w) I->w = (int)c2[2 * c];
+                if (c2[2 * c + 1] > I->h) I->h = (int)c2[2 * c + 1];
+            }
+    }
+
+    /* pack */
+    int *io = xrealloc(NULL, (nis + 1) * sizeof(int)), W = 0, H = 0, ok = 1;
+    for (int i = 0; i < nis; i++) io[i] = i;
+    sortIsl = is;
+    qsort(io, nis, sizeof(int), cmp_isl);
+    Tex *old = m->tex;
+    if (!partial) {
+        int maxw = 8;
+        for (int i = 0; i < nis; i++) if (is[i].w > maxw) maxw = is[i].w;
+        /* the smallest texture, but long strips count extra: they're awkward to paint on */
+        long long best = 0;
+        for (int w = pot(maxw); w <= maxsize; w *= 2) {
+            int h = pot(shelf(is, io, nis, w, 0));
+            if (h < 8) h = 8;
+            if (h > maxsize) continue;
+            int aspect = w > h ? w / h : h / w;
+            long long score = (long long)w * h * (aspect > 2 ? aspect / 2 : 1) * 4 + (aspect > 1);
+            if (!W || score < best) { best = score; W = w; H = h; }
+        }
+        if (W) shelf(is, io, nis, W, 1);
+        else ok = 0;
+    } else {
+        /* into the free space of the texture, which grows when nothing fits */
+        W = old->w;
+        H = old->h;
+        unsigned char *occ = xcalloc((size_t)W * H + 1, 1);
+        OccCtx oc = { occ, W };
+        for (int f = 0; f < nf; f++) {
+            if (use[f]) continue;
+            int s = m->fo[f];
+            for (int k = 1; s + k + 1 < m->fo[f + 1]; k++)
+                raster_tri(m->uv + 2 * s, m->uv + 2 * (s + k), m->uv + 2 * (s + k + 1), W, H, occ_put, &oc);
+            for (int c = s; c < m->fo[f + 1]; c++) {   /* faces squashed to a point still use theirs */
+                int x = (int)floorf(m->uv[2 * c]), y = (int)floorf(m->uv[2 * c + 1]);
+                if (x >= 0 && y >= 0 && x < W && y < H) occ[y * W + x] = 1;
+            }
+        }
+        int *sat = xrealloc(NULL, (size_t)(W + 1) * (H + 1) * sizeof(int));
+        sat_build(occ, W, H, sat);
+        for (int i = 0; i < nis && ok; i++) {
+            Isl *I = &is[io[i]];
+            while (!find_free(sat, W, H, I->w, I->h, &I->x, &I->y)) {
+                int W2 = W, H2 = H;
+                if (I->w > W) W2 = pot(I->w);
+                else if (H < W) H2 = H * 2;
+                else W2 = W * 2;
+                if (W2 > maxsize || H2 > maxsize) { ok = 0; break; }
+                unsigned char *o2 = xcalloc((size_t)W2 * H2 + 1, 1);
+                for (int y = 0; y < H; y++) memcpy(o2 + (size_t)y * W2, occ + (size_t)y * W, W);
+                free(occ);
+                occ = o2;
+                W = W2;
+                H = H2;
+                sat = xrealloc(sat, (size_t)(W + 1) * (H + 1) * sizeof(int));
+                sat_build(occ, W, H, sat);
+            }
+            if (!ok) break;
+            for (int y = I->y; y < I->y + I->h; y++) memset(occ + (size_t)y * W + I->x, 1, I->w);
+            sat_build(occ, W, H, sat);
+        }
+        free(occ);
+        free(sat);
+    }
+
+    if (ok) {
+        Tex *nt = tex_new(W, H);
+        int *ocov = NULL;
+        if (old && m->uv) {
+            ocov = xrealloc(NULL, ((size_t)old->w * old->h + 1) * sizeof(int));
+            mesh_texel_faces(m, ocov);
+        }
+        if (partial)
+            for (int y = 0; y < old->h; y++) memcpy(nt->px + (size_t)y * W * 4, old->px + (size_t)y * old->w * 4, (size_t)old->w * 4);
+        float *nuv = xrealloc(NULL, (2 * (size_t)nc + 2) * sizeof(float));
+        if (partial) memcpy(nuv, m->uv, 2 * (size_t)nc * sizeof(float));
+        for (int i = 0; i < nis; i++)
+            for (int j = 0; j < is[i].n; j++) {
+                int f = list[is[i].first + j];
+                for (int c = m->fo[f]; c < m->fo[f + 1]; c++) {
+                    nuv[2 * c] = c2[2 * c] + is[i].x;
+                    nuv[2 * c + 1] = c2[2 * c + 1] + is[i].y;
+                }
+            }
+        FillCtx k = { m, old, ocov, nuv, nt, { 0, 0, 0 }, !partial };
+        for (int f = 0; f < nf; f++) {
+            if (!use[f]) continue;
+            int s = m->fo[f];
+            for (int t = 1; s + t + 1 < m->fo[f + 1]; t++) {
+                k.c[0] = s; k.c[1] = s + t; k.c[2] = s + t + 1;
+                raster_tri(nuv + 2 * s, nuv + 2 * (s + t), nuv + 2 * (s + t + 1), W, H, fill_put, &k);
+            }
+        }
+        free(ocov);
+        free(m->uv);
+        tex_release(m->tex);
+        m->uv = nuv;
+        m->tex = nt;
+        mesh_uv_changed(m);
+        if (!partial)
+            for (int v = 0; v < m->nv; v++) m->c[v] = v3(1, 1, 1);
+    }
+    free(use); free(wp); free(fn); free(fa); free(ce); free(join); free(c2); free(t2); free(bb); free(bend);
+    free(isl); free(nextf); free(eo); free(list); free(gr); free(is); free(io);
+    return ok ? nuse : -1;
+}
+
+/* ---------------------------------------------------------------- mesh rebuilds */
+
 /* b was started with mb_from_verts(m), so its vertex numbers match m's: edge overrides carry over */
 static void mesh_replace(Mesh *m, MB *b)
 {
     for (int e = 0; e < m->ne; e++)
         if (m->eh && m->eh[e]) mb_hard(b, m->ev[2 * e], m->ev[2 * e + 1], m->eh[e]);
     Mesh n = mb_finish(b);
+    if (m->uv && m->tex) {
+        n.uv = uv_transfer(m, &n);
+        n.tex = m->tex;
+        m->tex = NULL;
+        mesh_uv_changed(&n);
+    }
     mesh_free(m);
     *m = n;
 }
@@ -645,6 +1651,13 @@ int mesh_delete_faces(Mesh *m)
 
 int mesh_raycast(const Mesh *m, V3 o, V3 d, float *tout)
 {
+    int tri[3];
+    float b[3];
+    return mesh_raycast_tri(m, o, d, tout, tri, b);
+}
+
+int mesh_raycast_tri(const Mesh *m, V3 o, V3 d, float *tout, int tri[3], float bary[3])
+{
     int best = -1;
     float bt = 1e30f;
     for (int f = 0; f < m->nf; f++) {
@@ -663,7 +1676,12 @@ int mesh_raycast(const Mesh *m, V3 o, V3 d, float *tout)
             float w = v3dot(d, qv) * inv;
             if (w < 0 || u + w > 1) continue;
             float t = v3dot(e2, qv) * inv;
-            if (t > 0 && t < bt) { bt = t; best = f; }
+            if (t > 0 && t < bt) {
+                bt = t;
+                best = f;
+                tri[0] = s; tri[1] = s + k; tri[2] = s + k + 1;
+                bary[0] = 1 - u - w; bary[1] = u; bary[2] = w;
+            }
         }
     }
     if (tout) *tout = bt;
@@ -867,14 +1885,26 @@ int mesh_fill_holes(Mesh *m, const unsigned char *touch)
     return made;
 }
 
+/* reverse the corners of face f (and their uvs) */
+static void face_reverse(Mesh *m, int f)
+{
+    for (int a = m->fo[f], b = m->fo[f + 1] - 1; a < b; a++, b--) {
+        int t = m->fi[a];
+        m->fi[a] = m->fi[b];
+        m->fi[b] = t;
+        if (m->uv) {
+            float u[2];
+            memcpy(u, m->uv + 2 * a, sizeof u);
+            memcpy(m->uv + 2 * a, m->uv + 2 * b, sizeof u);
+            memcpy(m->uv + 2 * b, u, sizeof u);
+        }
+    }
+}
+
 void mesh_flip(Mesh *m)
 {
-    for (int f = 0; f < m->nf; f++)
-        for (int a = m->fo[f], b = m->fo[f + 1] - 1; a < b; a++, b--) {
-            int t = m->fi[a];
-            m->fi[a] = m->fi[b];
-            m->fi[b] = t;
-        }
+    for (int f = 0; f < m->nf; f++) face_reverse(m, f);
+    if (m->uv) mesh_uv_changed(m);
 }
 
 /* ---------------------------------------------------------------- editable face lists
@@ -992,11 +2022,7 @@ int mesh_reverse(Mesh *m, const unsigned char *fmask)
     int n = 0;
     for (int f = 0; f < m->nf; f++) {
         if (fmask && !fmask[f]) continue;
-        for (int a = m->fo[f], b = m->fo[f + 1] - 1; a < b; a++, b--) {
-            int t = m->fi[a];
-            m->fi[a] = m->fi[b];
-            m->fi[b] = t;
-        }
+        face_reverse(m, f);
         n++;
     }
     return n;
@@ -1154,7 +2180,36 @@ Mesh mesh_subset(const Mesh *m, const unsigned char *fmask)
         if (fmask[f]) mb_face(&b, m->fi + m->fo[f], m->fo[f + 1] - m->fo[f], m->fs[f]);
     for (int e = 0; e < m->ne; e++)
         if (m->eh[e]) mb_hard(&b, m->ev[2 * e], m->ev[2 * e + 1], m->eh[e]);
-    return mb_finish(&b);
+    Mesh r = mb_finish(&b);
+    if (m->uv && m->tex) {   /* the faces keep their corners in order, so their uvs copy straight over */
+        int k = 0;
+        r.uv = xrealloc(NULL, (2 * (size_t)r.fo[r.nf] + 2) * sizeof(float));
+        for (int f = 0; f < m->nf; f++) {
+            if (!fmask[f]) continue;
+            int n = m->fo[f + 1] - m->fo[f];
+            memcpy(r.uv + 2 * k, m->uv + 2 * m->fo[f], 2 * n * sizeof(float));
+            k += n;
+        }
+        r.tex = tex_retain(m->tex);
+        mesh_uv_changed(&r);
+    }
+    return r;
+}
+
+/* one texture holding a's picture on top and b's below it (a 1x1 white one for a side without a
+   picture: vertex colors keep showing there); *yb gets where b starts */
+static Tex *tex_stack(const Tex *a, const Tex *b, int *yb)
+{
+    int wa = a ? a->w : 1, ha = a ? a->h : 1, wb = b ? b->w : 1, hb = b ? b->h : 1;
+    Tex *t = tex_new(wa > wb ? wa : wb, ha + UV_GAP + hb);
+    *yb = ha + UV_GAP;
+    for (int k = 0; k < 2; k++) {
+        const Tex *s = k ? b : a;
+        int y0 = k ? *yb : 0;
+        if (!s) { memset(t->px + 4 * (size_t)y0 * t->w, 255, 4); continue; }
+        for (int y = 0; y < s->h; y++) memcpy(t->px + 4 * ((size_t)(y0 + y) * t->w), s->px + 4 * (size_t)y * s->w, 4 * (size_t)s->w);
+    }
+    return t;
 }
 
 void mesh_append(Mesh *dst, const Mesh *src, const M4 *xf)
@@ -1173,7 +2228,36 @@ void mesh_append(Mesh *dst, const Mesh *src, const M4 *xf)
     for (int e = 0; e < src->ne; e++)
         if (src->eh[e]) mb_hard(&b, base + src->ev[2 * e], base + src->ev[2 * e + 1], src->eh[e]);
     free(tmp);
+    /* textures: the faces keep their corners in order (src's maybe reversed), so the uvs line up */
+    float *uv = NULL;
+    Tex *tex = NULL;
+    int dc = dst->fo[dst->nf], sc = src->fo[src->nf], dt = dst->uv && dst->tex && dst->nf, st = src->uv && src->tex && src->nf;
+    if (dt || st) {
+        int yb = 0;
+        if (!dst->nf) tex = tex_retain(src->tex);
+        else tex = tex_stack(dt ? dst->tex : NULL, st ? src->tex : NULL, &yb);
+        uv = xrealloc(NULL, (2 * (size_t)(dc + sc) + 2) * sizeof(float));
+        for (int c = 0; c < dc; c++) {
+            uv[2 * c] = dt ? dst->uv[2 * c] : 0.5f;
+            uv[2 * c + 1] = dt ? dst->uv[2 * c + 1] : 0.5f;
+        }
+        for (int f = 0; f < src->nf; f++) {
+            int s = src->fo[f], n = src->fo[f + 1] - s;
+            for (int k = 0; k < n; k++) {
+                int c = s + (flip ? n - 1 - k : k), o = dc + s + k;
+                uv[2 * o] = st ? src->uv[2 * c] : 0.5f;
+                uv[2 * o + 1] = (st ? src->uv[2 * c + 1] : 0.5f) + yb;
+            }
+        }
+    }
+    free(dst->uv);
+    tex_release(dst->tex);
+    dst->uv = NULL;
+    dst->tex = NULL;
     mesh_replace(dst, &b);
+    dst->uv = uv;
+    dst->tex = tex;
+    if (uv) mesh_uv_changed(dst);
 }
 
 /* faces renumbered through to[] (merged vertices point at the one they join); faces lose repeated
@@ -1929,23 +3013,53 @@ Mesh mesh_prim(const Prim *pp)
 
 /* ---------------------------------------------------------------- OBJ io */
 
-int obj_save(const char *path, int n, const Mesh *const *ms, const M4 *mats, const char *const *names, const float *angles)
+/* path with its extension swapped for ext (".mtl"); *base points at the file name part */
+static void swap_ext(const char *path, const char *ext, char *out, size_t n, const char **base)
+{
+    snprintf(out, n, "%s", path);
+    char *slash = strrchr(out, '/'), *bs = strrchr(out, '\\'), *dot = strrchr(out, '.');
+    if (bs && (!slash || bs > slash)) slash = bs;
+    if (dot && (!slash || dot > slash)) *dot = 0;
+    size_t l = strlen(out);
+    snprintf(out + l, n - l, "%s", ext);
+    *base = slash ? out + (slash - out) + 1 : out;
+}
+
+int obj_save(const char *path, int n, const Mesh *const *ms, const M4 *mats, const char *const *names, const float *angles,
+             const char *const *texfiles)
 {
     FILE *f = fopen(path, "w");
     if (!f) return 0;
-    int colors = 0;
+    int colors = 0, anytex = 0;
     for (int i = 0; i < n && !colors; i++)
         for (int v = 0; v < ms[i]->nv; v++) {
             V3 c = ms[i]->c[v];
             if (c.x != 1 || c.y != 1 || c.z != 1) { colors = 1; break; }
         }
+    for (int i = 0; i < n; i++) anytex |= texfiles && texfiles[i] && texfiles[i][0] && ms[i]->uv && ms[i]->tex;
     fprintf(f, "# tuff3d\n");
-    int base = 1, nbase = 1;
+    if (anytex) {
+        /* one material per textured object, and a plain one so untextured objects don't pick up the
+           previous object's texture */
+        char mp[1024];
+        const char *mb;
+        swap_ext(path, ".mtl", mp, sizeof mp, &mb);
+        FILE *mf = fopen(mp, "w");
+        if (!mf) { fclose(f); return 0; }
+        fprintf(mf, "# tuff3d\nnewmtl tuff3d_plain\nKd 1 1 1\n");
+        for (int i = 0; i < n; i++)
+            if (texfiles[i] && texfiles[i][0] && ms[i]->uv && ms[i]->tex)
+                fprintf(mf, "\nnewmtl %s\nKd 1 1 1\nmap_Kd %s\n", names[i], texfiles[i]);
+        int ok = !ferror(mf);
+        if (fclose(mf) || !ok) { fclose(f); return 0; }
+        fprintf(f, "mtllib %s\n", mb);
+    }
+    int base = 1, nbase = 1, tbase = 1;
     for (int i = 0; i < n; i++) {
         const Mesh *m = ms[i];
         M4 M = mats[i];
         V3 c0 = m4_col(M, 0), c1 = m4_col(M, 1), c2 = m4_col(M, 2);
-        int flip = v3dot(v3cross(c0, c1), c2) < 0;
+        int flip = v3dot(v3cross(c0, c1), c2) < 0, tex = anytex && texfiles[i] && texfiles[i][0] && m->uv && m->tex;
         fprintf(f, "o %s\n", names[i]);
         for (int v = 0; v < m->nv; v++) {
             V3 p = m4_pt(M, m->p[v]);
@@ -1955,7 +3069,7 @@ int obj_save(const char *path, int n, const Mesh *const *ms, const M4 *mats, con
                 fprintf(f, "v %.6g %.6g %.6g\n", p.x, p.y, p.z);
         }
         /* corner normals in world space (inverse transpose), shared where equal */
-        int nc = m->fo[m->nf], *ni = NULL;
+        int nc = m->fo[m->nf], *ni = NULL, *ti = NULL;
         if (angles) {
             V3 *cn = xrealloc(NULL, (nc + 1) * sizeof(V3));
             int *vfirst = xrealloc(NULL, (m->nv + 1) * sizeof(int));
@@ -1980,17 +3094,37 @@ int obj_save(const char *path, int n, const Mesh *const *ms, const M4 *mats, con
             free(cn); free(vfirst);
             fprintf(f, "# tuff3d normal angle %g\ns %s\n", angles[i], angles[i] > 0 ? "1" : "off");
         }
+        if (tex) {
+            /* texture coordinates, 0..1 with v up, shared by a vertex's corners where they agree */
+            int *vfirst = xrealloc(NULL, (m->nv + 1) * sizeof(int));
+            ti = xrealloc(NULL, (nc + 1) * sizeof(int));
+            for (int v = 0; v < m->nv; v++) vfirst[v] = -1;
+            for (int c = 0; c < nc; c++) {
+                int v = m->fi[c];
+                if (vfirst[v] >= 0 && !memcmp(m->uv + 2 * vfirst[v], m->uv + 2 * c, 2 * sizeof(float))) ti[c] = ti[vfirst[v]];
+                else {
+                    ti[c] = tbase++;
+                    fprintf(f, "vt %.7g %.7g\n", m->uv[2 * c] / m->tex->w, 1 - m->uv[2 * c + 1] / m->tex->h);
+                }
+                if (vfirst[v] < 0) vfirst[v] = c;
+            }
+            free(vfirst);
+        }
+        if (anytex) fprintf(f, "usemtl %s\n", tex ? names[i] : "tuff3d_plain");
         for (int fc = 0; fc < m->nf; fc++) {
             int o = m->fo[fc], cnt = m->fo[fc + 1] - o;
             fputc('f', f);
             for (int k = 0; k < cnt; k++) {
                 int c = o + (flip ? cnt - 1 - k : k);
-                if (ni) fprintf(f, " %d//%d", base + m->fi[c], ni[c]);
+                if (ni && ti) fprintf(f, " %d/%d/%d", base + m->fi[c], ti[c], ni[c]);
+                else if (ni) fprintf(f, " %d//%d", base + m->fi[c], ni[c]);
+                else if (ti) fprintf(f, " %d/%d", base + m->fi[c], ti[c]);
                 else fprintf(f, " %d", base + m->fi[c]);
             }
             fputc('\n', f);
         }
         free(ni);
+        free(ti);
         base += m->nv;
     }
     int ok = !ferror(f);
@@ -2013,12 +3147,16 @@ static char *read_line(FILE *f, char **buf, size_t *cap)
     return *buf;
 }
 
+typedef struct { char name[64], map[260]; } ObjMtl;
+
 typedef struct {
     V3 *p, *c; int np, cp;
-    int *fo, *fi; int nf, cf, ni, ci;
-    Mesh *ms; char (*names)[32]; float *angles; int nm, cm;
+    float *vt; int nvt, cvt;
+    int *fo, *fi, *ft; int nf, cf, ni, ci;   /* ft: texture coordinate of each corner, -1 for none */
+    Mesh *ms; char (*names)[32]; float *angles; char (*texs)[260]; int nm, cm;
     char name[32];
     float angle; int exact;   /* shading of the current object: -1 unknown; exact = from our own comment */
+    ObjMtl *mtl; int nmtl, cur, omat;   /* materials, the one in use, the current object's */
     int *map;
 } ObjRead;
 
@@ -2029,7 +3167,8 @@ static void objr_flush(ObjRead *r)
     mb_init(&b);
     r->map = xrealloc(r->map, (r->np + 1) * sizeof(int));
     for (int i = 0; i < r->np; i++) r->map[i] = -1;
-    int *tmp = xrealloc(NULL, (r->ni + 1) * sizeof(int));
+    int *tmp = xrealloc(NULL, (r->ni + 1) * sizeof(int)), *kept = xrealloc(NULL, (r->ni + 1) * sizeof(int)), nk = 0;
+    int tex = r->omat >= 0 && r->mtl[r->omat].map[0];
     for (int f = 0; f < r->nf; f++) {
         int o = r->fo[f], n = r->fo[f + 1] - o, ok = 1;
         for (int k = 0; k < n; k++) {
@@ -2038,7 +3177,12 @@ static void objr_flush(ObjRead *r)
             if (r->map[g] < 0) r->map[g] = mb_vert(&b, r->p[g], r->c[g]);
             tmp[k] = r->map[g];
         }
-        if (ok) mb_face(&b, tmp, n, 0);
+        if (!ok) continue;
+        mb_face(&b, tmp, n, 0);
+        for (int k = 0; k < n; k++) {
+            kept[nk++] = r->ft[o + k];
+            if (r->ft[o + k] < 0 || r->ft[o + k] >= r->nvt) tex = 0;
+        }
     }
     free(tmp);
     if (r->nm == r->cm) {
@@ -2046,15 +3190,75 @@ static void objr_flush(ObjRead *r)
         r->ms = xrealloc(r->ms, r->cm * sizeof(Mesh));
         r->names = xrealloc(r->names, r->cm * sizeof(*r->names));
         r->angles = xrealloc(r->angles, r->cm * sizeof(float));
+        r->texs = xrealloc(r->texs, r->cm * sizeof(*r->texs));
     }
     r->angles[r->nm] = r->angle;
     r->ms[r->nm] = mb_finish(&b);
     memcpy(r->names[r->nm], r->name, 32);
+    r->texs[r->nm][0] = 0;
+    if (tex && nk) {
+        /* 0..1 with v down for now; the caller scales them once it knows the picture's size */
+        Mesh *m = &r->ms[r->nm];
+        m->uv = xrealloc(NULL, (2 * (size_t)nk + 2) * sizeof(float));
+        for (int c = 0; c < nk; c++) {
+            m->uv[2 * c] = r->vt[2 * kept[c]];
+            m->uv[2 * c + 1] = 1 - r->vt[2 * kept[c] + 1];
+        }
+        mesh_uv_changed(m);
+        snprintf(r->texs[r->nm], 260, "%s", r->mtl[r->omat].map);
+    }
+    free(kept);
     r->nm++;
     r->nf = r->ni = 0;
+    r->omat = -1;
 }
 
-int obj_load(const char *path, Mesh **ms, char (**names)[32], float **angles)
+/* the folder part of path (with its slash), or "" */
+static void dir_of(const char *path, char *out, size_t n)
+{
+    const char *a = strrchr(path, '/'), *b = strrchr(path, '\\');
+    if (b && (!a || b > a)) a = b;
+    snprintf(out, n, "%.*s", a ? (int)(a - path + 1) : 0, path);
+}
+
+static int is_abs(const char *p) { return p[0] == '/' || p[0] == '\\' || (p[0] && p[1] == ':'); }
+
+/* materials from an .mtl file: name and picture (map_Kd, relative to the .mtl's folder) */
+static void mtl_read(ObjRead *r, const char *path)
+{
+    FILE *f = fopen(path, "r");
+    if (!f) return;
+    char dir[260], *buf = NULL, *line;
+    size_t cap = 0;
+    dir_of(path, dir, sizeof dir);
+    while ((line = read_line(f, &buf, &cap))) {
+        char *s = line;
+        while (*s == ' ' || *s == '\t') s++;
+        s[strcspn(s, "\r")] = 0;
+        if (!strncmp(s, "newmtl", 6) && (s[6] == ' ' || s[6] == '\t')) {
+            r->mtl = xrealloc(r->mtl, (r->nmtl + 1) * sizeof(ObjMtl));
+            ObjMtl *m = &r->mtl[r->nmtl++];
+            memset(m, 0, sizeof *m);
+            sscanf(s + 7, "%63s", m->name);
+        } else if (!strncmp(s, "map_Kd", 6) && (s[6] == ' ' || s[6] == '\t') && r->nmtl) {
+            char *q = s + 7, *e;
+            while (*q == ' ' || *q == '\t') q++;
+            for (e = q + strlen(q); e > q && (e[-1] == ' ' || e[-1] == '\t'); ) *--e = 0;
+            if (*q == '-') {   /* options (-s 1 1 1 ...): the file is the last word */
+                char *w = strrchr(q, ' '), *t = strrchr(q, '\t');
+                if (t && (!w || t > w)) w = t;
+                if (w) q = w + 1;
+            }
+            ObjMtl *m = &r->mtl[r->nmtl - 1];
+            if (is_abs(q)) snprintf(m->map, sizeof m->map, "%s", q);
+            else snprintf(m->map, sizeof m->map, "%s%s", dir, q);
+        }
+    }
+    free(buf);
+    fclose(f);
+}
+
+int obj_load(const char *path, Mesh **ms, char (**names)[32], float **angles, char (**texfiles)[260])
 {
     FILE *f = fopen(path, "r");
     if (!f) return -1;
@@ -2065,9 +3269,11 @@ int obj_load(const char *path, Mesh **ms, char (**names)[32], float **angles)
     r.fo[0] = 0;
     strcpy(r.name, "imported");
     r.angle = -1;
-    char *buf = NULL;
+    r.cur = r.omat = -1;
+    char *buf = NULL, dir[260];
     size_t cap = 0;
     char *line;
+    dir_of(path, dir, sizeof dir);
     while ((line = read_line(f, &buf, &cap))) {
         char *s = line;
         while (*s == ' ' || *s == '\t') s++;
@@ -2085,6 +3291,13 @@ int obj_load(const char *path, Mesh **ms, char (**names)[32], float **angles)
             r.p[r.np] = v3(a[0], a[1], a[2]);
             r.c[r.np] = v3(a[3], a[4], a[5]);
             r.np++;
+        } else if (s[0] == 'v' && s[1] == 't' && (s[2] == ' ' || s[2] == '\t')) {
+            float u = 0, v = 0;
+            if (sscanf(s + 3, "%f %f", &u, &v) < 1) continue;
+            if (r.nvt == r.cvt) { r.cvt = r.cvt ? r.cvt * 2 : 1024; r.vt = xrealloc(r.vt, 2 * r.cvt * sizeof(float)); }
+            r.vt[2 * r.nvt] = u;
+            r.vt[2 * r.nvt + 1] = v;
+            r.nvt++;
         } else if (s[0] == 'f' && (s[1] == ' ' || s[1] == '\t')) {
             char *q = s + 2;
             int n = 0;
@@ -2092,17 +3305,28 @@ int obj_load(const char *path, Mesh **ms, char (**names)[32], float **angles)
                 while (*q == ' ' || *q == '\t' || *q == '\r') q++;
                 if (!*q) break;
                 char *end;
-                long idx = strtol(q, &end, 10);
+                long idx = strtol(q, &end, 10), ti = 0;
                 if (end == q) break;
+                if (*end == '/' && end[1] != '/') {
+                    char *e2;
+                    ti = strtol(end + 1, &e2, 10);
+                    if (e2 == end + 1) ti = 0;
+                }
                 while (*end && *end != ' ' && *end != '\t' && *end != '\r') end++;
                 q = end;
                 int g = idx < 0 ? r.np + (int)idx : (int)idx - 1;
-                if (r.ni + 1 > r.ci) { r.ci = r.ci ? r.ci * 2 : 1024; r.fi = xrealloc(r.fi, r.ci * sizeof(int)); }
+                if (r.ni + 1 > r.ci) {
+                    r.ci = r.ci ? r.ci * 2 : 1024;
+                    r.fi = xrealloc(r.fi, r.ci * sizeof(int));
+                    r.ft = xrealloc(r.ft, r.ci * sizeof(int));
+                }
+                r.ft[r.ni] = ti < 0 ? r.nvt + (int)ti : ti ? (int)ti - 1 : -1;
                 r.fi[r.ni++] = g;
                 n++;
             }
             if (n < 3) { r.ni -= n; continue; }
             if (r.nf + 2 > r.cf) { r.cf *= 2; r.fo = xrealloc(r.fo, r.cf * sizeof(int)); }
+            if (!r.nf) r.omat = r.cur;
             r.nf++;
             r.fo[r.nf] = r.ni;
         } else if ((s[0] == 'o' || s[0] == 'g') && (s[1] == ' ' || s[1] == '\t')) {
@@ -2118,14 +3342,32 @@ int obj_load(const char *path, Mesh **ms, char (**names)[32], float **angles)
         } else if (!strncmp(s, "# tuff3d normal angle ", 22)) {
             r.angle = (float)atof(s + 22);
             r.exact = 1;
+        } else if (!strncmp(s, "mtllib", 6) && (s[6] == ' ' || s[6] == '\t')) {
+            char mp[600], *q = s + 7, *e;
+            while (*q == ' ' || *q == '\t') q++;
+            for (e = q + strlen(q); e > q && (e[-1] == ' ' || e[-1] == '\t' || e[-1] == '\r'); ) *--e = 0;
+            if (is_abs(q)) snprintf(mp, sizeof mp, "%s", q);
+            else snprintf(mp, sizeof mp, "%s%s", dir, q);
+            mtl_read(&r, mp);
+        } else if (!strncmp(s, "usemtl", 6) && (s[6] == ' ' || s[6] == '\t')) {
+            char nm[64] = "";
+            sscanf(s + 7, "%63s", nm);
+            r.cur = -1;
+            for (int i = 0; i < r.nmtl; i++) if (!strcmp(r.mtl[i].name, nm)) r.cur = i;
+            if (!r.nf) r.omat = r.cur;
         }
     }
     objr_flush(&r);
     fclose(f);
-    free(buf); free(r.p); free(r.c); free(r.fo); free(r.fi); free(r.map);
+    free(buf); free(r.p); free(r.c); free(r.vt); free(r.fo); free(r.fi); free(r.ft); free(r.map); free(r.mtl);
     *ms = r.ms;
     *names = r.names;
     if (angles) *angles = r.angles;
     else free(r.angles);
+    if (texfiles) *texfiles = r.texs;
+    else {
+        for (int i = 0; i < r.nm; i++) { free(r.ms[i].uv); r.ms[i].uv = NULL; }
+        free(r.texs);
+    }
     return r.nm;
 }

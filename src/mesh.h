@@ -31,15 +31,28 @@ M4 m4_persp(float fovy, float aspect, float n, float f);
 M4 m4_lookat(V3 eye, V3 at, V3 up);
 M4 m4_ortho(float l, float r, float b, float t, float n, float f);
 
+/* A texture: RGBA pixels, row 0 at the top like a PNG. Copies of a mesh (undo steps, duplicates)
+   share one; tex_own gives a mesh its own copy before painting. id is new for every texture and
+   ver goes up with every change, so the viewer knows when to upload it again. */
+typedef struct Tex { int w, h, refs; unsigned id, ver; unsigned char *px; } Tex;
+
+Tex *tex_new(int w, int h);                 /* all transparent */
+Tex *tex_retain(Tex *t);
+void tex_release(Tex *t);
+
 /* Polygon mesh. Faces are index lists: face f uses fi[fo[f] .. fo[f+1]-1].
    Edges are derived (mesh_edges) and rebuilt after topology changes.
    vs/es/fs hold the per component selection flags. eh is a per edge shading override:
-   EH_AUTO follows the object's normal angle, EH_HARD / EH_SOFT force it (Harden / Soften Edge). */
+   EH_AUTO follows the object's normal angle, EH_HARD / EH_SOFT force it (Harden / Soften Edge).
+   uv (with tex) textures the mesh: 2 floats per face corner, in texture pixels from the top left
+   (so pixel (x, y) spans x..x+1, y..y+1). Mesh ops carry the uvs over to the faces they make;
+   uvid changes whenever the uvs do. */
 typedef struct Mesh {
     int nv; V3 *p; V3 *c; unsigned char *vs;
     int nf; int *fo; int *fi; unsigned char *fs;
     int ne; int *ev; int *ef; unsigned char *es;   /* ev: 2 verts (lo,hi), ef: up to 2 faces (-1) */
     unsigned char *eh;
+    float *uv; Tex *tex; unsigned uvid;
 } Mesh;
 
 enum { EH_AUTO, EH_HARD, EH_SOFT };
@@ -109,10 +122,48 @@ int mesh_bevel(Mesh *m, const unsigned char *emask, float width);    /* new face
    faces in between. Returns faces made, -1 if the selection is not two runs, -2 if they differ. */
 int mesh_bridge(Mesh *m, const unsigned char *emask, int divs);
 
-/* angles: per mesh normal angle (writes vn + s), or NULL for positions only */
-int obj_save(const char *path, int n, const Mesh *const *ms, const M4 *mats, const char *const *names, const float *angles);
-/* angles (may be NULL): per mesh normal angle from s lines or a tuff3d comment, -1 = not given */
-int obj_load(const char *path, Mesh **ms, char (**names)[32], float **angles);
+/* ---- pixel art textures */
+
+/* Pixel Unwrap: lays faces out flat at 'density' pixels per unit (measured in world space through
+   xf), every corner on a pixel corner, walls upright. Faces join one island across edges that are
+   flat or soft (within 'angle' degrees or Soften Edge; Harden Edge always splits) as long as the
+   unfolded island doesn't overlap itself, and bends only go across edges parallel to the island's
+   other bends, so curved surfaces come out as strips. fmask NULL (or a mesh without uvs): every face, packed
+   into a new power-of-two texture; otherwise only those faces, placed in free space so the rest
+   keep their pixels where they are. Painted pixels follow their faces; faces with no pixels yet
+   get their vertex colors (and the vertex colors turn white). Returns faces laid out, 0 if none,
+   -1 if the texture would be larger than maxsize. */
+int mesh_pixel_unwrap(Mesh *m, M4 xf, float density, float angle, const unsigned char *fmask, int maxsize);
+/* pixels per unit (world space) of the faces that have pixels (the median), 0 if none do */
+float mesh_uv_density(const Mesh *m, M4 xf);
+/* marks the faces whose pixels are missing: squashed flat or to a line (walls of an extrusion, a
+   filled hole) next to that density. Returns how many. */
+int mesh_uv_needy(const Mesh *m, M4 xf, unsigned char *fmask);
+/* the face over each texture pixel (its center), -1 for none; out has tex w*h entries */
+void mesh_texel_faces(const Mesh *m, int *out);
+/* uv islands: faces joined where they share an edge with the same uvs. Returns the count. */
+int mesh_uv_islands(const Mesh *m, int *fisl);
+/* new uvid (call after changing uv by hand) */
+void mesh_uv_changed(Mesh *m);
+/* a texture of its own for m, so it can be painted without changing other copies */
+Tex *tex_own(Mesh *m);
+/* stretch uvs to a texture of another size (a reloaded picture) */
+void mesh_uv_scale(Mesh *m, float sx, float sy);
+/* flood fill from pixel (x, y): the 4-connected pixels of the same color that faces cover */
+int tex_fill(Tex *t, const int *texelFace, int x, int y, const unsigned char rgba[4]);
+/* ray against the faces; on a hit also returns the face's fan triangle (corner indices) and the
+   barycentric weights of the hit in it */
+int mesh_raycast_tri(const Mesh *m, V3 o, V3 d, float *t, int tri[3], float bary[3]);
+
+/* angles: per mesh normal angle (writes vn + s), or NULL for positions only.
+   texfiles (may be NULL): per mesh picture file for textured meshes; they go into a .mtl next to
+   the OBJ (same name) and their uvs into vt lines. */
+int obj_save(const char *path, int n, const Mesh *const *ms, const M4 *mats, const char *const *names, const float *angles,
+             const char *const *texfiles);
+/* angles (may be NULL): per mesh normal angle from s lines or a tuff3d comment, -1 = not given.
+   texfiles (may be NULL): per mesh the picture its material uses (map_Kd, "" for none); those meshes
+   get uvs from 0 to 1 that the caller scales by the picture's size once it has loaded it. */
+int obj_load(const char *path, Mesh **ms, char (**names)[32], float **angles, char (**texfiles)[260]);
 
 /* build a mesh from plain arrays (face f uses fi[fo[f] .. fo[f+1]-1]); c may be NULL for white */
 Mesh mesh_from_arrays(int nv, const V3 *p, const V3 *c, int nf, const int *fo, const int *fi);

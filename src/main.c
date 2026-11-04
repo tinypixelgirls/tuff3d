@@ -25,10 +25,12 @@ typedef struct {
     unsigned order;      /* selection stamp, highest is the lead object */
     Prim prim;           /* construction history, PRIM_NONE once components are edited */
     float nangle;        /* normal angle: 0 = hard shade, 180 = smooth, between = hard over that angle */
+    char tex[MAX_PATH];  /* picture file the texture is linked to: reloaded whenever it changes there */
+    unsigned long long texTime;   /* that file's write time when tuff3d last read or wrote it */
 } Obj;
 
 enum { M_OBJ, M_VERT, M_EDGE, M_FACE, M_MULTI };   /* component modes match COMP_* */
-enum { T_SELECT, T_MOVE, T_ROTATE, T_SCALE, T_PAINT, T_WELD, T_LOOP, T_CUT, NTOOL };
+enum { T_SELECT, T_MOVE, T_ROTATE, T_SCALE, T_PAINT, T_WELD, T_LOOP, T_CUT, T_PIXEL, NTOOL };
 enum { H_NONE, H_X, H_Y, H_Z, H_YZ, H_XZ, H_XY, H_C, H_VIEW };
 
 static Obj *ob;
@@ -46,6 +48,7 @@ static int bridgeDivs;              /* Edit Mesh > Bridge */
 static int liveCmd;                 /* the last step was this op: its settings redo it live */
 static V3 paintCol = { 1, 0, 0 };
 static float paintOpa = 1, paintRad = 40;
+static int pixDens = 16, pixBrush = 1, pixFill, pixGrid = 1, pixErase;   /* Pixel Paint: pixels per unit, brush, bucket, grid, eraser */
 static char g_path[MAX_PATH];
 static char g_msg[200];
 static int lastCmd, lastHandle, hover, modified, snapGrid, snapPoint;
@@ -53,7 +56,7 @@ static unsigned editStamp;
 static int hvObj = -1, hvKind, hvIdx, tracking, hudOn = 1;
 static int dk, dkBtn, mx0, my0, curx = -1000, cury = -1000, selMod;
 static float rad0;
-enum { D_NONE, D_PEND, D_MARQ, D_MANIP, D_TUMBLE, D_PAN, D_DOLLY, D_PAINT, D_BRUSH, D_WELD };   /* preselection highlight (hvKind 0 = whole object) */
+enum { D_NONE, D_PEND, D_MARQ, D_MANIP, D_TUMBLE, D_PAN, D_DOLLY, D_PAINT, D_BRUSH, D_WELD, D_PIXEL, D_PIXBRUSH };   /* preselection highlight (hvKind 0 = whole object) */
 
 static HWND hMain, hView, hPanel, hStatus, hBar;
 static HDC hdc;
@@ -470,6 +473,8 @@ static void snap_free(Snap *s)
     s->o = NULL;
 }
 
+static unsigned long long file_time(const char *path);
+
 static void snap_restore(Snap *s)
 {
     for (int i = 0; i < nob; i++) mesh_free(&ob[i].m);
@@ -480,6 +485,9 @@ static void snap_restore(Snap *s)
     mode = s->mode;
     s->o = NULL;
     normalFrame = 0;
+    /* a linked picture's file time is not part of the undo: undoing a reload must not reload it again */
+    for (int i = 0; i < nob; i++)
+        if (ob[i].tex[0]) ob[i].texTime = file_time(ob[i].tex);
 }
 
 static void stack_push(Snap *st, int *n, Snap s)
@@ -680,13 +688,151 @@ static void draw_edges(const Mesh *m, int selOnly)
     glEnd();
 }
 
+/* ================================================================ textures on the GPU
+
+   An object's texture is uploaded once, then patched where it gets painted. OpenGL 1.1 wants power
+   of two sizes, so it sits in the top left corner of one. Pixels no face covers (the gaps between
+   islands) take the color of the nearest covered pixel there, so island edges never show a dark
+   seam; the picture itself keeps them clear. */
+
+typedef struct {
+    GLuint gl; unsigned glTex, glVer, glUv; int pw, ph;          /* what is uploaded */
+    int *tf, tfw, tfh, nfisl; unsigned tfUv; int *fisl;          /* face over each pixel, island of each face */
+    float *grid; int ngrid; unsigned gridUv, gridGen; float texel;   /* pixel grid lines, size of a pixel */
+} PixCache;
+static PixCache *pxc;
+static int npxc;
+static GLint glMaxTex;
+static unsigned geoGen;
+
+static int pot(int x)
+{
+    int p = 1;
+    while (p < x && p < (1 << 28)) p *= 2;
+    return p;
+}
+
+static PixCache *pix_cache(int i)
+{
+    if (i >= npxc) {
+        pxc = realloc(pxc, (i + 1) * sizeof *pxc);
+        memset(pxc + npxc, 0, (i + 1 - npxc) * sizeof *pxc);
+        npxc = i + 1;
+    }
+    return &pxc[i];
+}
+
+/* the face over each pixel of object i's texture (-1: none), with each face's uv island in fisl */
+static const int *pix_faces(int i)
+{
+    PixCache *c = pix_cache(i);
+    const Mesh *m = &ob[i].m;
+    if (!m->tex || !m->uv) return NULL;
+    if (c->tf && c->tfUv == m->uvid && c->tfw == m->tex->w && c->tfh == m->tex->h && c->nfisl == m->nf) return c->tf;
+    c->tf = realloc(c->tf, ((size_t)m->tex->w * m->tex->h + 1) * sizeof(int));
+    c->fisl = realloc(c->fisl, (m->nf + 1) * sizeof(int));
+    mesh_texel_faces(m, c->tf);
+    mesh_uv_islands(m, c->fisl);
+    c->tfUv = m->uvid;
+    c->tfw = m->tex->w;
+    c->tfh = m->tex->h;
+    c->nfisl = m->nf;
+    return c->tf;
+}
+
+/* the covered pixel that shows at pixel (x, y): itself, or for a pixel no face covers (between
+   islands, or past the picture's edge) the nearest covered one within 2; -1 if none */
+static int pix_shown(const int *tf, int W, int H, int x, int y)
+{
+    int best = -1, bd = 99;
+    if (x >= 0 && y >= 0 && x < W && y < H && tf[y * W + x] >= 0) return y * W + x;
+    for (int yy = y - 2; yy <= y + 2; yy++)
+        for (int xx = x - 2; xx <= x + 2; xx++) {
+            if (xx < 0 || yy < 0 || xx >= W || yy >= H || tf[yy * W + xx] < 0) continue;
+            int dd = (xx - x) * (xx - x) + (yy - y) * (yy - y);
+            if (dd < bd) { bd = dd; best = yy * W + xx; }
+        }
+    return best;
+}
+
+/* uploads pixels x0..x1, y0..y1 of object i's (power of two) texture */
+static void pix_put(int i, int x0, int y0, int x1, int y1)
+{
+    PixCache *c = &pxc[i];
+    const Tex *t = ob[i].m.tex;
+    const int *tf = pix_faces(i);
+    int W = t->w, H = t->h, w = x1 - x0, h = y1 - y0;
+    if (w <= 0 || h <= 0) return;
+    unsigned char *buf = malloc((size_t)w * h * 4);
+    if (!buf) return;
+    for (int y = y0; y < y1; y++)
+        for (int x = x0; x < x1; x++) {
+            unsigned char *d = buf + 4 * ((size_t)(y - y0) * w + (x - x0));
+            int in = x < W && y < H, k = in ? y * W + x : -1, best = pix_shown(tf, W, H, x, y);
+            if (best >= 0) memcpy(d, t->px + 4 * (size_t)best, 4);
+            else if (in) memcpy(d, t->px + 4 * (size_t)k, 4);
+            else memset(d, 0, 4);
+        }
+    glBindTexture(GL_TEXTURE_2D, c->gl);
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+    glTexSubImage2D(GL_TEXTURE_2D, 0, x0, y0, w, h, GL_RGBA, GL_UNSIGNED_BYTE, buf);
+    free(buf);
+}
+
+/* object i's texture on the GPU, uploading it if it changed; 0 if it has none or it is too big */
+static GLuint pix_gl(int i)
+{
+    const Mesh *m = &ob[i].m;
+    if (!m->tex || !m->uv) return 0;
+    if (!glMaxTex) glGetIntegerv(GL_MAX_TEXTURE_SIZE, &glMaxTex);
+    PixCache *c = pix_cache(i);
+    int pw = pot(m->tex->w), ph = pot(m->tex->h);
+    if (pw > glMaxTex || ph > glMaxTex) return 0;
+    if (c->gl && c->glTex == m->tex->id && c->glVer == m->tex->ver && c->glUv == m->uvid && c->pw == pw && c->ph == ph) return c->gl;
+    if (!c->gl) glGenTextures(1, &c->gl);
+    glBindTexture(GL_TEXTURE_2D, c->gl);
+    if (c->pw != pw || c->ph != ph) {
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, pw, ph, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+        c->pw = pw;
+        c->ph = ph;
+    }
+    pix_put(i, 0, 0, pw, ph);
+    c->glTex = m->tex->id;
+    c->glVer = m->tex->ver;
+    c->glUv = m->uvid;
+    return c->gl;
+}
+
+/* is object i's texture on the GPU exactly what is in memory? */
+static int pix_synced(int i)
+{
+    const Mesh *m = &ob[i].m;
+    PixCache *c = pix_cache(i);
+    return m->tex && c->gl && c->glTex == m->tex->id && c->glVer == m->tex->ver && c->glUv == m->uvid;
+}
+
+/* after painting pixels x0..x1, y0..y1 of a texture that was in sync: upload just that part */
+static void pix_patch(int i, int x0, int y0, int x1, int y1)
+{
+    PixCache *c = pix_cache(i);
+    x0 = x0 - 2 < 0 ? 0 : x0 - 2;
+    y0 = y0 - 2 < 0 ? 0 : y0 - 2;
+    x1 = x1 + 2 > c->pw ? c->pw : x1 + 2;
+    y1 = y1 + 2 > c->ph ? c->ph : y1 + 2;
+    pix_put(i, x0, y0, x1, y1);
+}
+
 /* ================================================================ draw cache
 
    Shaded triangles are expanded once into a vertex array (color, shading normal, position per corner)
    and drawn with one glDrawArrays call. The arrays are rebuilt only when geoGen changes, which
    happens on every edit or selection change, so tumbling, hovering and idle redraws are cheap. */
 
-typedef struct { const V3 *key; int nv, nf, ntri; unsigned gen; float *v; V3 lo, hi; } DrawCache;
+typedef struct { const V3 *key; int nv, nf, ntri; unsigned gen, uvid; float *v, *t; V3 lo, hi; } DrawCache;
 static DrawCache *dcache;
 static int ndcache;
 static unsigned geoGen = 1;
@@ -703,10 +849,24 @@ static DrawCache *cache_get(int i)
     DrawCache *c = &dcache[i];
     const Obj *o = &ob[i];
     const Mesh *m = &o->m;
-    if (c->gen == geoGen && c->key == m->p && c->nv == m->nv && c->nf == m->nf) return c;
+    if (c->gen == geoGen && c->key == m->p && c->nv == m->nv && c->nf == m->nf && c->uvid == m->uvid) return c;
     int tint = o->hil && shows(M_FACE), nt = 0;
     for (int f = 0; f < m->nf; f++) nt += m->fo[f + 1] - m->fo[f] - 2;
     c->v = realloc(c->v, (size_t)(nt > 0 ? nt : 1) * 27 * sizeof(float));
+    free(c->t);
+    c->t = NULL;
+    if (m->uv && m->tex) {
+        /* texture coordinates for the power of two texture the picture sits in */
+        float sx = 1.0f / pot(m->tex->w), sy = 1.0f / pot(m->tex->h), *t;
+        t = c->t = malloc((size_t)(nt > 0 ? nt : 1) * 6 * sizeof(float));
+        for (int f = 0; f < m->nf && t; f++) {
+            int s = m->fo[f], n = m->fo[f + 1] - s;
+            for (int k = 1; k + 1 < n; k++) {
+                int cs[3] = { s, s + k, s + k + 1 };
+                for (int j = 0; j < 3; j++) { *t++ = m->uv[2 * cs[j]] * sx; *t++ = m->uv[2 * cs[j] + 1] * sy; }
+            }
+        }
+    }
     V3 *cn = malloc((m->fo[m->nf] + 1) * sizeof(V3));
     mesh_cnormals(m, o->nangle, cn);
     float *w = c->v;
@@ -736,6 +896,7 @@ static DrawCache *cache_get(int i)
     c->nv = m->nv;
     c->nf = m->nf;
     c->gen = geoGen;
+    c->uvid = m->uvid;
     return c;
 }
 
@@ -744,6 +905,7 @@ static void draw_cached(int i, int shade)
 {
     DrawCache *c = cache_get(i);
     if (!c->ntri) return;
+    GLuint tex = shade && c->t ? pix_gl(i) : 0;
     glEnableClientState(GL_VERTEX_ARRAY);
     glVertexPointer(3, GL_FLOAT, 9 * sizeof(float), c->v + 6);
     if (shade) {
@@ -752,7 +914,22 @@ static void draw_cached(int i, int shade)
         glColorPointer(3, GL_FLOAT, 9 * sizeof(float), c->v);
         glNormalPointer(GL_FLOAT, 9 * sizeof(float), c->v + 3);
     }
+    if (tex) {
+        /* pixel art: nearest pixels, vertex colors tint them, clear pixels are cut out */
+        glEnable(GL_TEXTURE_2D);
+        glBindTexture(GL_TEXTURE_2D, tex);
+        glTexEnvi(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_MODULATE);
+        glEnableClientState(GL_TEXTURE_COORD_ARRAY);
+        glTexCoordPointer(2, GL_FLOAT, 0, c->t);
+        glEnable(GL_ALPHA_TEST);
+        glAlphaFunc(GL_GREATER, 0.5f);
+    }
     glDrawArrays(GL_TRIANGLES, 0, c->ntri * 3);
+    if (tex) {
+        glDisableClientState(GL_TEXTURE_COORD_ARRAY);
+        glDisable(GL_TEXTURE_2D);
+        glDisable(GL_ALPHA_TEST);
+    }
     glDisableClientState(GL_COLOR_ARRAY);
     glDisableClientState(GL_NORMAL_ARRAY);
     glDisableClientState(GL_VERTEX_ARRAY);
@@ -1920,8 +2097,9 @@ typedef struct { UINT32 ver; void *cb; BOOL noThread, noCodecs; } GpStartIn;
 typedef struct { UINT w, h; INT stride, fmt; void *scan0; UINT_PTR res; } GpBits;
 typedef struct { INT x, y, w, h; } GpRect;
 
-/* RGBA pixels (bottom row first, ready for OpenGL) of an image file, or NULL */
-static unsigned char *image_load(const char *path, int *w, int *h)
+/* RGBA pixels of an image file (bottom row first, ready for OpenGL, unless topDown), or NULL.
+   An empty path just starts GDI+. */
+static unsigned char *image_load(const char *path, int *w, int *h, int topDown)
 {
     static HMODULE gp;
     static int (WINAPI *Startup)(ULONG_PTR *, const GpStartIn *, void *);
@@ -1944,7 +2122,7 @@ static unsigned char *image_load(const char *path, int *w, int *h)
         if (!Startup || !FromFile || !GetW || !GetH || !Lock || !Unlock || !Dispose || Startup(&tok, &in, NULL)) { FreeLibrary(gp); gp = NULL; return NULL; }
     }
     WCHAR wp[MAX_PATH];
-    if (!MultiByteToWideChar(CP_ACP, 0, path, -1, wp, MAX_PATH)) return NULL;
+    if (!path[0] || !MultiByteToWideChar(CP_ACP, 0, path, -1, wp, MAX_PATH)) return NULL;
     void *bm = NULL;
     UINT iw = 0, ih = 0;
     if (FromFile(wp, &bm) || !bm) return NULL;
@@ -1957,7 +2135,7 @@ static unsigned char *image_load(const char *path, int *w, int *h)
         out = malloc((size_t)iw * ih * 4);
         for (UINT y = 0; y < ih && out; y++) {
             const unsigned char *src = (const unsigned char *)d.scan0 + (size_t)y * d.stride;
-            unsigned char *dst = out + (size_t)(ih - 1 - y) * iw * 4;
+            unsigned char *dst = out + (size_t)(topDown ? y : ih - 1 - y) * iw * 4;
             for (UINT x = 0; x < iw; x++) {
                 dst[4 * x] = src[4 * x + 2];
                 dst[4 * x + 1] = src[4 * x + 1];
@@ -2022,7 +2200,7 @@ static void img_clear(int i)
 static int img_set(int i, const char *path, float size, float ox, float oy, float opa)
 {
     int w, h;
-    unsigned char *px = image_load(path, &w, &h);
+    unsigned char *px = image_load(path, &w, &h, 0);
     if (!px) return 0;
     img_clear(i);
     snprintf(img[i].path, MAX_PATH, "%s", path);
@@ -2104,6 +2282,1096 @@ static void cmd_image(int i)
     msg(b);
 }
 
+/* ================================================================ Pixel Paint
+
+   Pixel art painted straight onto the model, like Aseprite on a 3D canvas. Pixel Unwrap lays the
+   faces out flat at Pixels / Unit with every corner on a pixel corner; the Pixel Paint tool then
+   sets single pixels (or a square brush, or a bucket fill), with Ctrl+click to pick a color and
+   Shift+click for a straight line. Textures live in the .tuff scene and go out as PNG with an OBJ;
+   Edit in Aseprite saves a PNG, opens it there, and reloads it here whenever Aseprite saves. */
+
+static unsigned pal[256];
+static int npal;
+static HWND hPal;
+static char asePath[MAX_PATH];
+static void panel_sync(void);
+static int watchOn;
+
+static const unsigned PAL_DEFAULT[] = {
+    0x101018, 0x353541, 0x6a6a78, 0xa7a7b1, 0xdcdce0, 0xffffff,
+    0x452a20, 0x7a4b2e, 0xb67a4c, 0xe6b486, 0xf6dcc0,
+    0x5e1a25, 0xb02e30, 0xe5613b, 0xf3a33c, 0xfbe56f,
+    0x1b3a2a, 0x2e6a3a, 0x5aa63c, 0xa8d65c,
+    0x14284f, 0x2856a4, 0x3ea0d6, 0x92dcef, 0x2a8888,
+    0x3a1f4e, 0x72388e, 0xb05cbf, 0xee8cb6, 0xf6c8d8, 0xcaa14b,
+};
+
+static unsigned col_rgb(V3 c)
+{
+    int r = (int)(c.x * 255 + .5f), g = (int)(c.y * 255 + .5f), b = (int)(c.z * 255 + .5f);
+    return (unsigned)(r << 16 | g << 8 | b);
+}
+
+static V3 rgb_col(unsigned c) { return v3((c >> 16 & 255) / 255.0f, (c >> 8 & 255) / 255.0f, (c & 255) / 255.0f); }
+
+static void pal_save(void) { reg_set("Palette", REG_BINARY, pal, npal * sizeof(unsigned)); }
+
+static void pal_default(void)
+{
+    npal = (int)(sizeof PAL_DEFAULT / sizeof *PAL_DEFAULT);
+    memcpy(pal, PAL_DEFAULT, sizeof PAL_DEFAULT);
+}
+
+static void pal_load_reg(void)
+{
+    DWORD n = sizeof pal;
+    if (RegGetValueA(HKEY_CURRENT_USER, REG_KEY, "Palette", RRF_RT_REG_BINARY, NULL, pal, &n) == ERROR_SUCCESS && n >= sizeof(unsigned))
+        npal = (int)(n / sizeof(unsigned));
+    else
+        pal_default();
+}
+
+static void pal_add(unsigned c)
+{
+    for (int i = 0; i < npal; i++) if (pal[i] == c) return;
+    if (npal < 256) pal[npal++] = c;
+}
+
+static unsigned long long file_time(const char *path)
+{
+    WIN32_FILE_ATTRIBUTE_DATA a;
+    if (!path[0] || !GetFileAttributesExA(path, GetFileExInfoStandard, &a)) return 0;
+    return (unsigned long long)a.ftLastWriteTime.dwHighDateTime << 32 | a.ftLastWriteTime.dwLowDateTime;
+}
+
+static const char *file_name(const char *p)
+{
+    const char *a = strrchr(p, '\\'), *b = strrchr(p, '/');
+    if (b && (!a || b > a)) a = b;
+    return a ? a + 1 : p;
+}
+
+/* writes RGBA pixels (row 0 at the top) as a PNG through GDI+ */
+static int png_save(const char *path, const unsigned char *px, int w, int h)
+{
+    static int (WINAPI *FromScan0)(INT, INT, INT, INT, BYTE *, void **), (WINAPI *Save)(void *, const WCHAR *, const CLSID *, const void *);
+    static int (WINAPI *Dispose)(void *);
+    static const CLSID png = { 0x557cf406, 0x1a04, 0x11d3, { 0x9a, 0x73, 0x00, 0x00, 0xf8, 0x1e, 0xf3, 0x2e } };
+    int dummy;
+    if (!FromScan0) {
+        unsigned char *t = image_load("", &dummy, &dummy, 0);   /* starts GDI+ */
+        free(t);
+        HMODULE gp = GetModuleHandleA("gdiplus.dll");
+        if (!gp) return 0;
+        FromScan0 = (void *)GetProcAddress(gp, "GdipCreateBitmapFromScan0");
+        Save = (void *)GetProcAddress(gp, "GdipSaveImageToFile");
+        Dispose = (void *)GetProcAddress(gp, "GdipDisposeImage");
+        if (!FromScan0 || !Save || !Dispose) { FromScan0 = NULL; return 0; }
+    }
+    WCHAR wp[MAX_PATH];
+    if (!MultiByteToWideChar(CP_ACP, 0, path, -1, wp, MAX_PATH)) return 0;
+    unsigned char *bgra = malloc((size_t)w * h * 4);
+    if (!bgra) return 0;
+    for (size_t i = 0; i < (size_t)w * h; i++) {
+        bgra[4 * i] = px[4 * i + 2];
+        bgra[4 * i + 1] = px[4 * i + 1];
+        bgra[4 * i + 2] = px[4 * i];
+        bgra[4 * i + 3] = px[4 * i + 3];
+    }
+    void *bm = NULL;
+    int ok = !FromScan0(w, h, w * 4, 0x26200A /* 32bpp ARGB */, bgra, &bm) && bm && !Save(bm, wp, &png, NULL);
+    if (bm) Dispose(bm);
+    free(bgra);
+    return ok;
+}
+
+/* the texture of object i written to its linked file (remembering the write time) */
+static int tex_write(int i, const char *path)
+{
+    Obj *o = &ob[i];
+    if (!o->m.tex || !png_save(path, o->m.tex->px, o->m.tex->w, o->m.tex->h)) return 0;
+    if (path != o->tex) snprintf(o->tex, sizeof o->tex, "%s", path);
+    o->texTime = file_time(o->tex);
+    if (!watchOn) { SetTimer(hMain, 3, 600, NULL); watchOn = 1; }
+    return 1;
+}
+
+/* a picture (RGBA, top row first; taken over) as object i's texture: the same size replaces the
+   pixels, another size stretches the uvs to fit (it is the same layout, scaled) */
+static void tex_take(int i, unsigned char *px, int w, int h)
+{
+    Mesh *m = &ob[i].m;
+    if (m->tex && (w != m->tex->w || h != m->tex->h)) mesh_uv_scale(m, (float)w / m->tex->w, (float)h / m->tex->h);
+    Tex *t = tex_new(w, h);
+    memcpy(t->px, px, (size_t)w * h * 4);
+    free(px);
+    tex_release(m->tex);
+    m->tex = t;
+}
+
+/* a picture file as object i's texture; 0 if it can't be read */
+static int tex_from_file(int i, const char *path)
+{
+    int w, h;
+    unsigned char *px = image_load(path, &w, &h, 1);
+    if (!px) return 0;
+    tex_take(i, px, w, h);
+    return 1;
+}
+
+/* ---- picking pixels: the face and pixel under a screen point */
+
+typedef struct { int obj, face, x, y, tri[3]; float u, v, b[3]; V3 p; } PixHit;
+static PixHit pxh = { -1, -1, 0, 0, { 0, 0, 0 }, 0, 0, { 0, 0, 0 }, { 0, 0, 0 } };
+
+static int pix_hit(int sx, int sy, PixHit *h)
+{
+    V3 o, d;
+    float bt = 1e30f;
+    cam_update();
+    mouse_ray((float)sx, (float)sy, &o, &d);
+    h->obj = -1;
+    for (int i = 0; i < nob; i++) {
+        if (ob[i].hidden) continue;
+        DrawCache *c = cache_get(i);
+        M4 iM = m4_inv(obj_mat(&ob[i]));
+        V3 lo = m4_pt(iM, o), ld = m4_dir(iM, d), pad = v3mul(v3sub(c->hi, c->lo), 1e-3f);
+        if (!ray_box(lo, ld, v3sub(c->lo, pad), v3add(c->hi, pad))) continue;
+        int tri[3];
+        float b[3], t;
+        int f = mesh_raycast_tri(&ob[i].m, lo, ld, &t, tri, b);
+        if (f < 0) continue;
+        V3 wpnt = m4_pt(obj_mat(&ob[i]), v3add(lo, v3mul(ld, t)));
+        float dist = v3len(v3sub(wpnt, o));
+        if (dist >= bt) continue;
+        bt = dist;
+        h->obj = i;
+        h->face = f;
+        memcpy(h->tri, tri, sizeof tri);
+        memcpy(h->b, b, sizeof b);
+        h->p = v3add(lo, v3mul(ld, t));
+    }
+    if (h->obj < 0) return 0;
+    const Mesh *m = &ob[h->obj].m;
+    h->x = h->y = -1;
+    if (!m->uv || !m->tex) return 1;
+    h->u = h->v = 0;
+    for (int j = 0; j < 3; j++) { h->u += h->b[j] * m->uv[2 * h->tri[j]]; h->v += h->b[j] * m->uv[2 * h->tri[j] + 1]; }
+    /* the pixel, kept inside its face's pixels (a hit right on the face's edge) */
+    float x0 = 1e30f, y0 = 1e30f, x1 = -1e30f, y1 = -1e30f;
+    for (int c = m->fo[h->face]; c < m->fo[h->face + 1]; c++) {
+        x0 = fminf(x0, m->uv[2 * c]); x1 = fmaxf(x1, m->uv[2 * c]);
+        y0 = fminf(y0, m->uv[2 * c + 1]); y1 = fmaxf(y1, m->uv[2 * c + 1]);
+    }
+    float u = fminf(fmaxf(h->u, x0 + 1e-3f), fmaxf(x1 - 1e-3f, x0 + 1e-3f)), v = fminf(fmaxf(h->v, y0 + 1e-3f), fmaxf(y1 - 1e-3f, y0 + 1e-3f));
+    h->x = (int)floorf(u);
+    h->y = (int)floorf(v);
+    /* right at a slanted island edge the pixel can be one no face covers: work on the one shown there */
+    const int *tf = pix_faces(h->obj);
+    int k = tf ? pix_shown(tf, m->tex->w, m->tex->h, h->x, h->y) : -1;
+    if (k < 0) {
+        h->x = h->y = -1;
+        return 1;
+    }
+    h->x = k % m->tex->w;
+    h->y = k / m->tex->w;
+    h->face = tf[k];
+    return 1;
+}
+
+/* the brush's pixels around (x, y): a square, only on the uv island of face f */
+static int pix_brush(int i, int f, int x, int y, int *out, int max)
+{
+    const int *tf = pix_faces(i);
+    if (!tf) return 0;
+    const Tex *t = ob[i].m.tex;
+    int n = 0, b = pixBrush < 1 ? 1 : pixBrush, isl = pxc[i].fisl[f], x0 = x - (b - 1) / 2, y0 = y - (b - 1) / 2;
+    for (int yy = y0; yy < y0 + b; yy++)
+        for (int xx = x0; xx < x0 + b; xx++) {
+            if (xx < 0 || yy < 0 || xx >= t->w || yy >= t->h || n >= max) continue;
+            int g = tf[yy * t->w + xx];
+            if (g >= 0 && pxc[i].fisl[g] == isl) out[n++] = yy * t->w + xx;
+        }
+    return n;
+}
+
+/* ---- painting strokes */
+
+static struct { int dirty, obj, mx, my, have, lobj, lisl, lx, ly, x0, y0, x1, y1, stale; V3 lw; } pp;
+
+static void pix_rgba(unsigned char out[4])
+{
+    unsigned c = col_rgb(paintCol);
+    out[0] = (unsigned char)(c >> 16);
+    out[1] = (unsigned char)(c >> 8);
+    out[2] = (unsigned char)c;
+    out[3] = pixErase ? 0 : 255;
+    if (pixErase) out[0] = out[1] = out[2] = 0;
+}
+
+static void pix_dirty(int x, int y)
+{
+    if (x < pp.x0) pp.x0 = x;
+    if (y < pp.y0) pp.y0 = y;
+    if (x + 1 > pp.x1) pp.x1 = x + 1;
+    if (y + 1 > pp.y1) pp.y1 = y + 1;
+}
+
+static void pix_stamp(int i, int f, int x, int y, const char *what)
+{
+    int idx[1024], n = pix_brush(i, f, x, y, idx, 1024);
+    unsigned char c[4];
+    pix_rgba(c);
+    Tex *t = ob[i].m.tex;
+    int change = 0;
+    for (int k = 0; k < n && !change; k++) change = memcmp(t->px + 4 * (size_t)idx[k], c, 4) != 0;
+    if (!change) return;
+    if (!pp.dirty) { undo_push(what); pp.dirty = 1; }
+    t = tex_own(&ob[i].m);
+    int synced = pix_synced(i);   /* then patching the painted pixels keeps it in sync */
+    for (int k = 0; k < n; k++) {
+        memcpy(t->px + 4 * (size_t)idx[k], c, 4);
+        pix_dirty(idx[k] % t->w, idx[k] / t->w);
+    }
+    t->ver++;
+    if (synced) pxc[i].glVer = t->ver;
+    else pp.stale = 1;
+}
+
+/* a straight line of brush stamps from (xa, ya) to (xb, yb), staying on face f's island */
+static void pix_line(int i, int f, int xa, int ya, int xb, int yb, const char *what)
+{
+    int dx = abs(xb - xa), dy = -abs(yb - ya), sx = xa < xb ? 1 : -1, sy = ya < yb ? 1 : -1, err = dx + dy;
+    for (;;) {
+        pix_stamp(i, f, xa, ya, what);
+        if (xa == xb && ya == yb) break;
+        int e2 = 2 * err;
+        if (e2 >= dy) { err += dy; xa += sx; }
+        if (e2 <= dx) { err += dx; ya += sy; }
+    }
+}
+
+static void pix_flush(void);
+
+/* paint at screen point (sx, sy), joining it to the last pixel when that was on the same island */
+static void pix_at(int sx, int sy, int line)
+{
+    PixHit h;
+    if (!pix_hit(sx, sy, &h) || h.x < 0 || !pix_faces(h.obj)) return;
+    if (h.obj != pp.obj) pix_flush();   /* the dirty rectangle belongs to one object */
+    pp.obj = h.obj;
+    int isl = pxc[h.obj].fisl[h.face];
+    if (pp.have && h.obj == pp.lobj && isl == pp.lisl && (line || abs(h.x - pp.lx) + abs(h.y - pp.ly) > 0))
+        pix_line(h.obj, h.face, pp.lx, pp.ly, h.x, h.y, line ? "Pixel Line" : "Pixel Paint");
+    else
+        pix_stamp(h.obj, h.face, h.x, h.y, "Pixel Paint");
+    pp.have = 1;
+    pp.lobj = h.obj;
+    pp.lisl = isl;
+    pp.lx = h.x;
+    pp.ly = h.y;
+    pp.obj = h.obj;
+    pp.lw = m4_pt(obj_mat(&ob[h.obj]), h.p);
+}
+
+static void pix_flush(void)
+{
+    if (pp.x1 > pp.x0 && pp.obj >= 0 && pp.obj < nob && !pp.stale) pix_patch(pp.obj, pp.x0, pp.y0, pp.x1, pp.y1);
+    pp.x0 = pp.y0 = 1 << 30;
+    pp.x1 = pp.y1 = -1;
+    pp.stale = 0;   /* a stale texture uploads whole at the next draw */
+}
+
+/* mouse moved while painting: every pixel along the way gets painted */
+static void pix_drag(int x, int y)
+{
+    int dx = x - pp.mx, dy = y - pp.my, n = abs(dx) > abs(dy) ? abs(dx) : abs(dy);
+    for (int k = 1; k <= n; k++) pix_at(pp.mx + dx * k / n, pp.my + dy * k / n, 0);
+    pp.mx = x;
+    pp.my = y;
+    pix_flush();
+}
+
+/* ---- giving objects pixels */
+
+/* Pixel Unwrap for object i: every face, or just the faces in fmask at the object's own pixel size.
+   Returns faces laid out, 0, or -1 when the texture would be too big. */
+static int pix_unwrap(int i, const unsigned char *fmask)
+{
+    Obj *o = &ob[i];
+    M4 M = obj_mat(o);
+    float d = fmask && o->m.uv ? mesh_uv_density(&o->m, M) : 0;
+    int r = mesh_pixel_unwrap(&o->m, M, d > 0 ? d : (float)pixDens, o->nangle, fmask, 4096);
+    if (r > 0) o->prim.type = PRIM_NONE;
+    if (r > 0 && o->tex[0] && o->m.tex) tex_write(i, o->tex);   /* keep the linked picture in step */
+    return r;
+}
+
+static void cmd_unwrap(void)
+{
+    int n = 0, faces = 0, big = 0, last = -1, pushed = 0, partial = 0;
+    for (int i = 0; i < nob; i++) {
+        Obj *o = &ob[i];
+        if (!active(o) || o->hidden) continue;
+        unsigned char *fm = NULL;
+        if (mode != M_OBJ && shows(M_FACE) && o->m.uv) {
+            int k = 0;
+            for (int f = 0; f < o->m.nf; f++) k += o->m.fs[f] != 0;
+            if (!k) continue;
+            fm = o->m.fs;
+            partial = 1;
+        } else if (mode != M_OBJ && shows(M_FACE)) {
+            int k = 0;
+            for (int f = 0; f < o->m.nf; f++) k += o->m.fs[f] != 0;
+            if (!k) continue;
+        }
+        if (!pushed) { undo_push("Pixel Unwrap"); pushed = 1; }
+        int r = pix_unwrap(i, fm);
+        if (r < 0) big++;
+        if (r > 0) { n++; faces += r; last = i; }
+    }
+    char b[160];
+    if (!n) {
+        if (pushed) undo_drop();
+        msg(big ? "Pixel Unwrap: that would be over 4096 x 4096 pixels - lower Pixels / Unit"
+                : mode == M_OBJ ? "Pixel Unwrap: select objects" : "Pixel Unwrap: select faces (or switch to object mode)");
+        return;
+    }
+    if (n == 1 && !partial)
+        snprintf(b, sizeof b, "Pixel Unwrap: %s is %d x %d pixels (%d per unit)", ob[last].name, ob[last].m.tex->w, ob[last].m.tex->h, pixDens);
+    else if (partial)
+        snprintf(b, sizeof b, "Pixel Unwrap: %d face(s) got pixels of their own; the rest stayed put", faces);
+    else
+        snprintf(b, sizeof b, "Pixel Unwrap: %d objects", n);
+    msg(b);
+}
+
+/* Remove Texture: back to vertex colors (each vertex gets the average of its pixels) */
+static void cmd_tex_remove(void)
+{
+    int n = 0;
+    for (int i = 0; i < nob; i++) n += active(&ob[i]) && ob[i].m.tex;
+    if (!n) { msg("Remove Texture: select textured objects"); return; }
+    undo_push("Remove Texture");
+    for (int i = 0; i < nob; i++) {
+        Obj *o = &ob[i];
+        Mesh *m = &o->m;
+        if (!active(o) || !m->tex) continue;
+        V3 *sum = calloc(m->nv + 1, sizeof(V3));
+        int *cnt = calloc(m->nv + 1, sizeof(int));
+        for (int f = 0; f < m->nf; f++) {
+            V3 cen = v3(0, 0, 0);
+            int k = m->fo[f + 1] - m->fo[f];
+            for (int c = m->fo[f]; c < m->fo[f + 1]; c++) cen = v3add(cen, v3(m->uv[2 * c], m->uv[2 * c + 1], 0));
+            cen = v3mul(cen, 1.0f / k);
+            for (int c = m->fo[f]; c < m->fo[f + 1]; c++) {
+                /* a little in from the corner, so the corner pixel of this face is the one read */
+                float u = m->uv[2 * c] + (cen.x - m->uv[2 * c]) * 0.1f, v = m->uv[2 * c + 1] + (cen.y - m->uv[2 * c + 1]) * 0.1f;
+                int x = (int)u, y = (int)v;
+                x = x < 0 ? 0 : x >= m->tex->w ? m->tex->w - 1 : x;
+                y = y < 0 ? 0 : y >= m->tex->h ? m->tex->h - 1 : y;
+                const unsigned char *px = m->tex->px + 4 * ((size_t)y * m->tex->w + x);
+                sum[m->fi[c]] = v3add(sum[m->fi[c]], v3(px[0] / 255.0f, px[1] / 255.0f, px[2] / 255.0f));
+                cnt[m->fi[c]]++;
+            }
+        }
+        for (int v = 0; v < m->nv; v++)
+            if (cnt[v]) {
+                V3 a = v3mul(sum[v], 1.0f / cnt[v]);
+                m->c[v] = v3(m->c[v].x * a.x, m->c[v].y * a.y, m->c[v].z * a.z);
+            }
+        free(sum);
+        free(cnt);
+        free(m->uv);
+        m->uv = NULL;
+        tex_release(m->tex);
+        m->tex = NULL;
+        mesh_uv_changed(m);
+        o->tex[0] = 0;
+    }
+    msg("Removed the texture (its colors went to the vertex colors)");
+}
+
+/* the textured object a texture command works on: the lead object, given pixels if it has none */
+static int tex_target(const char *what)
+{
+    Obj *l = lead();
+    char b[96];
+    if (!l) {
+        snprintf(b, sizeof b, "%s: select an object", what);
+        msg(b);
+        return -1;
+    }
+    int i = (int)(l - ob);
+    if (!l->m.tex) {
+        undo_push("Pixel Unwrap");
+        if (pix_unwrap(i, NULL) <= 0) {
+            undo_drop();
+            snprintf(b, sizeof b, "%s: Pixel Unwrap didn't fit - lower Pixels / Unit", what);
+            msg(b);
+            return -1;
+        }
+    }
+    return i;
+}
+
+static int png_dlg(int save, char *path, const char *title)
+{
+    OPENFILENAMEA of;
+    memset(&of, 0, sizeof of);
+    of.lStructSize = sizeof of;
+    of.hwndOwner = hMain;
+    of.lpstrTitle = title;
+    of.lpstrFilter = save ? "PNG image (*.png)\0*.png\0" : "Images (*.png, *.gif, *.bmp)\0*.png;*.gif;*.bmp\0All files\0*.*\0";
+    of.lpstrFile = path;
+    of.nMaxFile = MAX_PATH;
+    of.lpstrDefExt = "png";
+    of.Flags = save ? OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST : OFN_FILEMUSTEXIST;
+    return save ? GetSaveFileNameA(&of) : GetOpenFileNameA(&of);
+}
+
+static void cmd_tex_save(void)
+{
+    int i = tex_target("Save Texture");
+    if (i < 0) return;
+    char p[MAX_PATH], b[MAX_PATH + 64];
+    snprintf(p, sizeof p, "%s", ob[i].tex[0] ? ob[i].tex : ob[i].name);
+    if (!ob[i].tex[0]) strncat(p, ".png", sizeof p - strlen(p) - 1);
+    if (!png_dlg(1, p, "Save Texture As")) return;
+    if (!tex_write(i, p)) { MessageBoxA(hMain, "Could not write the picture.", APP_NAME, MB_ICONERROR); return; }
+    modified = 1;
+    snprintf(b, sizeof b, "Saved %s - edits to it (in Aseprite or anything) show up here", file_name(p));
+    msg(b);
+}
+
+static void cmd_tex_load(void)
+{
+    int i = tex_target("Load Texture");
+    if (i < 0) return;
+    char p[MAX_PATH] = "", b[MAX_PATH + 64];
+    if (!png_dlg(0, p, "Load Texture")) return;
+    undo_push("Load Texture");
+    if (!tex_from_file(i, p)) {
+        undo_drop();
+        MessageBoxA(hMain, "Could not read that picture.", APP_NAME, MB_ICONERROR);
+        return;
+    }
+    snprintf(ob[i].tex, sizeof ob[i].tex, "%s", p);
+    ob[i].texTime = file_time(p);
+    if (!watchOn) { SetTimer(hMain, 3, 600, NULL); watchOn = 1; }
+    snprintf(b, sizeof b, "Loaded %s onto %s (it reloads when the file changes)", file_name(p), ob[i].name);
+    msg(b);
+}
+
+/* ---- Aseprite */
+
+static int exists(const char *p) { DWORD a = GetFileAttributesA(p); return a != INVALID_FILE_ATTRIBUTES && !(a & FILE_ATTRIBUTE_DIRECTORY); }
+
+/* Aseprite.exe: the one picked before, the usual install folders, or Steam's libraries */
+static int find_aseprite(void)
+{
+    static const char *spots[] = {
+        "%ProgramFiles%\\Aseprite\\Aseprite.exe", "%ProgramFiles(x86)%\\Aseprite\\Aseprite.exe",
+        "%LOCALAPPDATA%\\Programs\\Aseprite\\Aseprite.exe", "%ProgramFiles(x86)%\\Steam\\steamapps\\common\\Aseprite\\Aseprite.exe",
+        "%ProgramFiles%\\Steam\\steamapps\\common\\Aseprite\\Aseprite.exe",
+    };
+    char p[MAX_PATH];
+    if (!asePath[0]) reg_get("Aseprite", REG_SZ, asePath, sizeof asePath);
+    if (asePath[0] && exists(asePath)) return 1;
+    for (size_t k = 0; k < sizeof spots / sizeof *spots; k++)
+        if (ExpandEnvironmentStringsA(spots[k], p, sizeof p) && exists(p)) { strcpy(asePath, p); return 1; }
+    /* Steam games can live in other libraries, listed in libraryfolders.vdf */
+    char steam[MAX_PATH] = "";
+    DWORD n = sizeof steam;
+    if (RegGetValueA(HKEY_CURRENT_USER, "Software\\Valve\\Steam", "SteamPath", RRF_RT_REG_SZ, NULL, steam, &n) == ERROR_SUCCESS) {
+        snprintf(p, sizeof p, "%s\\steamapps\\libraryfolders.vdf", steam);
+        FILE *f = fopen(p, "r");
+        char line[1024];
+        while (f && fgets(line, sizeof line, f)) {
+            char *q = strstr(line, "\"path\"");
+            if (!q || !(q = strchr(q + 6, '"'))) continue;
+            char lib[MAX_PATH], *o = lib;
+            for (q++; *q && *q != '"' && o < lib + sizeof lib - 1; q++) {
+                if (*q == '\\' && q[1] == '\\') q++;
+                *o++ = *q;
+            }
+            *o = 0;
+            snprintf(p, sizeof p, "%s\\steamapps\\common\\Aseprite\\Aseprite.exe", lib);
+            if (exists(p)) { strcpy(asePath, p); fclose(f); return 1; }
+        }
+        if (f) fclose(f);
+        snprintf(p, sizeof p, "%s\\steamapps\\common\\Aseprite\\Aseprite.exe", steam);
+        if (exists(p)) { strcpy(asePath, p); return 1; }
+    }
+    return 0;
+}
+
+static void cmd_aseprite(void)
+{
+    int i = tex_target("Edit in Aseprite");
+    if (i < 0) return;
+    Obj *o = &ob[i];
+    char p[MAX_PATH], b[MAX_PATH + 96];
+    if (o->tex[0]) {
+        snprintf(p, sizeof p, "%s", o->tex);
+    } else if (g_path[0]) {
+        /* next to the scene: scene_object.png */
+        const char *dot = strrchr(g_path, '.');
+        snprintf(p, sizeof p, "%.*s_%s.png", dot ? (int)(dot - g_path) : (int)strlen(g_path), g_path, o->name);
+        if (exists(p)) {
+            snprintf(b, sizeof b, "%s already exists.\n\nReplace it with %s's texture?", file_name(p), o->name);
+            if (MessageBoxA(hMain, b, APP_NAME, MB_YESNO | MB_ICONQUESTION) != IDYES && !png_dlg(1, p, "Save the texture for Aseprite as")) return;
+        }
+    } else {
+        snprintf(p, sizeof p, "%s.png", o->name);
+        if (!png_dlg(1, p, "Save the texture for Aseprite as")) return;
+    }
+    if (!tex_write(i, p)) { MessageBoxA(hMain, "Could not write the picture for Aseprite.", APP_NAME, MB_ICONERROR); return; }
+    modified = 1;
+    char arg[MAX_PATH + 4];
+    snprintf(arg, sizeof arg, "\"%s\"", p);
+    if (!find_aseprite()) {
+        int r = MessageBoxA(hMain, "tuff3d couldn't find Aseprite.\n\nYes: show me where Aseprite.exe is\nNo: open the picture in the default app instead",
+                            APP_NAME, MB_YESNOCANCEL | MB_ICONQUESTION);
+        if (r == IDCANCEL) return;
+        if (r == IDYES) {
+            OPENFILENAMEA of;
+            char ap[MAX_PATH] = "Aseprite.exe";
+            memset(&of, 0, sizeof of);
+            of.lStructSize = sizeof of;
+            of.hwndOwner = hMain;
+            of.lpstrFilter = "Aseprite (Aseprite.exe)\0Aseprite.exe\0Programs (*.exe)\0*.exe\0";
+            of.lpstrFile = ap;
+            of.nMaxFile = MAX_PATH;
+            of.Flags = OFN_FILEMUSTEXIST;
+            if (!GetOpenFileNameA(&of)) return;
+            strcpy(asePath, ap);
+            reg_set("Aseprite", REG_SZ, asePath, (DWORD)strlen(asePath) + 1);
+        }
+    }
+    if (asePath[0] ? (INT_PTR)ShellExecuteA(hMain, "open", asePath, arg, NULL, SW_SHOWNORMAL) <= 32
+                   : (INT_PTR)ShellExecuteA(hMain, "open", p, NULL, NULL, SW_SHOWNORMAL) <= 32) {
+        snprintf(b, sizeof b, "Saved %s, but could not open it. Open it yourself: saving it there updates tuff3d.", p);
+        MessageBoxA(hMain, b, APP_NAME, MB_ICONWARNING);
+        return;
+    }
+    snprintf(b, sizeof b, "%s is open in %s - save there (Ctrl+S) and it updates here", file_name(p), asePath[0] ? "Aseprite" : "your image editor");
+    msg(b);
+}
+
+/* linked pictures that changed on disk (saved in Aseprite) come back in, as an undo step */
+static void tex_watch(void)
+{
+    int any = 0, pushed = 0;
+    char b[160] = "";
+    for (int i = 0; i < nob; i++) {
+        Obj *o = &ob[i];
+        if (!o->tex[0]) continue;
+        any = 1;
+        unsigned long long t = file_time(o->tex);
+        if (!t || t == o->texTime || !o->m.tex || dk != D_NONE) continue;
+        int w, h;
+        unsigned char *px = image_load(o->tex, &w, &h, 1);   /* fails while it is still being written: next time */
+        if (!px) continue;
+        if (!pushed) { undo_push("Reload Texture"); pushed = 1; }
+        tex_take(i, px, w, h);
+        snprintf(b, sizeof b, "Updated %s from %s", o->name, file_name(o->tex));
+        o->texTime = t;
+    }
+    if (!any && watchOn) { KillTimer(hMain, 3); watchOn = 0; }
+    if (pushed) {
+        msg(b);
+        refresh_all();
+    }
+}
+
+/* ---- palette files: GIMP .gpl, JASC .pal, .hex, paint.net .txt, or the colors of a picture */
+
+static int pal_read(const char *path)
+{
+    unsigned c[256];
+    int n = 0;
+    const char *ext = strrchr(path, '.');
+    if (ext && (!lstrcmpiA(ext, ".png") || !lstrcmpiA(ext, ".gif") || !lstrcmpiA(ext, ".bmp"))) {
+        int w, h;
+        unsigned char *px = image_load(path, &w, &h, 1);
+        if (!px) return 0;
+        for (int i = 0; i < w * h && n < 256; i++) {
+            if (px[4 * i + 3] < 128) continue;
+            unsigned v = (unsigned)(px[4 * i] << 16 | px[4 * i + 1] << 8 | px[4 * i + 2]);
+            int dup = 0;
+            for (int k = 0; k < n && !dup; k++) dup = c[k] == v;
+            if (!dup) c[n++] = v;
+        }
+        free(px);
+    } else {
+        FILE *f = fopen(path, "r");
+        char line[512];
+        if (!f) return 0;
+        while (fgets(line, sizeof line, f) && n < 256) {
+            char *s = line, *e;
+            int r, g, bl, k;
+            while (*s == ' ' || *s == '\t') s++;
+            if (*s == '#' || *s == ';') continue;
+            if (sscanf(s, "%d %d %d%n", &r, &g, &bl, &k) == 3 && r >= 0 && r < 256 && g >= 0 && g < 256 && bl >= 0 && bl < 256) {
+                c[n++] = (unsigned)(r << 16 | g << 8 | bl);
+                continue;
+            }
+            unsigned long v = strtoul(s, &e, 16);
+            size_t len = (size_t)(e - s);
+            if ((len == 6 || len == 8) && (!*e || *e == '\r' || *e == '\n' || *e == ' ')) c[n++] = (unsigned)(v & 0xffffff);
+        }
+        fclose(f);
+    }
+    if (!n) return 0;
+    memcpy(pal, c, n * sizeof *c);
+    npal = n;
+    pal_save();
+    return n;
+}
+
+static void cmd_pal_load(void)
+{
+    char p[MAX_PATH] = "", b[MAX_PATH + 64];
+    OPENFILENAMEA of;
+    memset(&of, 0, sizeof of);
+    of.lStructSize = sizeof of;
+    of.hwndOwner = hMain;
+    of.lpstrTitle = "Load Palette";
+    of.lpstrFilter = "Palettes (*.gpl, *.pal, *.hex, *.txt, *.png)\0*.gpl;*.pal;*.hex;*.txt;*.png;*.gif;*.bmp\0All files\0*.*\0";
+    of.lpstrFile = p;
+    of.nMaxFile = MAX_PATH;
+    of.Flags = OFN_FILEMUSTEXIST;
+    if (!GetOpenFileNameA(&of)) return;
+    int n = pal_read(p);
+    if (!n) { MessageBoxA(hMain, "No colors found in that file.", APP_NAME, MB_ICONERROR); return; }
+    snprintf(b, sizeof b, "Palette: %d colors from %s", n, file_name(p));
+    msg(b);
+}
+
+/* the colors the lead object's texture uses, in the order they first appear */
+static void cmd_pal_tex(void)
+{
+    Obj *l = lead();
+    if (!l || !l->m.tex) { msg("Palette from Texture: select a textured object"); return; }
+    const Tex *t = l->m.tex;
+    int n = 0;
+    unsigned c[256];
+    for (int i = 0; i < t->w * t->h && n < 256; i++) {
+        if (t->px[4 * i + 3] < 128) continue;
+        unsigned v = (unsigned)(t->px[4 * i] << 16 | t->px[4 * i + 1] << 8 | t->px[4 * i + 2]);
+        int dup = 0;
+        for (int k = 0; k < n && !dup; k++) dup = c[k] == v;
+        if (!dup) c[n++] = v;
+    }
+    if (!n) { msg("Palette from Texture: the texture is empty"); return; }
+    memcpy(pal, c, n * sizeof *c);
+    npal = n;
+    pal_save();
+    char b[96];
+    snprintf(b, sizeof b, "Palette: the %d colors of %s's texture", n, l->name);
+    msg(b);
+}
+
+/* ---- the palette in the side panel: click a color to paint with it, double-click to change it,
+   right-click for more. The first swatch is the eraser (clear pixels). */
+
+static int palHover = -1;
+
+static int pal_cols(void) { return npal + 1 <= 32 ? 8 : npal + 1 <= 72 ? 12 : 16; }
+
+static int pal_cell(int w) { int c = (w - 2) / pal_cols(); return c < 6 ? 6 : c; }
+
+static int pal_height(int w) { return pal_cell(w) * ((npal + pal_cols()) / pal_cols()) + 2; }
+
+static int pal_at(int w, int x, int y)
+{
+    int s = pal_cell(w), cx = (x - 1) / s, cy = (y - 1) / s, i = cy * pal_cols() + cx;
+    if (x < 1 || y < 1 || cx >= pal_cols() || i > npal) return -1;
+    return i;
+}
+
+/* the swatch matching the paint color (0 = eraser), or -1 */
+static int pal_current(void)
+{
+    if (pixErase) return 0;
+    unsigned c = col_rgb(paintCol);
+    for (int i = 0; i < npal; i++) if (pal[i] == c) return i + 1;
+    return -1;
+}
+
+static void pal_pick(int i)
+{
+    if (i == 0) pixErase = 1;
+    else if (i > 0 && i <= npal) { pixErase = 0; paintCol = rgb_col(pal[i - 1]); }
+    InvalidateRect(hPal, NULL, FALSE);
+    panel_sync();
+    redraw();
+}
+
+static int pal_choose(unsigned *c)
+{
+    static COLORREF cust[16];
+    CHOOSECOLORA cc;
+    memset(&cc, 0, sizeof cc);
+    cc.lStructSize = sizeof cc;
+    cc.hwndOwner = hMain;
+    cc.rgbResult = RGB(*c >> 16 & 255, *c >> 8 & 255, *c & 255);
+    cc.lpCustColors = cust;
+    cc.Flags = CC_RGBINIT | CC_FULLOPEN;
+    if (!ChooseColorA(&cc)) return 0;
+    *c = (unsigned)(GetRValue(cc.rgbResult) << 16 | GetGValue(cc.rgbResult) << 8 | GetBValue(cc.rgbResult));
+    return 1;
+}
+
+static void pal_changed(void)
+{
+    pal_save();
+    InvalidateRect(hPal, NULL, FALSE);
+    PostMessage(hPanel, WM_SIZE, 0, 0);   /* the palette may need another row */
+}
+
+static LRESULT CALLBACK PalProc(HWND h, UINT m, WPARAM wp, LPARAM lp)
+{
+    RECT rc;
+    GetClientRect(h, &rc);
+    int x = (short)LOWORD(lp), y = (short)HIWORD(lp);
+    switch (m) {
+    case WM_PAINT: {
+        PAINTSTRUCT ps_;
+        HDC wdc = BeginPaint(h, &ps_), dc = CreateCompatibleDC(wdc);
+        HBITMAP bm = CreateCompatibleBitmap(wdc, rc.right, rc.bottom), old = SelectObject(dc, bm);
+        FillRect(dc, &rc, brUi);
+        int s = pal_cell(rc.right), cols = pal_cols(), cur = pal_current();
+        for (int i = 0; i <= npal; i++) {
+            RECT r = { 1 + i % cols * s, 1 + i / cols * s, 1 + i % cols * s + s, 1 + i / cols * s + s };
+            RECT in = r;
+            InflateRect(&in, -1, -1);
+            if (i == 0) {
+                /* eraser: a checkerboard with a red slash */
+                HBRUSH lt = CreateSolidBrush(RGB(230, 230, 230)), dkb = CreateSolidBrush(RGB(160, 160, 160));
+                FillRect(dc, &in, lt);
+                RECT q = { in.left, in.top, (in.left + in.right) / 2, (in.top + in.bottom) / 2 };
+                FillRect(dc, &q, dkb);
+                OffsetRect(&q, q.right - q.left, q.bottom - q.top);
+                FillRect(dc, &q, dkb);
+                DeleteObject(lt);
+                DeleteObject(dkb);
+                HPEN pen = CreatePen(PS_SOLID, 1, RGB(220, 40, 40)), op = SelectObject(dc, pen);
+                MoveToEx(dc, in.left, in.bottom - 1, NULL);
+                LineTo(dc, in.right, in.top - 1);
+                SelectObject(dc, op);
+                DeleteObject(pen);
+            } else {
+                HBRUSH br = CreateSolidBrush(RGB(pal[i - 1] >> 16 & 255, pal[i - 1] >> 8 & 255, pal[i - 1] & 255));
+                FillRect(dc, &in, br);
+                DeleteObject(br);
+            }
+            if (i == cur || i == palHover) {
+                FrameRect(dc, &r, i == cur ? (HBRUSH)GetStockObject(WHITE_BRUSH) : brAcc);
+                if (i == cur) { InflateRect(&r, -1, -1); FrameRect(dc, &r, (HBRUSH)GetStockObject(BLACK_BRUSH)); }
+            }
+        }
+        BitBlt(wdc, 0, 0, rc.right, rc.bottom, dc, 0, 0, SRCCOPY);
+        SelectObject(dc, old);
+        DeleteObject(bm);
+        DeleteDC(dc);
+        EndPaint(h, &ps_);
+        return 0;
+    }
+    case WM_ERASEBKGND: return 1;
+    case WM_MOUSEMOVE: {
+        int i = pal_at(rc.right, x, y);
+        if (i != palHover) {
+            palHover = i;
+            InvalidateRect(h, NULL, FALSE);
+            TRACKMOUSEEVENT tme = { sizeof tme, TME_LEAVE, h, 0 };
+            TrackMouseEvent(&tme);
+            if (i >= 0) {
+                char b[160];
+                if (i == 0) snprintf(b, sizeof b, "Eraser: paints clear pixels (they show as holes, and as transparent in Aseprite)");
+                else snprintf(b, sizeof b, "#%06X - click to paint with it, double-click to change it, right-click for more", pal[i - 1]);
+                SetWindowTextA(hStatus, b);
+            } else {
+                status_text();
+            }
+        }
+        return 0;
+    }
+    case WM_MOUSELEAVE: palHover = -1; InvalidateRect(h, NULL, FALSE); status_text(); return 0;
+    case WM_LBUTTONDOWN: pal_pick(pal_at(rc.right, x, y)); SetFocus(hView); return 0;
+    case WM_LBUTTONDBLCLK: {
+        int i = pal_at(rc.right, x, y);
+        if (i > 0 && pal_choose(&pal[i - 1])) { pal_changed(); pal_pick(i); }
+        SetFocus(hView);
+        return 0;
+    }
+    case WM_RBUTTONUP: {
+        enum { P_SET = 1, P_EDIT, P_DEL, P_ADD, P_LOAD, P_TEX, P_RESET };
+        int i = pal_at(rc.right, x, y);
+        HMENU mm = CreatePopupMenu();
+        if (i > 0) {
+            AppendMenuA(mm, MF_STRING | (pixErase ? MF_GRAYED : 0), P_SET, "Set to the Paint Color");
+            AppendMenuA(mm, MF_STRING, P_EDIT, "Change Color...");
+            AppendMenuA(mm, MF_STRING | (npal > 1 ? 0 : MF_GRAYED), P_DEL, "Remove");
+            AppendMenuA(mm, MF_SEPARATOR, 0, NULL);
+        }
+        AppendMenuA(mm, MF_STRING | (pixErase || pal_current() > 0 || npal >= 256 ? MF_GRAYED : 0), P_ADD, "Add the Paint Color");
+        AppendMenuA(mm, MF_STRING, P_LOAD, "Load Palette...");
+        AppendMenuA(mm, MF_STRING, P_TEX, "Palette from Texture");
+        AppendMenuA(mm, MF_STRING, P_RESET, "Default Palette");
+        POINT pt = { x, y };
+        ClientToScreen(h, &pt);
+        int c = TrackPopupMenu(mm, TPM_RETURNCMD | TPM_RIGHTBUTTON, pt.x, pt.y, 0, h, NULL);
+        DestroyMenu(mm);
+        if (c == P_SET) { pal[i - 1] = col_rgb(paintCol); pal_changed(); }
+        else if (c == P_EDIT && pal_choose(&pal[i - 1])) { pal_changed(); pal_pick(i); }
+        else if (c == P_DEL) { memmove(pal + i - 1, pal + i, (npal - i) * sizeof *pal); npal--; pal_changed(); }
+        else if (c == P_ADD) { pal_add(col_rgb(paintCol)); pal_changed(); }
+        else if (c == P_LOAD) { cmd_pal_load(); pal_changed(); }
+        else if (c == P_TEX) { cmd_pal_tex(); pal_changed(); }
+        else if (c == P_RESET) { pal_default(); pal_changed(); msg("Default palette"); }
+        SetFocus(hView);
+        return 0;
+    }
+    }
+    return DefWindowProc(h, m, wp, lp);
+}
+
+/* ---- in the viewport: the pixel grid on textured objects and the pixels a click would paint */
+
+typedef struct { const Mesh *m; float *seg; int n, cap; } GridCtx;
+
+static void grid_add(GridCtx *g, V3 a, V3 b)
+{
+    if (g->n == g->cap) { g->cap = g->cap ? g->cap * 2 : 1024; g->seg = realloc(g->seg, g->cap * 6 * sizeof(float)); }
+    float *s = g->seg + 6 * g->n++;
+    s[0] = a.x; s[1] = a.y; s[2] = a.z; s[3] = b.x; s[4] = b.y; s[5] = b.z;
+}
+
+/* the lines x = k (axis 0) or y = k (axis 1) across one triangle, in 3D */
+static void grid_tri(GridCtx *g, const float *u[3], const V3 *p[3], int axis)
+{
+    float lo = fminf(u[0][axis], fminf(u[1][axis], u[2][axis])), hi = fmaxf(u[0][axis], fmaxf(u[1][axis], u[2][axis]));
+    for (int k = (int)ceilf(lo); k <= (int)floorf(hi) && hi - lo < 4096; k++) {
+        V3 q[2];
+        int nq = 0;
+        for (int e = 0; e < 3 && nq < 2; e++) {
+            const float *a = u[e], *b = u[(e + 1) % 3];
+            float da = a[axis] - k, db = b[axis] - k;
+            if ((da < 0 && db < 0) || (da > 0 && db > 0) || da == db) continue;
+            float t = da / (da - db);
+            V3 r = v3lerp(*p[e], *p[(e + 1) % 3], t);
+            if (nq == 1 && v3len(v3sub(r, q[0])) < 1e-7f) continue;
+            q[nq++] = r;
+        }
+        if (nq == 2) grid_add(g, q[0], q[1]);
+    }
+}
+
+/* grid lines of object i (object space), rebuilt after edits; *texel: object space size of a pixel */
+static const float *pix_grid(int i, int *n, float *texel)
+{
+    PixCache *c = pix_cache(i);
+    const Mesh *m = &ob[i].m;
+    *n = 0;
+    if (!m->uv || !m->tex) return NULL;
+    if (c->gridUv != m->uvid || c->gridGen != geoGen) {
+        GridCtx g = { m, NULL, 0, 0 };
+        double ua = 0, wa = 0;
+        free(c->grid);
+        for (int f = 0; f < m->nf; f++) {
+            int s = m->fo[f];
+            for (int k = 1; s + k + 1 < m->fo[f + 1]; k++) {
+                int cs[3] = { s, s + k, s + k + 1 };
+                const float *u[3] = { m->uv + 2 * cs[0], m->uv + 2 * cs[1], m->uv + 2 * cs[2] };
+                const V3 *p[3] = { &m->p[m->fi[cs[0]]], &m->p[m->fi[cs[1]]], &m->p[m->fi[cs[2]]] };
+                grid_tri(&g, u, p, 0);
+                grid_tri(&g, u, p, 1);
+                ua += fabsf((u[1][0] - u[0][0]) * (u[2][1] - u[0][1]) - (u[1][1] - u[0][1]) * (u[2][0] - u[0][0]));
+                wa += v3len(v3cross(v3sub(*p[1], *p[0]), v3sub(*p[2], *p[0])));
+            }
+        }
+        c->grid = g.seg;
+        c->ngrid = g.n;
+        c->texel = ua > 0 ? (float)sqrt(wa / ua) : 0;
+        c->gridUv = m->uvid;
+        c->gridGen = geoGen;
+    }
+    *n = c->ngrid;
+    *texel = c->texel;
+    return c->grid;
+}
+
+/* 3D corner of pixel (x + dx, y + dy) of face f, through the face's fan triangle around the pixel */
+static V3 pix_corner(const Mesh *m, int f, int x, int y, int dx, int dy)
+{
+    int s = m->fo[f], best = -1;
+    float cx = x + 0.5f, cy = y + 0.5f, worst = -1e30f;
+    for (int k = 1; s + k + 1 < m->fo[f + 1]; k++) {
+        const float *a = m->uv + 2 * s, *b = m->uv + 2 * (s + k), *c = m->uv + 2 * (s + k + 1);
+        float area = (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0]);
+        if (fabsf(area) < 1e-9f) continue;
+        float w0 = ((b[0] - cx) * (c[1] - cy) - (b[1] - cy) * (c[0] - cx)) / area, w1 = ((c[0] - cx) * (a[1] - cy) - (c[1] - cy) * (a[0] - cx)) / area;
+        float mn = fminf(w0, fminf(w1, 1 - w0 - w1));
+        if (mn > worst) { worst = mn; best = k; }
+    }
+    if (best < 0) return m->p[m->fi[s]];
+    const float *a = m->uv + 2 * s, *b = m->uv + 2 * (s + best), *c = m->uv + 2 * (s + best + 1);
+    float px = (float)(x + dx), py = (float)(y + dy), area = (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0]);
+    float w0 = ((b[0] - px) * (c[1] - py) - (b[1] - py) * (c[0] - px)) / area, w1 = ((c[0] - px) * (a[1] - py) - (c[1] - py) * (a[0] - px)) / area;
+    V3 pa = m->p[m->fi[s]], pb = m->p[m->fi[s + best]], pc = m->p[m->fi[s + best + 1]];
+    return v3add(v3add(v3mul(pa, w0), v3mul(pb, w1)), v3mul(pc, 1 - w0 - w1));
+}
+
+/* inside render(), in object i's space: its pixel grid, and the pixels the brush is over */
+static void draw_pixel_tool(int i)
+{
+    Obj *o = &ob[i];
+    const Mesh *m = &o->m;
+    if (!m->uv || !m->tex) return;
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    if (pixGrid) {
+        int n;
+        float texel;
+        const float *g = pix_grid(i, &n, &texel);
+        V3 sc = v3(v3len(m4_col(obj_mat(o), 0)), v3len(m4_col(obj_mat(o), 1)), v3len(m4_col(obj_mat(o), 2)));
+        DrawCache *dc = cache_get(i);
+        V3 mid = m4_pt(obj_mat(o), v3mul(v3add(dc->lo, dc->hi), 0.5f));
+        float px = texel * fmaxf(sc.x, fmaxf(sc.y, sc.z)) / wpp(mid), a = (px - 5) / 8;
+        if (g && n && a > 0) {
+            glColor4f(0, 0, 0, (a > 1 ? 1 : a) * 0.28f);
+            glEnableClientState(GL_VERTEX_ARRAY);
+            glVertexPointer(3, GL_FLOAT, 0, g);
+            glDrawArrays(GL_LINES, 0, n * 2);
+            glDisableClientState(GL_VERTEX_ARRAY);
+        }
+    }
+    if (pxh.obj == i && pxh.x >= 0 && pxh.face < m->nf && pxh.x < m->tex->w && pxh.y < m->tex->h && dk == D_NONE && pix_faces(i)) {
+        int idx[1024], n = pixFill ? 1 : pix_brush(i, pxh.face, pxh.x, pxh.y, idx, 1024);
+        if (pixFill) idx[0] = pxh.y * m->tex->w + pxh.x;
+        const int *tf = pix_faces(i);
+        glDisable(GL_DEPTH_TEST);
+        for (int pass = 0; pass < 2; pass++) {
+            for (int k = 0; k < n; k++) {
+                int x = idx[k] % m->tex->w, y = idx[k] / m->tex->w, f = tf[idx[k]] >= 0 ? tf[idx[k]] : pxh.face;
+                V3 q[4] = { pix_corner(m, f, x, y, 0, 0), pix_corner(m, f, x, y, 1, 0), pix_corner(m, f, x, y, 1, 1), pix_corner(m, f, x, y, 0, 1) };
+                if (pass == 0) {
+                    if (pixErase) glColor4f(1, 1, 1, .25f);
+                    else glColor4f(paintCol.x, paintCol.y, paintCol.z, .85f);
+                    glBegin(GL_QUADS);
+                } else {
+                    float l = paintCol.x * .3f + paintCol.y * .59f + paintCol.z * .11f;
+                    glColor4f(l > .5f && !pixErase ? 0 : 1, l > .5f && !pixErase ? 0 : 1, l > .5f && !pixErase ? 0 : 1, .9f);
+                    glBegin(GL_LINE_LOOP);
+                }
+                for (int j = 0; j < 4; j++) glVertex3fv(&q[j].x);
+                glEnd();
+            }
+        }
+        glEnable(GL_DEPTH_TEST);
+    }
+    glDisable(GL_BLEND);
+}
+
+/* ---- the Pixel Paint tool's mouse */
+
+static void watch_start(void)
+{
+    if (!watchOn && hMain) { SetTimer(hMain, 3, 600, NULL); watchOn = 1; }
+}
+
+/* the pixel under the cursor (for the brush preview and the status line) */
+static void pix_hover(int x, int y)
+{
+    PixHit h;
+    if (x < -999 || !pix_hit(x, y, &h)) h.obj = -1;
+    if (h.obj != pxh.obj || h.x != pxh.x || h.y != pxh.y || h.face != pxh.face) {
+        pxh = h;
+        status_text();
+        redraw();
+    }
+}
+
+/* left click with Pixel Paint: picks a color, fills, or starts a stroke (returns 1) */
+static int pix_down(int x, int y)
+{
+    PixHit h;
+    char b[160];
+    if (!pix_hit(x, y, &h)) return 0;
+    Obj *o = &ob[h.obj];
+    if (lead() != o) {
+        /* what you paint becomes the selection, so the side panel and Edit in Aseprite follow it */
+        if (mode == M_OBJ) {
+            for (int i = 0; i < nob; i++) ob[i].sel = 0;
+            o->sel = 1;
+        } else {
+            for (int i = 0; i < nob; i++) ob[i].hil = 0;
+            o->hil = 1;
+        }
+        o->order = ++stamp;
+        refresh_all();
+    }
+    if (key(VK_CONTROL)) {
+        if (h.x < 0) return 0;
+        const unsigned char *px = o->m.tex->px + 4 * ((size_t)h.y * o->m.tex->w + h.x);
+        pixErase = !px[3];
+        if (px[3]) paintCol = v3(px[0] / 255.0f, px[1] / 255.0f, px[2] / 255.0f);
+        if (px[3]) snprintf(b, sizeof b, "Picked #%02X%02X%02X", px[0], px[1], px[2]);
+        msg(px[3] ? b : "Picked a clear pixel: the eraser");
+        InvalidateRect(hPal, NULL, FALSE);
+        panel_sync();
+        return 0;
+    }
+    /* no pixels yet: Pixel Unwrap first (a face squashed by an edit gets its own pixels the same way) */
+    unsigned char *needy = o->m.tex ? malloc(o->m.nf + 1) : NULL;
+    int nn = needy ? mesh_uv_needy(&o->m, obj_mat(o), needy) : 0;
+    if (!o->m.tex || (nn && needy[h.face])) {
+        int was = o->m.tex != NULL, i = h.obj;
+        undo_push("Pixel Unwrap");
+        int r = pix_unwrap(i, was ? needy : NULL);
+        free(needy);
+        needy = NULL;
+        if (r <= 0) {
+            undo_drop();
+            msg(r < 0 ? "Pixel Unwrap: that would be over 4096 x 4096 pixels - lower Pixels / Unit" : "Pixel Unwrap: nothing to lay out");
+            return 0;
+        }
+        if (was) snprintf(b, sizeof b, "%d face(s) got pixels of their own", r);
+        else snprintf(b, sizeof b, "%s got %d x %d pixels (%d per unit) - paint away", ob[i].name, ob[i].m.tex->w, ob[i].m.tex->h, pixDens);
+        msg(b);
+        refresh_all();
+        if (!pix_hit(x, y, &h)) return 0;
+        o = &ob[h.obj];
+    }
+    free(needy);
+    if (h.x < 0 || !pix_faces(h.obj)) return 0;
+    if (pixFill) {
+        unsigned char c[4];
+        pix_rgba(c);
+        const unsigned char *px = o->m.tex->px + 4 * ((size_t)h.y * o->m.tex->w + h.x);
+        if (!memcmp(px, c, 4) || (!px[3] && !c[3])) return 0;
+        undo_push("Pixel Fill");
+        int n = tex_fill(tex_own(&o->m), pxc[h.obj].tf, h.x, h.y, c);
+        if (!n) { undo_drop(); return 0; }
+        snprintf(b, sizeof b, "Filled %d pixel(s)", n);
+        msg(b);
+        return 0;
+    }
+    int line = key(VK_SHIFT) && pp.have;
+    if (!line) pp.have = 0;
+    pp.dirty = pp.stale = 0;
+    pp.mx = x;
+    pp.my = y;
+    pp.obj = -1;
+    pp.x0 = pp.y0 = 1 << 30;
+    pp.x1 = pp.y1 = -1;
+    pix_at(x, y, line);
+    pix_flush();
+    return 1;
+}
+
 /* ================================================================ commands */
 
 enum {
@@ -2127,6 +3395,14 @@ enum {
     CM_RECENT = 300,             /* + recent file index */
     CM_THEME = 200               /* + theme index */
 };
+/* later commands start at 400, so ids saved with hotkeys never change */
+enum {
+    CM_TPIXEL = 400, CM_UNWRAP, CM_ASEPRITE, CM_TEXLOAD, CM_TEXSAVE, CM_TEXREMOVE,
+    CM_PALLOAD, CM_PALTEX, CM_PALRESET, CM_PIXFILL, CM_PIXGRID
+};
+
+/* the command that picks tool t */
+static int tool_cmd(int t) { return t == T_PIXEL ? CM_TPIXEL : CM_TSEL + t; }
 
 /* ---- hotkeys: each command can have two keys. The defaults are Maya's; Help > Hotkey Editor
    changes them, and the menus and toolbar show whatever is set. A key is its virtual key code plus
@@ -2145,6 +3421,7 @@ static Bind binds[] = {
     { CM_TWELD, "Tools", "Target Weld Tool", { 0 }, { 0 } },
     { CM_TLOOP, "Tools", "Insert Edge Loop Tool", { 0 }, { 0 } },
     { CM_TCUT, "Tools", "Multi-Cut Tool", { 0 }, { 0 } },
+    { CM_TPIXEL, "Tools", "Pixel Paint Tool", { 'P' }, { 0 } },
     { CM_MANIPUP, "Tools", "Bigger Manipulator", { VK_OEM_PLUS, VK_ADD }, { 0 } },
     { CM_MANIPDOWN, "Tools", "Smaller Manipulator", { VK_OEM_MINUS, VK_SUBTRACT }, { 0 } },
     { CM_COMPTOG, "Selection", "Object / Component Mode", { VK_F8 }, { 0 } },
@@ -2179,6 +3456,14 @@ static Bind binds[] = {
     { CM_TRIANG, "Mesh", "Triangulate", { 0 }, { 0 } },
     { CM_QUAD, "Mesh", "Quadrangulate", { 0 }, { 0 } },
     { CM_REVERSE, "Mesh", "Reverse Normals", { 0 }, { 0 } },
+    { CM_UNWRAP, "Texture", "Pixel Unwrap", { 0 }, { 0 } },
+    { CM_PIXFILL, "Texture", "Bucket Fill On/Off", { 0 }, { 0 } },
+    { CM_PIXGRID, "Texture", "Pixel Grid On/Off", { 0 }, { 0 } },
+    { CM_ASEPRITE, "Texture", "Edit Texture in Aseprite", { 0 }, { 0 } },
+    { CM_TEXLOAD, "Texture", "Load Texture", { 0 }, { 0 } },
+    { CM_TEXSAVE, "Texture", "Save Texture As", { 0 }, { 0 } },
+    { CM_TEXREMOVE, "Texture", "Remove Texture", { 0 }, { 0 } },
+    { CM_PALLOAD, "Texture", "Load Palette", { 0 }, { 0 } },
     { CM_FREEZE, "Modify", "Freeze Transformations", { 0 }, { 0 } },
     { CM_CENTERPIV, "Modify", "Center Pivot", { 0 }, { 0 } },
     { CM_RESETXF, "Modify", "Reset Transformations", { 0 }, { 0 } },
@@ -2267,6 +3552,16 @@ static void binds_load(void)
         Bind *b = bind_of(v[i]);
         if (b) { b->key[0] = v[i + 1]; b->key[1] = v[i + 2]; }
     }
+    /* a key someone gave a command themselves wins over a newer command's default (P) */
+    for (int i = 0; i < NBIND; i++)
+        for (int k = 0; k < 2; k++) {
+            Bind *b = &binds[i];
+            int code = b->key[k], taken = 0;
+            if (!code || code != b->def[k]) continue;
+            for (int j = 0; j < NBIND; j++)
+                for (int q = 0; q < 2; q++) taken |= j != i && binds[j].key[q] == code && binds[j].key[q] != binds[j].def[q];
+            if (taken) b->key[k] = 0;
+        }
 }
 
 /* menu items show the current key after a tab */
@@ -2851,12 +4146,14 @@ static int file_dlg(int save, char *path)
 
 /* ---- tuff3d scene files (.tuff): plain text that keeps everything tuff3d knows about a scene:
    objects with their transforms, shading, hidden state, primitive settings, vertex colors and
-   edge overrides, plus the camera and the image planes. Lines:
+   edge overrides, textures, plus the camera and the image planes. Lines:
      tuff3d scene 1
      camera cx cy cz yaw pitch dist ortho
      image slot size ox oy opacity path
      object name / xform t r s / shade angle / hidden 0|1 / prim type and its settings
-     v x y z r g b / f i j k ... (0 based) / e a b override / end */
+     v x y z r g b / f i j k ... (0 based) / e a b override
+     uv u v u v ... (one line per face, in pixels) / tex w h / t rrggbbaa... (one line per pixel row)
+     texfile time-high time-low path (the picture it is linked to) / end */
 
 static int tuff_save(const char *path, int selOnly)
 {
@@ -2887,6 +4184,27 @@ static int tuff_save(const char *path, int selOnly)
         }
         for (int e = 0; e < m->ne; e++)
             if (m->eh[e]) fprintf(f, "e %d %d %d\n", m->ev[2 * e], m->ev[2 * e + 1], m->eh[e]);
+        if (m->uv && m->tex) {
+            static const char hx[] = "0123456789abcdef";
+            for (int fc = 0; fc < m->nf; fc++) {
+                fputs("uv", f);
+                for (int k = m->fo[fc]; k < m->fo[fc + 1]; k++) fprintf(f, " %.9g %.9g", m->uv[2 * k], m->uv[2 * k + 1]);
+                fputc('\n', f);
+            }
+            fprintf(f, "tex %d %d\n", m->tex->w, m->tex->h);
+            char *row = malloc((size_t)m->tex->w * 8 + 4);
+            for (int y = 0; y < m->tex->h && row; y++) {
+                const unsigned char *px = m->tex->px + 4 * (size_t)y * m->tex->w;
+                char *w = row;
+                *w++ = 't';
+                *w++ = ' ';
+                for (int k = 0; k < m->tex->w * 4; k++) { *w++ = hx[px[k] >> 4]; *w++ = hx[px[k] & 15]; }
+                *w++ = '\n';
+                fwrite(row, 1, (size_t)(w - row), f);
+            }
+            free(row);
+            if (o->tex[0]) fprintf(f, "texfile %lu %lu %s\n", (unsigned long)(o->texTime >> 32), (unsigned long)(o->texTime & 0xffffffffu), o->tex);
+        }
         fprintf(f, "end\n");
         n++;
     }
@@ -2895,9 +4213,14 @@ static int tuff_save(const char *path, int selOnly)
     return ok ? n : -1;
 }
 
-typedef struct { Obj o; int nv, nf, ni, ne, cv, cf, ci, ce; V3 *p, *c; int *fo, *fi, *eh; } TObj;
+typedef struct {
+    Obj o; int nv, nf, ni, ne, cv, cf, ci, ce; V3 *p, *c; int *fo, *fi, *eh;
+    float *uv; int nuv, cuv, tw, th, trow; unsigned char *tpx;
+} TObj;
 
-static void tobj_free(TObj *t) { free(t->p); free(t->c); free(t->fo); free(t->fi); free(t->eh); }
+static void tobj_free(TObj *t) { free(t->p); free(t->c); free(t->fo); free(t->fi); free(t->eh); free(t->uv); free(t->tpx); }
+
+static int hexv(int ch) { return ch >= '0' && ch <= '9' ? ch - '0' : ch >= 'a' && ch <= 'f' ? ch - 'a' + 10 : ch >= 'A' && ch <= 'F' ? ch - 'A' + 10 : -1; }
 
 /* reads a scene's objects into the scene; returns how many, or -1. camera / images: take those too */
 static int tuff_load(const char *path, int camera, int images)
@@ -2974,6 +4297,38 @@ static int tuff_load(const char *path, int camera, int images)
             if (c->ne == c->ce) { c->ce = c->ce * 2 + 32; c->eh = realloc(c->eh, c->ce * 3 * sizeof(int)); }
             int *e = c->eh + 3 * c->ne;
             if (sscanf(line + 2, "%d %d %d", &e[0], &e[1], &e[2]) == 3 && e[2] >= EH_AUTO && e[2] <= EH_SOFT) c->ne++;
+        } else if (!strncmp(line, "uv ", 3)) {
+            for (char *q = line + 3, *end;; q = end) {
+                float v = strtof(q, &end);
+                if (end == q) break;
+                if (c->nuv == c->cuv) { c->cuv = c->cuv * 2 + 256; c->uv = realloc(c->uv, c->cuv * sizeof(float)); }
+                c->uv[c->nuv++] = v;
+            }
+        } else if (!strncmp(line, "tex ", 4)) {
+            int w, h;
+            if (sscanf(line + 4, "%d %d", &w, &h) == 2 && w > 0 && h > 0 && w <= 8192 && h <= 8192 && !c->tpx) {
+                c->tpx = calloc((size_t)w * h, 4);
+                c->tw = w;
+                c->th = h;
+                c->trow = 0;
+            }
+        } else if (line[0] == 't' && line[1] == ' ') {
+            if (!c->tpx || c->trow >= c->th) continue;
+            unsigned char *px = c->tpx + 4 * (size_t)c->trow * c->tw;
+            const char *q = line + 2;
+            for (int k = 0; k < c->tw * 4 && q[0] && q[1]; k++, q += 2) {
+                int a = hexv(q[0]), b = hexv(q[1]);
+                if (a < 0 || b < 0) break;
+                px[k] = (unsigned char)(a << 4 | b);
+            }
+            c->trow++;
+        } else if (!strncmp(line, "texfile ", 8)) {
+            unsigned long hi, lo;
+            int pos = 0;
+            if (sscanf(line + 8, "%lu %lu %n", &hi, &lo, &pos) == 2 && pos) {
+                snprintf(c->o.tex, sizeof c->o.tex, "%s", line + 8 + pos);
+                c->o.texTime = (unsigned long long)hi << 32 | lo;
+            }
         }
     }
     fclose(f);
@@ -2989,6 +4344,22 @@ static int tuff_load(const char *path, int camera, int images)
         memcpy(o->name, taken ? nm : c->o.name, 32);   /* keep the saved name unless it is in use */
         o->m = mesh_from_arrays(c->nv, c->p, c->c, c->nf, c->fo, c->fi);
         if (c->ne) mesh_set_eh(&o->m, c->eh, c->ne);
+        if (c->tpx && c->trow == c->th && c->nuv == 2 * o->m.fo[o->m.nf]) {
+            o->m.uv = c->uv;
+            c->uv = NULL;
+            o->m.tex = tex_new(c->tw, c->th);
+            memcpy(o->m.tex->px, c->tpx, (size_t)c->tw * c->th * 4);
+            mesh_uv_changed(&o->m);
+            o->prim.type = PRIM_NONE;
+            if (o->tex[0]) {
+                /* the linked picture changed while the scene was closed (painted in Aseprite): take it */
+                unsigned long long t = file_time(o->tex);
+                if (t && t != o->texTime && tex_from_file((int)(o - ob), o->tex)) o->texTime = t;
+                watch_start();
+            }
+        } else {
+            o->tex[0] = 0;
+        }
         o->sel = o->hil = 0;
         o->order = ++stamp;
         tobj_free(c);
@@ -3007,21 +4378,43 @@ static void recent_add(const char *path);
 static int save_scene(const char *path, int selOnly)
 {
     if (has_ext(path, ".tuff")) return tuff_save(path, selOnly);
-    const Mesh **ms = malloc((nob + 1) * sizeof *ms);
-    M4 *mats = malloc((nob + 1) * sizeof *mats);
-    const char **names = malloc((nob + 1) * sizeof *names);
-    float *angles = malloc((nob + 1) * sizeof *angles);
-    int n = 0;
+    const Mesh **ms = calloc(nob + 1, sizeof *ms);
+    M4 *mats = calloc(nob + 1, sizeof *mats);
+    const char **names = calloc(nob + 1, sizeof *names), **texs = calloc(nob + 1, sizeof *texs);
+    float *angles = calloc(nob + 1, sizeof *angles);
+    char (*tn)[MAX_PATH] = calloc(nob + 1, sizeof *tn);
+    int n = 0, bad = 0;
+    const char *base = file_name(path), *dot = strrchr(base, '.');
     for (int i = 0; i < nob; i++) {
         if (selOnly && !active(&ob[i])) continue;
         ms[n] = &ob[i].m;
         mats[n] = obj_mat(&ob[i]);
         names[n] = ob[i].name;
         angles[n] = ob[i].nangle;
+        texs[n] = NULL;
+        if (ob[i].m.tex && ob[i].m.uv) {
+            /* the picture goes next to the OBJ as obj-name_object-name.png, named in a .mtl */
+            char full[MAX_PATH];
+            snprintf(tn[n], MAX_PATH, "%.*s_%s.png", dot ? (int)(dot - base) : (int)strlen(base), base, ob[i].name);
+            snprintf(full, sizeof full, "%.*s%s", (int)(base - path), path, tn[n]);
+            if (png_save(full, ob[i].m.tex->px, ob[i].m.tex->w, ob[i].m.tex->h)) {
+                texs[n] = tn[n];
+                if (!ob[i].tex[0]) {   /* from now on, edits to that picture come back here */
+                    snprintf(ob[i].tex, sizeof ob[i].tex, "%s", full);
+                    ob[i].texTime = file_time(full);
+                    watch_start();
+                } else if (!lstrcmpiA(ob[i].tex, full)) {
+                    ob[i].texTime = file_time(full);
+                }
+            } else {
+                bad++;
+            }
+        }
         n++;
     }
-    int ok = obj_save(path, n, ms, mats, names, angles);
-    free(ms); free(mats); free(names); free(angles);
+    int ok = obj_save(path, n, ms, mats, names, angles, texs);
+    free(ms); free(mats); free(names); free(angles); free(texs); free(tn);
+    if (ok && bad) MessageBoxA(hMain, "Some textures could not be written next to the OBJ.", APP_NAME, MB_ICONWARNING);
     return ok ? n : -1;
 }
 
@@ -3110,11 +4503,11 @@ static void load_file(const char *path, int replace)
     int mlt = ext && !lstrcmpiA(ext, ".mlt");
     char report[600] = "";
     Mesh *ms;
-    char (*names)[32];
+    char (*names)[32], (*texs)[260] = NULL;
     float *angles = NULL;
-    int n = mlt ? mlt_load(p, &ms, &names, report, sizeof report) : obj_load(p, &ms, &names, &angles);
+    int n = mlt ? mlt_load(p, &ms, &names, report, sizeof report) : obj_load(p, &ms, &names, &angles, &texs);
     if (n <= 0) {
-        if (n == 0) free(ms), free(names), free(angles);
+        if (n == 0) free(ms), free(names), free(angles), free(texs);
         snprintf(b, sizeof b, n < 0 ? "Could not read %s" : "Nothing in %s could be rebuilt yet", p);
         if (mlt && report[0]) {
             size_t l = strlen(b);
@@ -3130,16 +4523,38 @@ static void load_file(const char *path, int replace)
     }
     set_mode(M_OBJ);
     clear_sel();
+    int lost = 0;
     for (int i = 0; i < n; i++) {
         Obj *o = obj_new(names[i]);
         o->m = ms[i];
         if (angles && angles[i] >= 0) o->nangle = angles[i];
         o->sel = !replace;
         o->order = ++stamp;
+        if (o->m.uv) {
+            /* uvs from 0 to 1 come with a picture: scale them to its pixels */
+            int w = 0, h = 0;
+            unsigned char *px = texs && texs[i][0] ? image_load(texs[i], &w, &h, 1) : NULL;
+            if (px) {
+                o->m.tex = tex_new(w, h);
+                memcpy(o->m.tex->px, px, (size_t)w * h * 4);
+                free(px);
+                mesh_uv_scale(&o->m, (float)w, (float)h);
+                snprintf(o->tex, sizeof o->tex, "%s", texs[i]);
+                for (char *c = o->tex; *c; c++) if (*c == '/') *c = '\\';
+                o->texTime = file_time(o->tex);
+                watch_start();
+            } else {
+                free(o->m.uv);
+                o->m.uv = NULL;
+                mesh_uv_changed(&o->m);
+                lost++;
+            }
+        }
     }
     free(ms);
     free(names);
     free(angles);
+    free(texs);
     if (replace) {
         /* an .mlt opens as an unsaved OBJ scene: Export must never write over the .mlt itself */
         snprintf(g_path, sizeof g_path, "%s", mlt ? "" : p);
@@ -3150,7 +4565,7 @@ static void load_file(const char *path, int replace)
         frame(1);
     }
     const char *fn = strrchr(p, '\\') ? strrchr(p, '\\') + 1 : p;
-    snprintf(b, sizeof b, "%s %d object(s) from %s", replace ? "Opened" : "Imported", n, fn);
+    snprintf(b, sizeof b, "%s %d object(s) from %s%s", replace ? "Opened" : "Imported", n, fn, lost ? " (some textures were missing)" : "");
     msg(b);
     if (mlt && strstr(report, "not supported")) {
         snprintf(b, sizeof b, "Rebuilt %s from its Maya LT history.\n\n%s\n\nThose steps were skipped, so parts of the model "
@@ -4046,6 +5461,11 @@ static const char *HELP_TEXT =
     "  Target Weld\tDrag one vertex onto another\n"
     "  Insert Edge Loop\tClick an edge (yellow preview)\n"
     "  Multi-Cut\tClick points; Enter/RMB finish, Backspace, Esc, Ctrl+click = loop\n\n"
+    "Pixel Paint (P)\n"
+    "  Click / drag\tPaint pixels (a model without pixels gets them first)\n"
+    "  Ctrl+click / Shift+click\tPick that color / straight line from the last pixel\n"
+    "  B + drag\tBrush size\n"
+    "  Texture menu\tPixel Unwrap, Bucket Fill, Edit in Aseprite, palettes\n\n"
     "Edit\n"
     "  Ctrl+E / Ctrl+B\tExtrude / bevel (Bevel Width in the side panel)\n"
     "  Ctrl+D / Delete\tDuplicate / delete (edges and vertices: their faces join)\n"
@@ -4176,6 +5596,17 @@ static void do_cmd(int id)
     case CM_TSEL: case CM_TMOVE: case CM_TROT: case CM_TSCALE: case CM_TPAINT: case CM_TWELD: case CM_TLOOP: case CM_TCUT:
         set_tool(id - CM_TSEL);
         break;
+    case CM_TPIXEL: set_tool(T_PIXEL); break;
+    case CM_UNWRAP: cmd_unwrap(); break;
+    case CM_ASEPRITE: cmd_aseprite(); break;
+    case CM_TEXLOAD: cmd_tex_load(); break;
+    case CM_TEXSAVE: cmd_tex_save(); break;
+    case CM_TEXREMOVE: cmd_tex_remove(); break;
+    case CM_PALLOAD: cmd_pal_load(); InvalidateRect(hPal, NULL, FALSE); break;
+    case CM_PALTEX: cmd_pal_tex(); InvalidateRect(hPal, NULL, FALSE); break;
+    case CM_PALRESET: pal_default(); pal_save(); msg("Default palette"); break;
+    case CM_PIXFILL: pixFill = !pixFill; msg(pixFill ? "Bucket fill: a click fills the area of one color" : "Pencil: a click paints the brush's pixels"); break;
+    case CM_PIXGRID: pixGrid = !pixGrid; msg(pixGrid ? "Pixel grid on (shows once you zoom in)" : "Pixel grid off"); break;
     case CM_REVERSE: cmd_face_op(mesh_reverse, "Reverse Normals", "Reversed %d face(s)"); break;
     case CM_TRIANG: cmd_face_op(mesh_triangulate, "Triangulate", "Triangulated %d face(s)"); break;
     case CM_QUAD: cmd_face_op(quad30, "Quadrangulate", "Joined %d triangle pair(s) into quads"); break;
@@ -4206,7 +5637,7 @@ static void do_cmd(int id)
     }
     }
     if ((id >= CM_DELETE && id <= CM_MERGE) || id == CM_APPLYCOL || id == CM_GROW || id == CM_SHRINK ||
-        (id >= CM_FREEZE && id <= CM_RESETXF) || id == CM_FILLHOLE || (id >= CM_REVERSE && id <= CM_SOFTEN))
+        (id >= CM_FREEZE && id <= CM_RESETXF) || id == CM_FILLHOLE || (id >= CM_REVERSE && id <= CM_SOFTEN) || id == CM_UNWRAP)
         lastCmd = id;
     refresh_all();
 }
@@ -4222,14 +5653,15 @@ enum {
     PF_PW, PF_PD, PF_PSW, PF_PSD,
     PF_OPA, PF_RAD, PF_COLOR, PF_APPLY,
     PF_MERGED, PF_BEVELW, PF_BRIDGED,
-    PF_IMG   /* + plane * 4 + (size, offset x, offset y, opacity) */
+    PF_IMG,  /* + plane * 4 + (size, offset x, offset y, opacity) */
+    PF_PBRUSH = PF_IMG + 16, PF_PFILL, PF_PGRID, PF_PDENS
 };
-enum { RK_HEAD = 1, RK_FLOAT, RK_INT, RK_BOOL, RK_COLOR, RK_BUTTON, RK_NAME, RK_TIP };
+enum { RK_HEAD = 1, RK_FLOAT, RK_INT, RK_BOOL, RK_COLOR, RK_BUTTON, RK_NAME, RK_TIP, RK_PALETTE };   /* a button's id is its command */
 #define NROW 64
-typedef struct { int kind, id; char label[40]; } Row;
+typedef struct { int kind, id; char label[64]; } Row;
 static Row rows[NROW];
 static int nrows, panelObj = -1, building;
-static HWND rLab[NROW], rEdit[NROW], rChk[NROW], hSwatch, hApply;
+static HWND rLab[NROW], rEdit[NROW], rChk[NROW], rBtn[NROW], hSwatch;
 static WNDPROC editProc0;
 
 static float *fld_f(int id)
@@ -4266,6 +5698,10 @@ static int *fld_i(int id)
 {
     Obj *o = panelObj >= 0 && panelObj < nob ? &ob[panelObj] : NULL;
     if (id == PF_BRIDGED) return &bridgeDivs;
+    if (id == PF_PBRUSH) return &pixBrush;
+    if (id == PF_PFILL) return &pixFill;
+    if (id == PF_PGRID) return &pixGrid;
+    if (id == PF_PDENS) return &pixDens;
     if (!o) return NULL;
     switch (id) {
     case PF_CSW: return &o->prim.sw;
@@ -4328,7 +5764,32 @@ static void panel_build(void)
     nrows = 0;
     Obj *o = lead();
     panelObj = o ? (int)(o - ob) : -1;
-    if (o) {
+    if (tool == T_PIXEL) {
+        /* painting: just what painting needs */
+        char b[64];
+        if (o) add_row(RK_NAME, 0, "Name");
+        add_row(RK_HEAD, 0, "Pixel Paint");
+        add_row(RK_COLOR, PF_COLOR, "Color");
+        add_row(RK_PALETTE, 0, "");
+        add_row(RK_INT, PF_PBRUSH, "Brush Size");
+        add_row(RK_BOOL, PF_PFILL, "Bucket Fill");
+        add_row(RK_BOOL, PF_PGRID, "Pixel Grid");
+        add_row(RK_HEAD, 0, "Texture");
+        add_row(RK_INT, PF_PDENS, "Pixels / Unit");
+        add_row(RK_BUTTON, CM_UNWRAP, mode == M_OBJ ? "Pixel Unwrap" : "Pixel Unwrap Selected Faces");
+        add_row(RK_BUTTON, CM_ASEPRITE, "Edit in Aseprite");
+        if (o && o->m.tex) {
+            snprintf(b, sizeof b, "%d x %d pixels", o->m.tex->w, o->m.tex->h);
+            add_row(RK_TIP, 0, b);
+            if (o->tex[0]) {
+                snprintf(b, sizeof b, "Linked to %s", file_name(o->tex));
+                add_row(RK_TIP, 0, b);
+            }
+        } else {
+            add_row(RK_TIP, 0, o ? "No pixels yet: click it to start," : "Click a model to paint it.");
+            add_row(RK_TIP, 0, o ? "or press Pixel Unwrap." : "It gets pixels the first time.");
+        }
+    } else if (o) {
         add_row(RK_NAME, 0, "Name");
         for (int i = 0; i < 9; i++) add_row(RK_FLOAT, PF_TX + i, trs[i]);
         add_row(RK_FLOAT, PF_NANGLE, "Normal Angle");
@@ -4367,16 +5828,18 @@ static void panel_build(void)
         add_row(RK_TIP, 0, "Tip: drag a label left or right");
         add_row(RK_TIP, 0, "to scrub its value (Shift = fast).");
     }
-    add_row(RK_HEAD, 0, "Vertex Color");
-    add_row(RK_COLOR, PF_COLOR, "Color");
-    add_row(RK_FLOAT, PF_OPA, "Opacity");
-    add_row(RK_FLOAT, PF_RAD, "Brush Radius");
-    add_row(RK_BUTTON, PF_APPLY, "Apply Color to Selection");
-    add_row(RK_HEAD, 0, "Mesh Tools");
-    add_row(RK_FLOAT, PF_MERGED, "Merge Distance");
-    add_row(RK_FLOAT, PF_BEVELW, "Bevel Width");
-    add_row(RK_INT, PF_BRIDGED, "Bridge Divisions");
-    for (int i = 0; i < 3; i++) {
+    if (tool != T_PIXEL) {
+        add_row(RK_HEAD, 0, "Vertex Color");
+        add_row(RK_COLOR, PF_COLOR, "Color");
+        add_row(RK_FLOAT, PF_OPA, "Opacity");
+        add_row(RK_FLOAT, PF_RAD, "Brush Radius");
+        add_row(RK_BUTTON, CM_APPLYCOL, "Apply Color to Selection");
+        add_row(RK_HEAD, 0, "Mesh Tools");
+        add_row(RK_FLOAT, PF_MERGED, "Merge Distance");
+        add_row(RK_FLOAT, PF_BEVELW, "Bevel Width");
+        add_row(RK_INT, PF_BRIDGED, "Bridge Divisions");
+    }
+    for (int i = 0; i < 3 && tool != T_PIXEL; i++) {
         static const char *lab[4] = { "Size", "Offset X", "Offset Y", "Opacity" };
         char b[40];
         if (!img[i].tex) continue;
@@ -4389,7 +5852,7 @@ static void panel_build(void)
     GetClientRect(hPanel, &rc);
     int W = rc.right, rh = (int)(22 * ds), pad = (int)(6 * ds), lw = (int)(92 * ds), y = pad;
     int ew = W - lw - 2 * pad;
-    HWND swatchShown = NULL, applyShown = NULL;
+    HWND swatchShown = NULL, palShown = NULL;
     for (int r = 0; r < NROW; r++) {
         int k = r < nrows ? rows[r].kind : 0;
         if (k == RK_HEAD && r) y += pad;
@@ -4414,11 +5877,23 @@ static void panel_build(void)
         }
         ShowWindow(rChk[r], k == RK_BOOL ? SW_SHOW : SW_HIDE);
         if (k == RK_COLOR) { MoveWindow(hSwatch, pad + lw + 1, y + 1, ew - 2, rh - 4, TRUE); swatchShown = hSwatch; }
-        if (k == RK_BUTTON) { MoveWindow(hApply, pad, y, W - 2 * pad, rh + 2, TRUE); applyShown = hApply; y += 4; }
+        if (k == RK_BUTTON) {
+            SetWindowTextA(rBtn[r], rows[r].label);
+            MoveWindow(rBtn[r], pad, y, W - 2 * pad, rh + 2, TRUE);
+            y += 4;
+        }
+        ShowWindow(rBtn[r], k == RK_BUTTON ? SW_SHOW : SW_HIDE);
+        if (k == RK_PALETTE) {
+            int ph = pal_height(W - 2 * pad);
+            MoveWindow(hPal, pad, y + 2, W - 2 * pad, ph, TRUE);
+            InvalidateRect(hPal, NULL, FALSE);
+            palShown = hPal;
+            y += ph + 6 - rh;
+        }
         if (k) y += k == RK_TIP ? rh * 3 / 4 : rh;
     }
     ShowWindow(hSwatch, swatchShown ? SW_SHOW : SW_HIDE);
-    ShowWindow(hApply, applyShown ? SW_SHOW : SW_HIDE);
+    ShowWindow(hPal, palShown ? SW_SHOW : SW_HIDE);
     RedrawWindow(hPanel, NULL, NULL, RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN);
     panel_sync();
     building = 0;
@@ -4472,6 +5947,9 @@ static void panel_set(int r, double v)
         *fld_f(id) = (float)v;
     } else {
         if (id == PF_BRIDGED) { bridgeDivs = v < 0 ? 0 : v > 50 ? 50 : (int)v; live_redo(CM_BRIDGE); return; }
+        if (id == PF_PBRUSH) { pixBrush = v < 1 ? 1 : v > 32 ? 32 : (int)v; return; }
+        if (id == PF_PDENS) { pixDens = v < 1 ? 1 : v > 256 ? 256 : (int)v; return; }
+        if (id == PF_PFILL || id == PF_PGRID) { *fld_i(id) = v != 0; return; }
         *fld_i(id) = (int)v;
     }
     prim_rebuild(&ob[panelObj]);
@@ -4581,14 +6059,19 @@ static LRESULT CALLBACK PanelProc(HWND h, UINT m, WPARAM wp, LPARAM lp)
             int r = id - 2000;
             panel_commit(r, SendMessage(rChk[r], BM_GETCHECK, 0, 0) == BST_CHECKED);
             SetFocus(hView);
-        } else if (id == 3000 && code == STN_CLICKED) { do_cmd(CM_SETCOL); SetFocus(hView); }
-        else if (id == 3001 && code == BN_CLICKED) { do_cmd(CM_APPLYCOL); SetFocus(hView); }
+        } else if (id == 3000 && code == STN_CLICKED) { do_cmd(CM_SETCOL); pixErase = 0; SetFocus(hView); }
+        else if (id >= 4000 && id < 4000 + NROW && code == BN_CLICKED && id - 4000 < nrows) { do_cmd(rows[id - 4000].id); SetFocus(hView); }
         return 0;
     }
     case WM_CTLCOLORSTATIC: {
         if ((HWND)lp == hSwatch) {
             if (swatchBrush) DeleteObject(swatchBrush);
-            swatchBrush = CreateSolidBrush(RGB((int)(paintCol.x * 255 + .5f), (int)(paintCol.y * 255 + .5f), (int)(paintCol.z * 255 + .5f)));
+            if (tool == T_PIXEL && pixErase) {   /* the eraser: clear pixels */
+                SetBkColor((HDC)wp, RGB(235, 235, 235));
+                swatchBrush = CreateHatchBrush(HS_DIAGCROSS, RGB(170, 170, 170));
+            } else {
+                swatchBrush = CreateSolidBrush(RGB((int)(paintCol.x * 255 + .5f), (int)(paintCol.y * 255 + .5f), (int)(paintCol.z * 255 + .5f)));
+            }
             return (LRESULT)swatchBrush;
         }
         int kind = 0;
@@ -4688,8 +6171,11 @@ static void panel_create(HINSTANCE inst)
         editProc0 = (WNDPROC)SetWindowLongPtrA(rEdit[r], GWLP_WNDPROC, (LONG_PTR)EditProc);
     }
     hSwatch = CreateWindowA("STATIC", "", WS_CHILD | SS_NOTIFY, 0, 0, 1, 1, hPanel, (HMENU)3000, inst, NULL);
-    hApply = CreateWindowA("BUTTON", "Apply Color to Selection", WS_CHILD | BS_OWNERDRAW, 0, 0, 1, 1, hPanel, (HMENU)3001, inst, NULL);
-    SendMessage(hApply, WM_SETFONT, (WPARAM)hFont, 0);
+    for (int r = 0; r < NROW; r++) {
+        rBtn[r] = CreateWindowA("BUTTON", "", WS_CHILD | BS_OWNERDRAW, 0, 0, 1, 1, hPanel, (HMENU)(INT_PTR)(4000 + r), inst, NULL);
+        SendMessage(rBtn[r], WM_SETFONT, (WPARAM)hFont, 0);
+    }
+    hPal = CreateWindowA("Tuff3DPal", "", WS_CHILD, 0, 0, 1, 1, hPanel, NULL, inst, NULL);
 }
 
 /* ================================================================ toolbar (shelf) */
@@ -4701,7 +6187,8 @@ static const Tool tbItems[] = {
     { "Move", "W", CM_TMOVE, "Move tool: drag the arrows (1 axis), squares (2 axes) or center" },
     { "Rotate", "E", CM_TROT, "Rotate tool: drag a ring; hold J for 15 degree steps" },
     { "Scale", "R", CM_TSCALE, "Scale tool: drag a handle; drag components past the center to flatten them" },
-    { "Paint", "", CM_TPAINT, "Paint vertex colors: drag over a mesh; B + drag sets the brush size" }, { 0 },
+    { "Paint", "", CM_TPAINT, "Paint vertex colors: drag over a mesh; B + drag sets the brush size" },
+    { "Pixel", "P", CM_TPIXEL, "Pixel Paint: paint pixel art right on the model (it gets square pixels the first time you click it)" }, { 0 },
     { "Object", "F8", CM_MOBJ, "Object mode: pick whole objects (F8 toggles object/component)" },
     { "Vertex", "F9", CM_MVERT, "Vertex mode (Ctrl+F9 converts the selection to vertices)" },
     { "Edge", "F10", CM_MEDGE, "Edge mode: double-click an edge to select its loop" },
@@ -4738,7 +6225,10 @@ static int tbHover = -1, tbDown = -1;
 
 static int tb_on(int cmd)
 {
-    if (cmd >= CM_TSEL && cmd < CM_TSEL + NTOOL) return tool == cmd - CM_TSEL;
+    if (cmd >= CM_TSEL && cmd <= CM_TCUT) return tool == cmd - CM_TSEL;
+    if (cmd == CM_TPIXEL) return tool == T_PIXEL;
+    if (cmd == CM_PIXFILL) return pixFill;
+    if (cmd == CM_PIXGRID) return pixGrid;
     if (cmd >= CM_HARD && cmd <= CM_AUTOSMOOTH) {
         Obj *l = lead();
         float a = l ? l->nangle : defAngle;
@@ -4880,7 +6370,7 @@ static LRESULT CALLBACK BarProc(HWND h, UINT m, WPARAM wp, LPARAM lp)
 static void status_text(void)
 {
     static const char *mn[] = { "Object mode", "Vertex mode", "Edge mode", "Face mode", "Multi mode" };
-    static const char *tn[] = { "Select tool", "Move tool", "Rotate tool", "Scale tool", "Paint tool", "Target Weld", "Insert Edge Loop", "Multi-Cut" };
+    static const char *tn[] = { "Select tool", "Move tool", "Rotate tool", "Scale tool", "Paint tool", "Target Weld", "Insert Edge Loop", "Multi-Cut", "Pixel Paint" };
     static const char *hint[] = {
         "Click to select, drag for a box. Shift: toggle, Ctrl: remove, Ctrl+Shift: add. Alt+drag: orbit/pan/zoom",
         "Drag a handle to move. Hold X: grid snap, V: point snap, Ctrl+handle: other two axes, Esc: cancel",
@@ -4890,6 +6380,7 @@ static void status_text(void)
         "Drag from one vertex onto another to weld them together (the first one moves). Esc cancels",
         "Click an edge to add an edge loop across it, where the yellow preview shows",
         "Click points on edges or vertices to cut. Enter/right click: finish, Backspace: undo point, Esc: drop, Ctrl+click: edge loop",
+        "Click or drag on a model to paint pixels. Ctrl+click: pick a color, Shift+click: straight line, B+drag: brush size",
     };
     int nsel = 0, ncomp = 0;
     for (int i = 0; i < nob; i++) {
@@ -4902,6 +6393,18 @@ static void status_text(void)
         snprintf(h, sizeof h, "%s", tbItems[tbHover].desc);
     } else if (dk == D_MANIP || (g_msg[0] && GetTickCount() - msgT < 5000)) {
         snprintf(h, sizeof h, "%s", g_msg);
+    } else if (tool == T_PIXEL && pxh.obj >= 0 && pxh.obj < nob) {
+        const Mesh *m = &ob[pxh.obj].m;
+        if (pxh.x >= 0 && m->tex && pxh.x < m->tex->w && pxh.y < m->tex->h) {
+            const unsigned char *px = m->tex->px + 4 * ((size_t)pxh.y * m->tex->w + pxh.x);
+            char c[16];
+            if (px[3]) snprintf(c, sizeof c, "#%02X%02X%02X", px[0], px[1], px[2]);
+            else snprintf(c, sizeof c, "clear");
+            snprintf(h, sizeof h, "%s  pixel %d, %d  %s - %s, Ctrl+click: pick this color, Shift+click: line from the last pixel",
+                     ob[pxh.obj].name, pxh.x, pxh.y, c, pixFill ? "click to fill" : "click to paint");
+        } else {
+            snprintf(h, sizeof h, "%s - click to give it pixels (Pixel Unwrap at %d per unit) and start painting", ob[pxh.obj].name, pixDens);
+        }
     } else if (hvObj >= 0 && hvObj < nob) {
         static const char *kn[] = { "", "vertex", "edge", "face" };
         if (hvKind) snprintf(h, sizeof h, "%s  %s %d - click to select it%s", ob[hvObj].name, kn[hvKind], hvIdx,
@@ -4927,7 +6430,9 @@ static void status_update(void)
         if (*c == '\\' || *c == '/') fn = c + 1;
     snprintf(s, sizeof s, "%s%s - " APP_NAME, fn, modified ? "*" : "");
     SetWindowTextA(hMain, s);
-    for (int i = 0; i < NTOOL; i++) CheckMenuItem(hMenu, CM_TSEL + i, MF_BYCOMMAND | (tool == i ? MF_CHECKED : MF_UNCHECKED));
+    for (int i = 0; i < NTOOL; i++) CheckMenuItem(hMenu, tool_cmd(i), MF_BYCOMMAND | (tool == i ? MF_CHECKED : MF_UNCHECKED));
+    CheckMenuItem(hMenu, CM_PIXFILL, MF_BYCOMMAND | (pixFill ? MF_CHECKED : MF_UNCHECKED));
+    CheckMenuItem(hMenu, CM_PIXGRID, MF_BYCOMMAND | (pixGrid ? MF_CHECKED : MF_UNCHECKED));
     for (int i = 0; i < 5; i++) CheckMenuItem(hMenu, CM_MOBJ + i, MF_BYCOMMAND | (mode == i ? MF_CHECKED : MF_UNCHECKED));
     CheckMenuItem(hMenu, CM_WIRE, MF_BYCOMMAND | (wire ? MF_CHECKED : MF_UNCHECKED));
     CheckMenuItem(hMenu, CM_SHADED, MF_BYCOMMAND | (!wire ? MF_CHECKED : MF_UNCHECKED));
@@ -4954,6 +6459,8 @@ static void refresh_all(void)
 {
     geo_changed();
     if (hvObj >= nob) hvObj = -1;
+    if (tool == T_PIXEL && dk == D_NONE) pix_hover(curx, cury);
+    else pxh.obj = -1;
     panel_build();
     status_update();
     redraw();
@@ -5091,7 +6598,7 @@ static void draw_hover(const Obj *o)
 static void hover_update(int x, int y)
 {
     int o = -1, k = 0, i = 0;
-    if (x > -1000 && dk == D_NONE && tool != T_PAINT && tool != T_LOOP && tool != T_CUT && !(manip_vis() && hover)) {
+    if (x > -1000 && dk == D_NONE && tool != T_PAINT && tool != T_PIXEL && tool != T_LOOP && tool != T_CUT && !(manip_vis() && hover)) {
         cam_update();
         if (mode != M_OBJ) pick_comp(x, y, &o, &k, &i);
         if (o < 0) {
@@ -5246,7 +6753,7 @@ static HCURSOR view_cursor(void)
     if (dk == D_TUMBLE) c = IDC_SIZEALL;
     else if (dk == D_PAN) c = IDC_HAND;
     else if (dk == D_DOLLY) c = IDC_SIZENS;
-    else if (dk == D_MARQ || tool == T_PAINT || tool == T_WELD || tool == T_LOOP || tool == T_CUT) c = IDC_CROSS;
+    else if (dk == D_MARQ || tool == T_PAINT || tool == T_WELD || tool == T_LOOP || tool == T_CUT || tool == T_PIXEL) c = IDC_CROSS;
     else if (gizmoHover >= 0) c = IDC_HAND;
     return LoadCursor(NULL, c);
 }
@@ -5346,6 +6853,7 @@ static void render(void)
             draw_all_edges(m);
         }
         if (i == hvObj) draw_hover(o);
+        if (tool == T_PIXEL && !wire) draw_pixel_tool(i);
         glPopMatrix();
     }
 
@@ -5392,6 +6900,21 @@ static void render(void)
         glVertex2f(curx + .5f, cury + .5f); glVertex2f(mx0 + .5f, cury + .5f);
         glEnd();
         glDisable(GL_LINE_STIPPLE);
+    }
+    if (tool == T_PIXEL && pp.have && dk == D_NONE && key(VK_SHIFT) && curx > -1000) {
+        float sx, sy;
+        if (proj(pp.lw, &sx, &sy, NULL)) {
+            glColor3f(paintCol.x, paintCol.y, paintCol.z);
+            glLineWidth(1.5f * ds);
+            glEnable(GL_LINE_STIPPLE);
+            glLineStipple(1, 0xF0F0);
+            glBegin(GL_LINES);
+            glVertex2f(sx, sy);
+            glVertex2f((float)curx, (float)cury);
+            glEnd();
+            glDisable(GL_LINE_STIPPLE);
+            glLineWidth(1);
+        }
     }
     if (tool == T_PAINT) {
         float cx = dk == D_BRUSH ? (float)mx0 : (float)curx, cy = dk == D_BRUSH ? (float)my0 : (float)cury;
@@ -5512,6 +7035,7 @@ static void end_drag(int cancel)
     else if (k == D_MARQ && !cancel) select_rect(mx0, my0, curx, cury, selMod);
     else if (k == D_MANIP) drag_end();
     else if (k == D_PAINT) paint_end();
+    else if (k == D_PIXEL) { pix_flush(); pp.dirty = 0; }
     else if (k == D_WELD) weld_end(cancel);
     if (k == D_PEND || k == D_MARQ) normalFrame = 0;
     if (GetCapture() == hView) ReleaseCapture();
@@ -5524,9 +7048,10 @@ static void end_drag(int cancel)
 /* Esc while dragging: put everything back as it was when the drag started */
 static void cancel_drag(void)
 {
-    if ((dk == D_MANIP && dg.dirty) || (dk == D_PAINT && ps.dirty)) {
+    if ((dk == D_MANIP && dg.dirty) || (dk == D_PAINT && ps.dirty) || (dk == D_PIXEL && pp.dirty)) {
         snap_restore(&undo_s[--nundo]);
-        dg.dirty = ps.dirty = 0;
+        dg.dirty = ps.dirty = pp.dirty = 0;
+        pp.have = 0;
     }
     end_drag(1);
     msg("Cancelled");
@@ -5535,7 +7060,7 @@ static void cancel_drag(void)
 /* double-click an edge: select its edge loop. Returns 0 when it was not on an edge. */
 static int dbl_click(int x, int y)
 {
-    if (!shows(M_EDGE) || key(VK_MENU) || tool == T_PAINT) return 0;
+    if (!shows(M_EDGE) || key(VK_MENU) || tool == T_PAINT || tool == T_PIXEL) return 0;
     int o, k, i;
     cam_update();
     if (!pick_comp(x, y, &o, &k, &i) || k != M_EDGE) return 0;
@@ -5653,6 +7178,16 @@ static LRESULT CALLBACK ViewProc(HWND h, UINT m, WPARAM wp, LPARAM lp)
             dk = key('B') ? D_BRUSH : D_PAINT;
             rad0 = paintRad;
             if (dk == D_PAINT) paint_begin(x, y);
+        } else if (tool == T_PIXEL) {
+            if (key('B')) {
+                dk = D_PIXBRUSH;
+                rad0 = (float)pixBrush;
+            } else if (pix_down(x, y)) {
+                dk = D_PIXEL;
+            } else {
+                refresh_all();
+                return 0;
+            }
         } else {
             int hh = manip_vis() ? manip_hit(x, y) : H_NONE;
             if (hh) {
@@ -5700,6 +7235,16 @@ static LRESULT CALLBACK ViewProc(HWND h, UINT m, WPARAM wp, LPARAM lp)
             break;
         case D_MANIP: drag_move(x, y); panel_sync(); status_text(); break;
         case D_PAINT: paint_dab(x, y); break;
+        case D_PIXEL: pix_drag(x, y); break;
+        case D_PIXBRUSH: {
+            char b[48];
+            pixBrush = (int)(rad0 + (x - mx0) / (14 * ds));
+            pixBrush = pixBrush < 1 ? 1 : pixBrush > 32 ? 32 : pixBrush;
+            snprintf(b, sizeof b, "Brush %d x %d pixels", pixBrush, pixBrush);
+            if (strcmp(b, g_msg)) msg(b);
+            panel_sync();
+            break;
+        }
         case D_WELD: {
             int t = weld_pick(x, y, wd.obj);
             wd.tgt = t == wd.v ? -1 : t;
@@ -5726,6 +7271,7 @@ static LRESULT CALLBACK ViewProc(HWND h, UINT m, WPARAM wp, LPARAM lp)
             if (tool == T_LOOP) loop_hover(x, y);
             if (tool == T_CUT) mc_hover(x, y);
             if (tool == T_PAINT) redraw();
+            if (tool == T_PIXEL) pix_hover(gh >= 0 ? -10000 : x, y);
             return 0;
         }
         redraw();
@@ -5746,6 +7292,7 @@ static LRESULT CALLBACK ViewProc(HWND h, UINT m, WPARAM wp, LPARAM lp)
         curx = cury = -1000;
         hover_update(-10000, 0);
         if (tool == T_PAINT) redraw();
+        if (tool == T_PIXEL) pix_hover(-10000, 0);
         return 0;
     case WM_SETCURSOR:
         if (LOWORD(lp) == HTCLIENT) { SetCursor(view_cursor()); return TRUE; }
@@ -5757,7 +7304,11 @@ static LRESULT CALLBACK ViewProc(HWND h, UINT m, WPARAM wp, LPARAM lp)
         return 0;
     case WM_KEYDOWN:
         if (wp == VK_ESCAPE && dk != D_NONE) { cancel_drag(); return 0; }
+        if (wp == VK_SHIFT && tool == T_PIXEL) redraw();   /* the line preview */
         if (!(lp & (1 << 30)) && dk == D_NONE) handle_key(wp);
+        return 0;
+    case WM_KEYUP:
+        if (wp == VK_SHIFT && tool == T_PIXEL) redraw();
         return 0;
     case WM_SYSKEYDOWN:
         if (wp == VK_F10) { if (!(lp & (1 << 30)) && dk == D_NONE) handle_key(wp); return 0; }
@@ -5866,11 +7417,27 @@ static HMENU build_menu(void)
     AppendMenuA(m, MF_STRING, CM_TWELD, "Target &Weld Tool");
     AppendMenuA(m, MF_STRING, CM_TLOOP, "&Insert Edge Loop Tool");
     AppendMenuA(m, MF_STRING, CM_TCUT, "Multi-&Cut Tool");
+    AppendMenuA(m, MF_STRING, CM_TPIXEL, "Pi&xel Paint Tool\tP");
     AppendMenuA(bar, MF_POPUP, (UINT_PTR)m, "&Tools");
     m = CreatePopupMenu();
     AppendMenuA(m, MF_STRING, CM_SETCOL, "&Set Paint Color...");
     AppendMenuA(m, MF_STRING, CM_APPLYCOL, "&Apply Color to Selection");
     AppendMenuA(bar, MF_POPUP, (UINT_PTR)m, "C&olor");
+    m = CreatePopupMenu();
+    AppendMenuA(m, MF_STRING, CM_TPIXEL, "Pixel &Paint Tool\tP");
+    AppendMenuA(m, MF_STRING, CM_UNWRAP, "Pixel &Unwrap");
+    AppendMenuA(m, MF_STRING, CM_PIXFILL, "&Bucket Fill");
+    AppendMenuA(m, MF_STRING, CM_PIXGRID, "Pixel &Grid");
+    AppendMenuA(m, MF_SEPARATOR, 0, NULL);
+    AppendMenuA(m, MF_STRING, CM_ASEPRITE, "&Edit in Aseprite");
+    AppendMenuA(m, MF_STRING, CM_TEXLOAD, "&Load Texture...");
+    AppendMenuA(m, MF_STRING, CM_TEXSAVE, "&Save Texture As...");
+    AppendMenuA(m, MF_STRING, CM_TEXREMOVE, "&Remove Texture");
+    AppendMenuA(m, MF_SEPARATOR, 0, NULL);
+    AppendMenuA(m, MF_STRING, CM_PALLOAD, "Load Pa&lette...");
+    AppendMenuA(m, MF_STRING, CM_PALTEX, "Palette from &Texture");
+    AppendMenuA(m, MF_STRING, CM_PALRESET, "&Default Palette");
+    AppendMenuA(bar, MF_POPUP, (UINT_PTR)m, "Te&xture");
     m = CreatePopupMenu();
     AppendMenuA(m, MF_STRING, CM_WIRE, "&Wireframe\t4");
     AppendMenuA(m, MF_STRING, CM_SHADED, "&Shaded\t5");
@@ -5980,6 +7547,7 @@ static LRESULT CALLBACK MainProc(HWND h, UINT m, WPARAM wp, LPARAM lp)
     }
     case WM_TIMER:
         if (wp == 2) autosave_tick();
+        if (wp == 3) tex_watch();
         return 0;
     case WM_APP: {
         const char *arg = (const char *)lp;
@@ -6003,6 +7571,9 @@ static LRESULT CALLBACK MainProc(HWND h, UINT m, WPARAM wp, LPARAM lp)
         reg_set_int("ManipSize", (int)(manipSize * 1000));
         reg_set_int("MergeDist", (int)(mergeDist * 1e5f));
         reg_set_int("BevelWidth", (int)(bevelW * 1e5f));
+        reg_set_int("PixelDensity", pixDens);
+        reg_set_int("PixelBrush", pixBrush);
+        reg_set_int("PixelGrid", pixGrid);
         autosave_remove();
         PostQuitMessage(0);
         return 0;
@@ -6032,6 +7603,12 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmd, int show)
     mergeDist = reg_int("MergeDist", 1000) / 1e5f;
     bevelW = reg_int("BevelWidth", 10000) / 1e5f;
     if (bevelW <= 0) bevelW = 0.1f;
+    pixDens = reg_int("PixelDensity", 16);
+    if (pixDens < 1 || pixDens > 256) pixDens = 16;
+    pixBrush = reg_int("PixelBrush", 1);
+    if (pixBrush < 1 || pixBrush > 32) pixBrush = 1;
+    pixGrid = reg_int("PixelGrid", 1) != 0;
+    pal_load_reg();
     recent_load();
     binds_load();
 
@@ -6056,6 +7633,10 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmd, int show)
     RegisterClassExA(&wc);
     wc.lpfnWndProc = BarProc;
     wc.lpszClassName = "Tuff3DBar";
+    RegisterClassExA(&wc);
+    wc.style = CS_DBLCLKS;
+    wc.lpfnWndProc = PalProc;
+    wc.lpszClassName = "Tuff3DPal";
     RegisterClassExA(&wc);
     wc.style = CS_OWNDC | CS_DBLCLKS;
     wc.lpfnWndProc = ViewProc;

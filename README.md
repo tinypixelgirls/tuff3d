@@ -1,8 +1,8 @@
 # tuff3d
 
 A small, minimalist polygon modeler for Windows with Autodesk Maya's navigation and hotkeys.
-It is one ~420 KB exe with no installer, and it only uses DLLs that ship with Windows
-(OpenGL 1.1, GDI, GDI+ for reference images, common dialogs, shell drag and drop). It redraws only when something changes, so
+It is one ~490 KB exe with no installer, and it only uses DLLs that ship with Windows
+(OpenGL 1.1, GDI, GDI+ for pictures, common dialogs, shell drag and drop). It redraws only when something changes, so
 it sits at 0% CPU when idle. Meshes are drawn from cached vertex arrays that are only rebuilt after
 an edit, so tumbling and hovering stay fast on dense meshes.
 
@@ -38,6 +38,27 @@ Modeling
 - Modify menu: Freeze Transformations, Center Pivot, Reset Transformations
 - Vertex paint brush (color, opacity, radius) and "Apply Color to Selection" (tint by opacity)
 - Duplicate, delete objects or faces, hide / show objects
+
+Pixel art (paint textures right on the model, like Aseprite on a 3D canvas)
+- Pixel Paint tool (P): click or drag on a model to paint pixels. A model gets square pixels the first
+  time you click it (Pixel Unwrap at Pixels / Unit, 16 by default: a 1 unit cube face is 16 x 16)
+- Pixel Unwrap (Texture menu or side panel) puts every corner on a pixel corner and stands walls
+  upright. Islands break at hard edges and unfold across soft ones (Smooth / Auto Smooth shading,
+  Soften Edge), always as strips, so a smooth cylinder's side is one long strip. In face mode it gives
+  only the selected faces new pixels, in free space, and leaves the rest where they are
+- Square brush (B + drag sets the size), Bucket Fill, Ctrl+click picks a color, Shift+click draws a
+  straight line from the last pixel, and the eraser paints clear pixels, which show as holes
+- A pixel grid on the model once you zoom in, and the pixels a click would paint shown in the color
+- Palette in the side panel: click a color to paint with it, double-click to change it, right-click to
+  add or remove colors, load a palette (GIMP .gpl, JASC .pal, .hex, paint.net .txt or the colors of a
+  picture, so palettes from Aseprite or Lospec work), or take the colors the texture uses
+- Modeling keeps the pixels: extrude, cut, bevel, merge, combine and the rest carry them along. New
+  faces, like the walls of an extrusion, get pixels of their own the moment you paint on them
+- Edit in Aseprite saves the texture as a PNG next to the scene and opens it in Aseprite (found in
+  Program Files or a Steam library, or show tuff3d Aseprite.exe once). Each time Aseprite saves, the
+  model updates (undo puts it back). Load Texture and Save Texture As link any PNG the same way
+- Textures are kept in the .tuff scene; Export OBJ writes a PNG and an .mtl next to the OBJ, and OBJs
+  with textures (map_Kd) open textured
 
 Selection
 - Objects, vertices, edges, faces, or Multi mode (F7): all three at once, like Maya's multi-component
@@ -116,7 +137,9 @@ See [FEATURES.md](FEATURES.md) for a checklist of what's in and ideas for what c
 | Z or Ctrl+Z / Shift+Z or Ctrl+Y | Undo / redo |
 | G | Repeat last command |
 | 4 / 5 | Wireframe / shaded |
-| B + LMB drag | Brush radius (paint tool) |
+| B + LMB drag | Brush radius (paint tool) / brush size (pixel paint) |
+| P | Pixel Paint tool |
+| Ctrl + click / Shift + click | Pick a color / straight line (pixel paint) |
 | Ctrl+N / Ctrl+O / Ctrl+S | New / open / save (.tuff scene, or back to the open OBJ) |
 | Ctrl+Shift+O / Ctrl+Shift+S | Import into the scene / save as |
 | Ctrl+A | Toggle side panel |
@@ -190,5 +213,5 @@ The icon is `res/tuff3d.ico` (16 to 256 px), built from `res/tuff3d.png` with `p
 Geometry tests (any C compiler): `cc -Isrc tests/test_mesh.c src/mesh.c -lm && ./a.out`
 
 `src/mesh.c` is the platform-independent geometry core (primitives, extrude, merge, edge loops,
-selection grow/shrink/convert, OBJ).
+selection grow/shrink/convert, OBJ, Pixel Unwrap and carrying textures through edits).
 `src/main.c` is the Win32/OpenGL UI.

@@ -257,6 +257,230 @@ static void test_ops(void)
     mesh_free(&c);
 }
 
+
+/* ---- pixel art textures */
+
+static int texels_covered(const Mesh *m)
+{
+    int n = 0, *tf = malloc((size_t)m->tex->w * m->tex->h * sizeof(int));
+    mesh_texel_faces(m, tf);
+    for (int i = 0; i < m->tex->w * m->tex->h; i++) n += tf[i] >= 0;
+    free(tf);
+    return n;
+}
+
+static float uv_area(const Mesh *m, int f)
+{
+    float a = 0;
+    int s = m->fo[f], n = m->fo[f + 1] - s;
+    for (int k = 0; k < n; k++) {
+        const float *p = m->uv + 2 * (s + k), *q = m->uv + 2 * (s + (k + 1) % n);
+        a += p[0] * q[1] - q[0] * p[1];
+    }
+    return fabsf(a) * 0.5f;
+}
+
+static int uv_integral(const Mesh *m)
+{
+    for (int c = 0; c < 2 * m->fo[m->nf]; c++)
+        if (m->uv[c] != floorf(m->uv[c])) return 0;
+    return 1;
+}
+
+static void test_tex(void)
+{
+    M4 id = m4_id();
+    /* a cube at 16 pixels per unit: six 16x16 islands with every corner on a pixel corner */
+    Mesh m = cube();
+    m.c[0] = v3(1, 0, 0);
+    CHECK(mesh_pixel_unwrap(&m, id, 16, 0, NULL, 4096) == 6);
+    CHECK(m.uv && m.tex && m.tex->w == 64 && m.tex->h == 64);
+    CHECK(uv_integral(&m));
+    for (int f = 0; f < m.nf; f++) CHECK(fabsf(uv_area(&m, f) - 256) < 1e-3f);
+    CHECK(texels_covered(&m) == 6 * 256);
+    {
+        int white = 1, red = 0;
+        for (int v = 0; v < m.nv; v++) white &= m.c[v].x == 1 && m.c[v].y == 1 && m.c[v].z == 1;
+        for (int i = 0; i < m.tex->w * m.tex->h; i++) red += m.tex->px[4 * i + 3] == 255 && m.tex->px[4 * i + 1] < 128;
+        CHECK(white && red > 0);   /* vertex colors went into the texture */
+    }
+    int fisl[64];
+    CHECK(mesh_uv_islands(&m, fisl) == 6);
+    float rd = 0;
+    {
+        unsigned char nm[64];
+        CHECK(mesh_uv_needy(&m, id, nm) == 0);
+        rd = mesh_uv_density(&m, id);
+        CHECK(fabsf(rd - 16) < 1e-3f);
+    }
+
+    /* the uvs ride along through ops */
+    Mesh t = mesh_copy(&m);
+    CHECK(t.tex == m.tex && m.tex->refs == 2);
+    CHECK(mesh_triangulate(&t, NULL) == 6 && t.nf == 12 && uv_integral(&t) && texels_covered(&t) == 6 * 256);
+    CHECK(mesh_quadrangulate(&t, NULL, 30) == 6 && t.nf == 6 && uv_integral(&t));
+    for (int f = 0; f < t.nf; f++) CHECK(fabsf(uv_area(&t, f) - 256) < 1e-3f);
+    CHECK(tex_own(&t) != m.tex && m.tex->refs == 1);
+    mesh_free(&t);
+
+    /* reverse keeps each corner's uv */
+    t = mesh_copy(&m);
+    CHECK(mesh_reverse(&t, NULL) == 6 && texels_covered(&t) == 6 * 256);
+    for (int f = 0; f < t.nf; f++) {
+        int s = t.fo[f], n = t.fo[f + 1] - s;
+        for (int k = 0; k < n; k++) CHECK(!memcmp(t.uv + 2 * (s + k), m.uv + 2 * (s + n - 1 - k), 2 * sizeof(float)));
+    }
+    mesh_free(&t);
+
+    /* an edge loop splits a face's pixels between its halves */
+    t = mesh_copy(&m);
+    CHECK(mesh_insert_loop(&t, 0, 0.5f) == 4 && t.nf == 10);
+    CHECK(texels_covered(&t) == 6 * 256);
+    mesh_free(&t);
+
+    /* extrude: the cap keeps its pixels, the walls are lines until they get their own */
+    t = mesh_copy(&m);
+    int top = -1;
+    for (int f = 0; f < t.nf; f++) if (mesh_fnormal(&t, f).y > 0.9f) top = f;
+    float capuv[8];
+    memcpy(capuv, t.uv + 2 * t.fo[top], sizeof capuv);
+    t.fs[top] = 1;
+    CHECK(mesh_extrude_faces(&t) && t.nf == 10);
+    int cap = -1;
+    for (int f = 0; f < t.nf; f++) if (t.fs[f]) cap = f;
+    CHECK(cap >= 0 && !memcmp(t.uv + 2 * t.fo[cap], capuv, sizeof capuv));
+    unsigned char vm[64], nm[64];
+    mesh_vmask(&t, COMP_FACE, vm);
+    for (int v = 0; v < t.nv; v++) if (vm[v]) t.p[v].y += 1;
+    CHECK(mesh_uv_needy(&t, id, nm) == 4);
+    unsigned char walls[64];
+    memcpy(walls, nm, sizeof walls);
+    float keep[200];
+    memcpy(keep, t.uv, 2 * t.fo[t.nf] * sizeof(float));
+    CHECK(mesh_pixel_unwrap(&t, id, 16, 0, walls, 4096) == 4);
+    CHECK(mesh_uv_needy(&t, id, nm) == 0 && uv_integral(&t));
+    memcpy(nm, walls, sizeof nm);
+    {
+        int same = 1;   /* the faces that had pixels keep them where they were */
+        for (int f = 0; f < t.nf; f++)
+            if (!nm[f] && fabsf(uv_area(&t, f) - 256) < 1e-3f)
+                for (int c = t.fo[f]; c < t.fo[f + 1]; c++) same &= keep[2 * c] == t.uv[2 * c] && keep[2 * c + 1] == t.uv[2 * c + 1];
+        CHECK(same);
+        for (int f = 0; f < t.nf; f++) CHECK(fabsf(uv_area(&t, f) - 256) < 1e-3f);
+        CHECK(texels_covered(&t) == 10 * 256);   /* nothing overlaps: the cap took over the old top's pixels */
+    }
+    mesh_free(&t);
+
+    /* separate and combine */
+    unsigned char half[6] = { 1, 1, 1, 0, 0, 0 };
+    Mesh a = mesh_subset(&m, half);
+    CHECK(a.nf == 3 && a.tex == m.tex && texels_covered(&a) == 3 * 256);
+    static const int fo0 = 0;
+    Mesh acc = mesh_from_arrays(0, NULL, NULL, 0, &fo0, NULL);
+    M4 mv = m4_trs(v3(3, 0, 0), v3(0, 0, 0), v3(1, 1, 1));
+    mesh_append(&acc, &a, &id);
+    CHECK(acc.uv && acc.tex == m.tex && texels_covered(&acc) == 3 * 256);
+    Mesh plain = cube();
+    mesh_append(&acc, &plain, &mv);
+    CHECK(acc.nf == 9 && acc.tex && acc.tex->w == 64 && acc.tex->h == 64 + 2 + 1);
+    CHECK(acc.uv[2 * acc.fo[8]] == 0.5f && acc.uv[2 * acc.fo[8] + 1] == 66.5f);
+    CHECK(acc.tex->px[4 * 66 * 64] == 255);
+    mesh_free(&acc);
+    mesh_free(&a);
+    mesh_free(&plain);
+
+    /* flood fill stays inside an island */
+    Mesh w = cube();
+    mesh_pixel_unwrap(&w, id, 16, 0, NULL, 4096);
+    {
+        int *tf = malloc(64 * 64 * sizeof(int));
+        mesh_texel_faces(&w, tf);
+        unsigned char blue[4] = { 0, 0, 255, 255 };
+        int x = (int)w.uv[0] + 3, y = (int)w.uv[1] + 3;   /* inside face 0 */
+        x = 0; y = 0;
+        for (int i = 0; i < 64 * 64; i++) if (tf[i] == 0) { x = i % 64; y = i / 64; break; }
+        CHECK(tex_fill(w.tex, tf, x, y, blue) == 256);
+        CHECK(tex_fill(w.tex, tf, x, y, blue) == 0);
+        free(tf);
+    }
+    /* ray hit with weights: the middle of the front face is the middle of its island */
+    {
+        int tri[3];
+        float b[3], tt;
+        int f = mesh_raycast_tri(&w, v3(0.001f, 0.002f, 5), v3(0, 0, -1), &tt, tri, b);
+        CHECK(f >= 0 && fabsf(b[0] + b[1] + b[2] - 1) < 1e-5f);
+        float u = 0, v = 0, lo[2] = { 1e9f, 1e9f };
+        for (int j = 0; j < 3; j++) { u += b[j] * w.uv[2 * tri[j]]; v += b[j] * w.uv[2 * tri[j] + 1]; }
+        for (int c = w.fo[f]; c < w.fo[f + 1]; c++) { lo[0] = fminf(lo[0], w.uv[2 * c]); lo[1] = fminf(lo[1], w.uv[2 * c + 1]); }
+        CHECK(fabsf(u - lo[0] - 8) < 0.1f && fabsf(v - lo[1] - 8) < 0.1f);
+    }
+
+    /* OBJ with vt + mtl */
+    {
+        const Mesh *ms[1] = { &w };
+        const char *nms[1] = { "box" }, *tfs[1] = { "box.png" };
+        CHECK(obj_save("test_tex.obj", 1, ms, &id, nms, NULL, tfs));
+        FILE *f = fopen("test_tex.mtl", "r");
+        char line[256];
+        int mk = 0;
+        while (f && fgets(line, sizeof line, f)) mk += !strncmp(line, "map_Kd box.png", 14);
+        if (f) fclose(f);
+        CHECK(mk == 1);
+        Mesh *lm;
+        char (*ln)[32], (*lt)[260];
+        int n = obj_load("test_tex.obj", &lm, &ln, NULL, &lt);
+        CHECK(n == 1);
+        if (n == 1) {
+            CHECK(lm[0].uv && strstr(lt[0], "box.png") && lm[0].nf == w.nf);
+            int same = 1;
+            for (int c = 0; lm[0].uv && c < 2 * w.fo[w.nf]; c++) same &= fabsf(lm[0].uv[c] * 64 - w.uv[c]) < 1e-3f;
+            CHECK(same);
+            mesh_free(&lm[0]);
+            free(lm); free(ln); free(lt);
+        }
+        remove("test_tex.obj");
+        remove("test_tex.mtl");
+    }
+    mesh_free(&w);
+
+    /* islands break at hard edges and unfold across soft ones */
+    Prim p;
+    prim_defaults(&p, PRIM_CYL);
+    p.csides = 8;
+    Mesh c = mesh_prim(&p);
+    int ci[64];
+    CHECK(mesh_pixel_unwrap(&c, id, 16, 0, NULL, 4096) == 10 && mesh_uv_islands(&c, ci) == 10);
+    CHECK(mesh_pixel_unwrap(&c, id, 16, 50, NULL, 4096) == 10 && mesh_uv_islands(&c, ci) == 3 && uv_integral(&c));
+    CHECK(mesh_pixel_unwrap(&c, id, 16, 180, NULL, 4096) == 10 && mesh_uv_islands(&c, ci) == 3);   /* caps don't fork the strip */
+    {
+        /* the side strip stands upright: 8 faces side by side, 32 pixels tall */
+        int tall = 0;
+        for (int f = 0; f < c.nf; f++) {
+            float lo = 1e9f, hi = -1e9f;
+            for (int k = c.fo[f]; k < c.fo[f + 1]; k++) { lo = fminf(lo, c.uv[2 * k + 1]); hi = fmaxf(hi, c.uv[2 * k + 1]); }
+            tall += c.fo[f + 1] - c.fo[f] == 4 && hi - lo == 32;
+        }
+        CHECK(tall == 8);
+    }
+    /* a smooth cube unwraps into a band of four walls plus a top and a bottom */
+    Mesh sc = cube();
+    CHECK(mesh_pixel_unwrap(&sc, id, 16, 180, NULL, 4096) == 6 && mesh_uv_islands(&sc, ci) == 3 && uv_integral(&sc));
+    mesh_free(&sc);
+    mesh_free(&c);
+
+    /* a turned cube still gets square pixels on top */
+    Mesh r = cube();
+    M4 rot = m4_trs(v3(0, 0, 0), v3(0, 30, 0), v3(1, 1, 1));
+    CHECK(mesh_pixel_unwrap(&r, rot, 16, 0, NULL, 4096) == 6);
+    for (int f = 0; f < r.nf; f++) CHECK(fabsf(uv_area(&r, f) - 256) < 1e-3f);
+    CHECK(uv_integral(&r));
+    /* too many pixels: nothing changes */
+    Tex *was = r.tex;
+    CHECK(mesh_pixel_unwrap(&r, id, 5000, 0, NULL, 4096) == -1 && r.tex == was);
+    mesh_free(&r);
+    mesh_free(&m);
+}
+
 int main(void)
 {
     Prim p;
@@ -387,11 +611,11 @@ int main(void)
     M4 mats[1] = { m4_trs(v3(5, 0, 0), v3(0, 0, 0), v3(1, 1, -1)) };
     const char *names[1] = { "pCube1" };
     float angles[1] = { 30 };
-    CHECK(obj_save("test_out.obj", 1, ms, mats, names, angles));
+    CHECK(obj_save("test_out.obj", 1, ms, mats, names, angles, NULL));
     Mesh *lm;
     char (*ln)[32];
     float *la;
-    int n = obj_load("test_out.obj", &lm, &ln, &la);
+    int n = obj_load("test_out.obj", &lm, &ln, &la, NULL);
     CHECK(n == 1);
     if (n == 1) {
         CHECK(lm[0].nv == 8 && lm[0].nf == 6 && !strcmp(ln[0], "pCube1"));
@@ -411,8 +635,8 @@ int main(void)
         if (f) fclose(f);
         CHECK(vn == 6 && fslash == 6);   /* hard cube: one shared normal per face */
     }
-    CHECK(obj_save("test_out.obj", 1, ms, mats, names, NULL));
-    n = obj_load("test_out.obj", &lm, &ln, NULL);
+    CHECK(obj_save("test_out.obj", 1, ms, mats, names, NULL, NULL));
+    n = obj_load("test_out.obj", &lm, &ln, NULL, NULL);
     CHECK(n == 1);
     if (n == 1) {
         CHECK(lm[0].nv == 8 && lm[0].nf == 6);
@@ -424,7 +648,7 @@ int main(void)
         FILE *f = fopen("test_out.obj", "w");
         fputs("v 0 0 0\nv 1 0 0\nv 0 1 0\no a\ns 1\nf 1 2 3\no b\ns off\nf 1 3 2\no c\nf 1 2 3\n", f);
         fclose(f);
-        n = obj_load("test_out.obj", &lm, &ln, &la);
+        n = obj_load("test_out.obj", &lm, &ln, &la, NULL);
         CHECK(n == 3);
         if (n == 3) {
             CHECK(la[0] == 180 && la[1] == 0 && la[2] == -1);
@@ -551,6 +775,7 @@ int main(void)
     mesh_free(&m);
 
     test_ops();
+    test_tex();
     printf(fails ? "%d FAILED\n" : "all tests passed\n", fails);
     return fails != 0;
 }

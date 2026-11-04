@@ -26,6 +26,15 @@ Display
 - [x] Heads-up poly counts, corner axis gizmo, front / side / top / home views
 - [x] 48 themes with a live-preview picker
 
+Pixel art textures
+- [x] Pixel Unwrap: pixel-perfect islands at a set pixels per unit, upright walls, strips across soft edges
+- [x] Pixel Paint tool: pencil with a square brush, bucket fill, color picker, straight lines, eraser
+- [x] Pixel grid and brush preview on the model
+- [x] Palette (load .gpl / .pal / .hex / .txt / picture, palette from texture)
+- [x] Textures survive modeling ops, undo, duplicate, combine and separate
+- [x] Edit in Aseprite with live reload when Aseprite saves; linked PNGs
+- [x] Textures in .tuff scenes; OBJ export and import with .mtl + PNG
+
 Files and comfort
 - [x] Open / import / export OBJ with vertex colors and shading normals
 - [x] Shading survives an OBJ round trip; other apps' smoothing groups are read
@@ -67,7 +76,14 @@ Quality of life
 - [ ] Viewport screenshot to PNG
 - [x] Hotkey editor
 
+Pixel art
+- [ ] Brushes that paint across island seams (in 3D, not only in the texture)
+- [ ] Mirror painting (symmetry across X)
+- [ ] A 2D view of the texture next to the model, to paint in either
+- [ ] Pick Pixels / Unit per object and keep it with the object
+- [ ] Repack: tidy a texture after many partial unwraps
+
 Files
-- [ ] glTF (.glb) export with vertex colors, for game engines and the web
+- [ ] glTF (.glb) export with vertex colors and textures, for game engines and the web
 - [ ] Export each object to its own OBJ
 - [x] A native scene file (.tuff) that keeps everything: hidden objects, primitive settings, camera, image planes
