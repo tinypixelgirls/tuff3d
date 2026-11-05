@@ -23,11 +23,13 @@ Selection
 Display
 - [x] Wireframe / shaded
 - [x] Hard Shade, Smooth Shade, Auto Smooth with a per-object Normal Angle
+- [x] Hard / Smooth / Auto Smooth on just the selected faces, edges or vertices
 - [x] Heads-up poly counts, corner axis gizmo, front / side / top / home views
 - [x] 48 themes with a live-preview picker
 
 Pixel art textures
 - [x] Pixel Unwrap: pixel-perfect islands at a set pixels per unit, upright walls, strips across soft edges
+- [x] Follow Quads: quads unwrap as pixel rectangles, so the grid follows slanted faces and edge loops like a UV map
 - [x] Pixel Paint tool: pencil with a square brush, bucket fill, color picker, straight lines, eraser
 - [x] Pixel grid and brush preview on the model
 - [x] Palette (load .gpl / .pal / .hex / .txt / picture, palette from texture)

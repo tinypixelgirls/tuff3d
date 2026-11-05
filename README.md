@@ -1,7 +1,7 @@
 # tuff3d
 
 A small, minimalist polygon modeler for Windows with Autodesk Maya's navigation and hotkeys.
-It is one ~490 KB exe with no installer, and it only uses DLLs that ship with Windows
+It is one ~510 KB exe with no installer, and it only uses DLLs that ship with Windows
 (OpenGL 1.1, GDI, GDI+ for pictures, common dialogs, shell drag and drop). It redraws only when something changes, so
 it sits at 0% CPU when idle. Meshes are drawn from cached vertex arrays that are only rebuilt after
 an edit, so tumbling and hovering stay fast on dense meshes.
@@ -40,12 +40,19 @@ Modeling
 - Duplicate, delete objects or faces, hide / show objects
 
 Pixel art (paint textures right on the model, like Aseprite on a 3D canvas)
-- Pixel Paint tool (P): click or drag on a model to paint pixels. A model gets square pixels the first
+- Pixel Paint tool (P): click or drag on a model to paint pixels. A model gets pixels the first
   time you click it (Pixel Unwrap at Pixels / Unit, 16 by default: a 1 unit cube face is 16 x 16)
 - Pixel Unwrap (Texture menu or side panel) puts every corner on a pixel corner and stands walls
-  upright. Islands break at hard edges and unfold across soft ones (Smooth / Auto Smooth shading,
-  Soften Edge), always as strips, so a smooth cylinder's side is one long strip. In face mode it gives
-  only the selected faces new pixels, in free space, and leaves the rest where they are
+  upright. With Follow Quads (on by default, side panel or Texture menu) it works like a UV map: each
+  quad becomes a rectangle of whole pixels, so the pixel grid runs along the edges of slanted,
+  tapered and sheared faces instead of cutting across them, and quads that meet across soft edges
+  form one grid whose rows follow the edge loops (a sphere's middle comes out as one latitude /
+  longitude grid, a smooth cube as a cross). Quads are stretched a little at most (a flat face a bit
+  more, so it stays in one piece); triangles, n-gons and faces smaller than a pixel keep their shape.
+  With Follow Quads off, every face keeps its true shape (square pixels). Islands break at hard edges
+  and unfold across soft ones (Smooth / Auto Smooth shading, Soften Edge, or Hard / Smooth Shade on
+  selected edges), so a smooth cylinder's side is one long strip. In face mode it gives only the
+  selected faces new pixels, in free space, and leaves the rest where they are
 - Square brush (B + drag sets the size), Bucket Fill, Ctrl+click picks a color, Shift+click draws a
   straight line from the last pixel, and the eraser paints clear pixels, which show as holes
 - A pixel grid on the model once you zoom in, and the pixels a click would paint shown in the color
@@ -95,9 +102,14 @@ Comfort
   click to keep it, arrow keys to step through, R for a random one. Ctrl+Shift+T steps to the next
   theme. Themes color the viewport, side panel, toolbar, status bar, menu bar and (Windows 10/11)
   the title bar
-- Hard Shade, Smooth Shade and Auto Smooth per object (Display menu and toolbar). Auto Smooth keeps
-  edges sharper than the Normal Angle (default 30°, editable in the side panel) hard and smooths the
-  rest; Harden / Soften Edge override single edges (hard ones draw thicker while editing)
+- Hard Shade, Smooth Shade and Auto Smooth (Display menu, toolbar and right-click menu) shade whole
+  objects in object mode. Auto Smooth keeps edges sharper than the Normal Angle (default 30°, editable
+  in the side panel) hard and smooths the rest. In component mode they shade just what is selected:
+  the selected edges, every edge of the selected faces, or the edges between selected vertices (a
+  vertex selected on its own: all its edges); Auto Smooth puts a selection back on the Normal Angle.
+  With nothing selected they change the rest of the object and leave shaded selections alone. The
+  toolbar shows how the selection is shaded. Harden / Soften Edge do the same (hard edges draw
+  thicker while editing)
 - Front / side / top views are orthographic, with the grid on the view plane; orbiting goes back to
   perspective. Display > Image Planes puts a reference picture behind each of those views
 - Help > Hotkey Editor: change any command's keys (two per command); menus and toolbar follow

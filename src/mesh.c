@@ -1210,6 +1210,412 @@ static void straighten(const Mesh *m, float *c2, int sd, const int *faces, int n
         }
 }
 
+/* ---- Follow Quads: islands grow from their biggest face like a UV map. Each quad is a rectangle of
+   whole pixels (the pixel grid runs along its edges, even on slanted and tapered faces), and a
+   strip of quads keeps one row height, so pixel rows follow the mesh's edge loops. Other faces keep
+   their shape, with their corners on pixel corners. */
+
+/* how far a face may be stretched to keep its neighbors' rows (or by a pixel): more on a flat face,
+   so a tapered face that was cut up stays one piece */
+#define Q_STRETCH 1.5f
+#define Q_STRETCH_FLAT 2.0f
+
+typedef struct { float cost; int e, f; } QEnt;   /* face f is placed; edge e leads to the next one */
+typedef struct { QEnt *a; int n, cap; } QHeap;
+
+static void qh_push(QHeap *h, float cost, int e, int f)
+{
+    if (h->n == h->cap) { h->cap = h->cap * 2 + 64; h->a = xrealloc(h->a, h->cap * sizeof(QEnt)); }
+    int i = h->n++;
+    while (i > 0 && h->a[(i - 1) / 2].cost > cost) { h->a[i] = h->a[(i - 1) / 2]; i = (i - 1) / 2; }
+    h->a[i].cost = cost; h->a[i].e = e; h->a[i].f = f;
+}
+
+static int qh_pop(QHeap *h, QEnt *out)
+{
+    if (!h->n) return 0;
+    *out = h->a[0];
+    QEnt last = h->a[--h->n];
+    int i = 0;
+    for (;;) {
+        int c = 2 * i + 1;
+        if (c >= h->n) break;
+        if (c + 1 < h->n && h->a[c + 1].cost < h->a[c].cost) c++;
+        if (h->a[c].cost >= last.cost) break;
+        h->a[i] = h->a[c];
+        i = c;
+    }
+    if (h->n) h->a[i] = last;
+    return 1;
+}
+
+/* the faces of the island being built, bucketed by pixel cell, to find overlaps quickly. A slot is
+   in use when its gen is the current one, so starting the next island is just gen++. */
+typedef struct {
+    int cap, used, gen, *kx, *ky, *sg, *head;   /* slots */
+    int *ef, *en, ne, me;                        /* entries: face, next entry */
+    int *big, nbig, mbig;                        /* faces over too many cells: always checked */
+    float cell;
+} QGrid;
+
+#define QG_BIG 4096   /* cells */
+
+static int qg_slot(QGrid *g, int x, int y, int make)
+{
+    unsigned i = ((unsigned)x * 73856093u ^ (unsigned)y * 19349663u) & (unsigned)(g->cap - 1);
+    for (;; i = (i + 1) & (unsigned)(g->cap - 1)) {
+        if (g->sg[i] != g->gen) {
+            if (!make) return -1;
+            g->sg[i] = g->gen; g->kx[i] = x; g->ky[i] = y; g->head[i] = -1;
+            g->used++;
+            return (int)i;
+        }
+        if (g->kx[i] == x && g->ky[i] == y) return (int)i;
+    }
+}
+
+static void qg_alloc(QGrid *g, int cap)
+{
+    g->cap = cap;
+    g->kx = xrealloc(NULL, cap * sizeof(int)); g->ky = xrealloc(NULL, cap * sizeof(int));
+    g->head = xrealloc(NULL, cap * sizeof(int)); g->sg = xcalloc(cap, sizeof(int));
+}
+
+static void qg_add(QGrid *g, int f, const float *b)
+{
+    int x0 = (int)floorf(b[0] / g->cell), x1 = (int)floorf(b[2] / g->cell), y0 = (int)floorf(b[1] / g->cell), y1 = (int)floorf(b[3] / g->cell);
+    if ((double)(x1 - x0 + 1) * (y1 - y0 + 1) > QG_BIG) {
+        if (g->nbig == g->mbig) { g->mbig = g->mbig * 2 + 16; g->big = xrealloc(g->big, g->mbig * sizeof(int)); }
+        g->big[g->nbig++] = f;
+        return;
+    }
+    for (int y = y0; y <= y1; y++)
+        for (int x = x0; x <= x1; x++) {
+            if (2 * (g->used + 1) > g->cap) {   /* grow: move this island's slots over */
+                QGrid o = *g;
+                qg_alloc(g, o.cap * 2);
+                g->gen = 1;
+                g->used = 0;
+                for (int i = 0; i < o.cap; i++)
+                    if (o.sg[i] == o.gen) g->head[qg_slot(g, o.kx[i], o.ky[i], 1)] = o.head[i];
+                free(o.kx); free(o.ky); free(o.head); free(o.sg);
+            }
+            int s = qg_slot(g, x, y, 1);
+            if (g->ne == g->me) { g->me = g->me * 2 + 256; g->ef = xrealloc(g->ef, g->me * sizeof(int)); g->en = xrealloc(g->en, g->me * sizeof(int)); }
+            g->ef[g->ne] = f;
+            g->en[g->ne] = g->head[s];
+            g->head[s] = g->ne++;
+        }
+}
+
+typedef struct {
+    const Mesh *m; const V3 *wp; const unsigned char *use, *join; const int *ce; const float *bend;
+    float *c2, *ci, *t2, *ti, *fl, *len, *bb, density;   /* c2: corners in whole pixels (y up), ci: unrounded */
+    int *isl, *nextf, *stamp, st;
+    unsigned char *rect, *isrect;   /* quads that become rectangles / faces placed as rectangles */
+    Grow *gr; QGrid grid; QHeap heap;
+} QCtx;
+
+static int q_fits(float got, float want, float k) { return fabsf(got - want) <= 1 || (got <= want * k && got * k >= want); }
+
+/* is quad f fit to be a rectangle: no corner close to straight (that is a triangle in disguise) */
+static int q_quad_ok(const QCtx *q, int f)
+{
+    const Mesh *m = q->m;
+    int s = m->fo[f];
+    float l[4];
+    if (m->fo[f + 1] - s != 4) return 0;
+    for (int k = 0; k < 4; k++) {
+        const float *p = q->fl + 2 * (s + (k + 3) % 4), *c = q->fl + 2 * (s + k), *n = q->fl + 2 * (s + (k + 1) % 4);
+        float ax = p[0] - c[0], ay = p[1] - c[1], bx = n[0] - c[0], by = n[1] - c[1];
+        float la = sqrtf(ax * ax + ay * ay), lb = sqrtf(bx * bx + by * by);
+        if (la < 1e-6f || lb < 1e-6f) return 0;
+        if ((ax * bx + ay * by) / (la * lb) < -0.9f) return 0;          /* nearly straight */
+        if (bx * ay - by * ax < 0) return 0;                              /* concave */
+        l[k] = lb;
+    }
+    return 0.5f * (l[0] + l[2]) >= 1 && 0.5f * (l[1] + l[3]) >= 1;      /* under a pixel: its own shape */
+}
+
+/* face g laid next to placed face f across edge e, into t2 / ti (its own corners); 0 if it can't go
+   there. *dist says how much it had to stretch. */
+static int q_place(QCtx *q, int f, int e, int g, float *dist)
+{
+    const Mesh *m = q->m;
+    int a = m->ev[2 * e], b = m->ev[2 * e + 1];
+    int caf = corner_at(m, f, a), cbf = corner_at(m, f, b), cag = corner_at(m, g, a), cbg = corner_at(m, g, b);
+    if (caf < 0 || cbf < 0 || cag < 0 || cbg < 0) return 0;
+    int s = m->fo[g], n = m->fo[g + 1] - s;
+    if (s + (cbg - s + 1) % n != cag) {   /* name them so g runs from b to a */
+        int t = caf; caf = cbf; cbf = t;
+        t = cag; cag = cbg; cbg = t;
+        t = a; a = b; b = t;
+    }
+    const float *A = q->c2 + 2 * caf, *B = q->c2 + 2 * cbf, *Ai = q->ci + 2 * caf, *Bi = q->ci + 2 * cbf;
+    float dx = A[0] - B[0], dy = A[1] - B[1], L = sqrtf(dx * dx + dy * dy), k = q->bend[e] > 4e-5f ? Q_STRETCH : Q_STRETCH_FLAT;
+    if (q->rect[g] && L >= 0.5f && (dx == 0 || dy == 0)) {
+        int k0 = cbg - s, k1 = (k0 + 1) % 4, k2 = (k0 + 2) % 4, k3 = (k0 + 3) % 4;
+        float along = 0.5f * (q->len[s + k0] + q->len[s + k2]) * q->density, perp = 0.5f * (q->len[s + k1] + q->len[s + k3]) * q->density;
+        float nx = -dy / L, ny = dx / L;   /* into g (faces turn counterclockwise) */
+        float nearI = 0.5f * ((Ai[0] + Bi[0]) * nx + (Ai[1] + Bi[1]) * ny), nearP = A[0] * nx + A[1] * ny;
+        /* the far side lands where the unrounded one would, so rounding doesn't add up along a strip */
+        float P = roundf(nearI + perp) - nearP, farI = nearI + perp;
+        if (P < 1) P = 1;
+        /* a neighbor already placed on either side sets the row height, so the grid stays whole */
+        for (int side = 0; side < 2; side++) {
+            int ce = q->ce[s + (side ? k3 : k1)], base = side ? cbf : caf, vb = side ? b : a, vs = m->fi[s + (side ? k3 : k2)];
+            if (ce < 0) continue;
+            int h = m->ef[2 * ce] == g ? m->ef[2 * ce + 1] : m->ef[2 * ce];
+            if (h < 0 || h == g || q->isl[h] != q->isl[f]) continue;
+            int hb = corner_at(m, h, vb), hs = corner_at(m, h, vs);
+            if (hb < 0 || hs < 0) continue;
+            if (q->c2[2 * hb] != q->c2[2 * base] || q->c2[2 * hb + 1] != q->c2[2 * base + 1]) {
+                /* that neighbor is elsewhere (across a strip's seam): coming in from here would put g
+                   out of line with it, so g waits to be joined from the neighbor's side */
+                if (q->isrect[h]) return 0;
+                continue;
+            }
+            float ex = q->c2[2 * hs] - q->c2[2 * base], ey = q->c2[2 * hs + 1] - q->c2[2 * base + 1], pn = ex * nx + ey * ny;
+            if (fabsf(ex * dx + ey * dy) > 1e-3f || pn < 1 || !q_fits(pn, perp, k)) continue;
+            P = pn;
+            farI = q->ci[2 * hs] * nx + q->ci[2 * hs + 1] * ny;
+            break;
+        }
+        if (!q_fits(L, along, k) || !q_fits(P, perp, k)) return 0;
+        float *t = q->t2 + 2 * s, *ti = q->ti + 2 * s, mv = farI - nearI;
+        t[2 * k0] = B[0]; t[2 * k0 + 1] = B[1]; t[2 * k1] = A[0]; t[2 * k1 + 1] = A[1];
+        t[2 * k2] = A[0] + nx * P; t[2 * k2 + 1] = A[1] + ny * P;
+        t[2 * k3] = B[0] + nx * P; t[2 * k3 + 1] = B[1] + ny * P;
+        ti[2 * k0] = Bi[0]; ti[2 * k0 + 1] = Bi[1]; ti[2 * k1] = Ai[0]; ti[2 * k1 + 1] = Ai[1];
+        ti[2 * k2] = Ai[0] + nx * mv; ti[2 * k2 + 1] = Ai[1] + ny * mv;
+        ti[2 * k3] = Bi[0] + nx * mv; ti[2 * k3 + 1] = Bi[1] + ny * mv;
+        *dist = fabsf(logf(L / fmaxf(along, 0.5f)));
+        return 1;
+    }
+    if (q->rect[g]) return 0;   /* a quad that would come out slanted waits to be a rectangle of its own */
+    /* its own shape, turned and scaled (a little) so its copy of the edge lands on f's. This works
+       on the unrounded spots, so faces smaller than a pixel can shrink to nothing as they should. */
+    const float *Ga = q->fl + 2 * cag, *Gb = q->fl + 2 * cbg;
+    float gx = Ga[0] - Gb[0], gy = Ga[1] - Gb[1], lg = sqrtf(gx * gx + gy * gy);
+    float ix = Ai[0] - Bi[0], iy = Ai[1] - Bi[1], li = sqrtf(ix * ix + iy * iy);
+    if (lg < 1e-6f || li < 1e-6f || !q_fits(li, lg, k)) return 0;
+    float th = atan2f(iy, ix) - atan2f(gy, gx), sc = li / lg, cs = cosf(th) * sc, sn = sinf(th) * sc;
+    for (int j = 0; j < n; j++) {
+        float px = q->fl[2 * (s + j)] - Gb[0], py = q->fl[2 * (s + j) + 1] - Gb[1];
+        float x = Bi[0] + cs * px - sn * py, y = Bi[1] + sn * px + cs * py;
+        q->ti[2 * (s + j)] = x;
+        q->ti[2 * (s + j) + 1] = y;
+        q->t2[2 * (s + j)] = roundf(x);
+        q->t2[2 * (s + j) + 1] = roundf(y);
+    }
+    memcpy(q->t2 + 2 * cag, A, 2 * sizeof(float));
+    memcpy(q->t2 + 2 * cbg, B, 2 * sizeof(float));
+    memcpy(q->ti + 2 * cag, Ai, 2 * sizeof(float));
+    memcpy(q->ti + 2 * cbg, Bi, 2 * sizeof(float));
+    *dist = fabsf(logf(sc));
+    return 1;
+}
+
+static int q_hit1(QCtx *q, int g, const float *gb, int h)
+{
+    if (q->stamp[h] == q->st) return 0;
+    q->stamp[h] = q->st;
+    if (!box_hit(gb, q->bb + 4 * h)) return 0;
+    return (q->rect[g] && q->isrect[h]) || face2_overlap(q->m, q->t2, g, q->c2, h);
+}
+
+/* does face g at t2 overlap a face of the island? */
+static int q_hits(QCtx *q, int g, const float *gb)
+{
+    QGrid *G = &q->grid;
+    int x0 = (int)floorf(gb[0] / G->cell), x1 = (int)floorf(gb[2] / G->cell), y0 = (int)floorf(gb[1] / G->cell), y1 = (int)floorf(gb[3] / G->cell);
+    q->st++;
+    for (int i = 0; i < G->nbig; i++)
+        if (q_hit1(q, g, gb, G->big[i])) return 1;
+    if ((double)(x1 - x0 + 1) * (y1 - y0 + 1) > QG_BIG) {   /* a huge face: every face of the island */
+        for (int i = 0; i < G->ne; i++)
+            if (q_hit1(q, g, gb, G->ef[i])) return 1;
+        return 0;
+    }
+    for (int y = y0; y <= y1; y++)
+        for (int x = x0; x <= x1; x++) {
+            int sl = qg_slot(G, x, y, 0);
+            for (int i = sl < 0 ? -1 : G->head[sl]; i >= 0; i = G->en[i])
+                if (q_hit1(q, g, gb, G->ef[i])) return 1;
+        }
+    return 0;
+}
+
+static float q_area(const Mesh *m, const float *c2, int f)
+{
+    int s = m->fo[f], n = m->fo[f + 1] - s;
+    float a = 0;
+    for (int k = 0; k < n; k++) {
+        const float *p = c2 + 2 * (s + k), *r = c2 + 2 * (s + (k + 1) % n);
+        a += p[0] * r[1] - r[0] * p[1];
+    }
+    return 0.5f * a;
+}
+
+static void q_add(QCtx *q, int id, int f)
+{
+    face_bb(q->m, q->c2, f, q->bb);
+    q->isl[f] = id;
+    q->nextf[f] = -1;
+    Grow *G = &q->gr[id];
+    if (G->n) q->nextf[G->tail] = f;
+    else G->head = f;
+    G->tail = f;
+    G->n++;
+    if (q_area(q->m, q->c2, f) > 0) qg_add(&q->grid, f, q->bb + 4 * f);
+    /* the faces it leads to, cheapest first: gentle bends, little stretch; upright edges a touch sooner */
+    const Mesh *m = q->m;
+    for (int c = m->fo[f]; c < m->fo[f + 1]; c++) {
+        int e = q->ce[c];
+        if (e < 0 || !q->join[e]) continue;
+        int g = m->ef[2 * e] == f ? m->ef[2 * e + 1] : m->ef[2 * e];
+        float dist;
+        if (g < 0 || q->isl[g] >= 0 || !q_place(q, f, e, g, &dist)) continue;
+        V3 d = v3norm(v3sub(q->wp[m->ev[2 * e + 1]], q->wp[m->ev[2 * e]]));
+        qh_push(&q->heap, q->bend[e] + 4 * dist - 0.002f * fabsf(d.y), e, f);
+    }
+}
+
+/* face f alone as a new island: a quad as an upright rectangle, other faces in their own shape
+   with the pixel grid along an edge */
+static void q_seed(QCtx *q, int id, int f)
+{
+    const Mesh *m = q->m;
+    int s = m->fo[f], n = m->fo[f + 1] - s;
+    float *c = q->c2 + 2 * s, *ci = q->ci + 2 * s;
+    if (q->rect[f]) {
+        float h[2] = { 0, 0 }, l[4];
+        for (int k = 0; k < 4; k++) {
+            const float *p = q->fl + 2 * (s + k), *r = q->fl + 2 * (s + (k + 1) % 4);
+            l[k] = sqrtf((r[0] - p[0]) * (r[0] - p[0]) + (r[1] - p[1]) * (r[1] - p[1]));
+            h[k & 1] += fabsf(r[0] - p[0]) / l[k];
+        }
+        int k0 = h[0] >= h[1] ? 0 : 1;
+        const float *p0 = q->fl + 2 * (s + k0), *p1 = q->fl + 2 * (s + (k0 + 1) % 4);
+        float w = 0.5f * (l[k0] + l[(k0 + 2) % 4]), ht = 0.5f * (l[(k0 + 1) % 4] + l[(k0 + 3) % 4]), sx = p1[0] >= p0[0] ? 1.0f : -1.0f;
+        float W = fmaxf(1, roundf(w)), H = fmaxf(1, roundf(ht));
+        float cx[4] = { 0, sx, sx, 0 }, cy[4] = { 0, 0, sx, sx };
+        for (int j = 0; j < 4; j++) {
+            int k = (k0 + j) % 4;
+            c[2 * k] = cx[j] * W; c[2 * k + 1] = cy[j] * H;
+            ci[2 * k] = cx[j] * w; ci[2 * k + 1] = cy[j] * ht;
+        }
+        q->isrect[f] = 1;
+    } else {
+        memcpy(ci, q->fl + 2 * s, 2 * n * sizeof(float));
+        straighten(m, q->ci, f, &f, 1);
+        for (int k = 0; k < 2 * n; k++) c[k] = roundf(ci[k]);
+    }
+    q->gr[id].n = 0;
+    q->gr[id].folded = 0;
+    q->gr[id].fold[0] = q->gr[id].fold[1] = 0;
+    q->grid.gen++;
+    q->grid.used = 0;
+    q->grid.ne = 0;
+    q->grid.nbig = 0;
+    q->heap.n = 0;
+    q_add(q, id, f);
+}
+
+static const float *sortSeed;
+static const unsigned char *sortRect;
+static int cmp_seed(const void *a, const void *b)
+{
+    int i = *(const int *)a, j = *(const int *)b;
+    if (sortRect[i] != sortRect[j]) return sortRect[j] - sortRect[i];
+    float d = sortSeed[j] - sortSeed[i];
+    return d > 0 ? 1 : d < 0 ? -1 : i - j;
+}
+
+/* lays out the faces in use as islands (c2: pixels, y up); returns how many islands it made */
+static int q_grow(const Mesh *m, const V3 *wp, const V3 *fn, const float *fa, const unsigned char *use, const unsigned char *join,
+                  const int *ce, const float *bend, float density, float *c2, float *t2, float *bb, int *isl, int *nextf, Grow *gr)
+{
+    int nf = m->nf, nc = m->fo[nf], nb = 0;
+    QCtx q;
+    memset(&q, 0, sizeof q);
+    q.m = m; q.wp = wp; q.use = use; q.join = join; q.ce = ce; q.bend = bend; q.density = density;
+    q.c2 = c2; q.t2 = t2; q.bb = bb; q.isl = isl; q.nextf = nextf; q.gr = gr;
+    q.ci = xrealloc(NULL, (2 * (size_t)nc + 2) * sizeof(float));
+    q.ti = xrealloc(NULL, (2 * (size_t)nc + 2) * sizeof(float));
+    q.fl = xrealloc(NULL, (2 * (size_t)nc + 2) * sizeof(float));
+    q.len = xrealloc(NULL, ((size_t)nc + 1) * sizeof(float));
+    q.stamp = xcalloc(nf + 1, sizeof(int));
+    q.rect = xcalloc(nf + 1, 1);
+    q.isrect = xcalloc(nf + 1, 1);
+    float *key = xrealloc(NULL, (nf + 1) * sizeof(float)), el = 0;
+    int *ord = xrealloc(NULL, (nf + 1) * sizeof(int)), no = 0, nel = 0;
+    for (int f = 0; f < nf; f++) {
+        V3 R, U;
+        face_frame(fn[f], &R, &U);
+        int s = m->fo[f], n = m->fo[f + 1] - s;
+        for (int k = 0; k < n; k++) {
+            V3 p = wp[m->fi[s + k]];
+            q.fl[2 * (s + k)] = v3dot(p, R) * density;
+            q.fl[2 * (s + k) + 1] = v3dot(p, U) * density;
+            q.len[s + k] = v3len(v3sub(wp[m->fi[s + (k + 1) % n]], p));
+            if (use[f]) { el += q.len[s + k]; nel++; }
+        }
+        if (!use[f]) continue;
+        q.rect[f] = (unsigned char)q_quad_ok(&q, f);
+        /* seeds: quads first, biggest first, walls before floors when it's a tie */
+        key[f] = fa[f] * (1 + 1e-3f * (1 - fabsf(fn[f].y)));
+        ord[no++] = f;
+    }
+    sortSeed = key;
+    sortRect = q.rect;
+    qsort(ord, no, sizeof(int), cmp_seed);
+    q.grid.cell = fmaxf(4, roundf(nel ? el / nel * density : 4));
+    qg_alloc(&q.grid, 1024);
+    for (int i = 0; i < no; i++) {
+        int f = ord[i];
+        if (isl[f] >= 0) continue;
+        int id = nb++;
+        q_seed(&q, id, f);
+        QEnt it;
+        while (qh_pop(&q.heap, &it)) {
+            int g = m->ef[2 * it.e] == it.f ? m->ef[2 * it.e + 1] : m->ef[2 * it.e];
+            float dist, gb[4];
+            if (isl[g] >= 0 || !q_place(&q, it.f, it.e, g, &dist)) continue;
+            /* faces in their own shape only bend across edges parallel to the island's other bends,
+               so they unroll in strips; a grid of quad rectangles may curve both ways (each quad is
+               stretched a little at most) */
+            int caf = corner_at(m, it.f, m->ev[2 * it.e]), cbf = corner_at(m, it.f, m->ev[2 * it.e + 1]);
+            float dx = q.ci[2 * cbf] - q.ci[2 * caf], dy = q.ci[2 * cbf + 1] - q.ci[2 * caf + 1], dl = sqrtf(dx * dx + dy * dy);
+            int bent = bend[it.e] > 4e-5f, grid = q.isrect[it.f] && q.rect[g];
+            Grow *G = &gr[id];
+            if (bent && !grid && G->folded && fabsf(G->fold[0] * dx + G->fold[1] * dy) < 0.866f * dl) continue;
+            /* rounding may squash a face smaller than a pixel, but not one that should get pixels.
+               A squashed face covers nothing, so it can't overlap anything either. */
+            float ar = q_area(m, t2, g);
+            if (dl < 1e-9f || (ar <= 0 && q_area(m, q.ti, g) >= 2)) continue;
+            gb[0] = gb[1] = 1e30f;
+            gb[2] = gb[3] = -1e30f;
+            for (int c = m->fo[g]; c < m->fo[g + 1]; c++) {
+                gb[0] = fminf(gb[0], t2[2 * c]); gb[1] = fminf(gb[1], t2[2 * c + 1]);
+                gb[2] = fmaxf(gb[2], t2[2 * c]); gb[3] = fmaxf(gb[3], t2[2 * c + 1]);
+            }
+            if (ar > 0 && q_hits(&q, g, gb)) continue;
+            int s = m->fo[g], n = m->fo[g + 1] - s;
+            memcpy(c2 + 2 * s, t2 + 2 * s, 2 * n * sizeof(float));
+            memcpy(q.ci + 2 * s, q.ti + 2 * s, 2 * n * sizeof(float));
+            q.isrect[g] = q.rect[g];
+            if (bent && !G->folded) { G->fold[0] = dx / dl; G->fold[1] = dy / dl; G->folded = 1; }
+            else if (bent && fabsf(G->fold[0] * dx + G->fold[1] * dy) < 0.866f * dl) G->fold[0] = G->fold[1] = 0;   /* curved both ways */
+            q_add(&q, id, g);
+        }
+    }
+    free(q.ci); free(q.ti); free(q.fl); free(q.len); free(q.stamp); free(q.rect); free(q.isrect);
+    free(q.grid.kx); free(q.grid.ky); free(q.grid.head); free(q.grid.sg); free(q.grid.ef); free(q.grid.en); free(q.grid.big);
+    free(q.heap.a); free(key); free(ord);
+    return nb;
+}
+
 static int pot(int x)
 {
     int p = 1;
@@ -1303,7 +1709,7 @@ static void fill_put(void *ctx, int x, int y, const float w[3])
     }
 }
 
-int mesh_pixel_unwrap(Mesh *m, M4 xf, float density, float angle, const unsigned char *fmask, int maxsize)
+int mesh_pixel_unwrap(Mesh *m, M4 xf, float density, float angle, const unsigned char *fmask, int maxsize, int quads)
 {
     int nf = m->nf, nc = m->fo[nf], partial = fmask && m->uv && m->tex, nuse = 0;
     if (!nf || !(density > 0)) return 0;
@@ -1330,9 +1736,10 @@ int mesh_pixel_unwrap(Mesh *m, M4 xf, float density, float angle, const unsigned
         join[e] = (unsigned char)(runs(m, f0, a, b) != runs(m, f1, a, b));
     }
 
-    /* islands: joinable edges go gentlest bend first (flat ones before any bend). Each joins the
-       islands on its two sides if they fit together without overlapping, and an island only bends
-       across edges parallel to its earlier bends, so curved surfaces unfold into strips. */
+    /* islands. Follow Quads grows each one from its biggest face (q_grow). Otherwise joinable edges
+       go gentlest bend first (flat ones before any bend): each joins the islands on its two sides if
+       they fit together without overlapping. Either way an island only bends across edges parallel
+       to its earlier bends, so curved surfaces unfold into strips. */
     float *c2 = xrealloc(NULL, (2 * (size_t)nc + 2) * sizeof(float)), *t2 = xrealloc(NULL, (2 * (size_t)nc + 2) * sizeof(float));
     float *bb = xrealloc(NULL, (4 * (size_t)nf + 4) * sizeof(float)), *bend = xrealloc(NULL, (m->ne + 1) * sizeof(float));
     int *isl = xrealloc(NULL, (nf + 1) * sizeof(int)), *nextf = xrealloc(NULL, (nf + 1) * sizeof(int));
@@ -1345,16 +1752,20 @@ int mesh_pixel_unwrap(Mesh *m, M4 xf, float density, float angle, const unsigned
             bend[e] = 1 - v3dot(fn[m->ef[2 * e]], fn[m->ef[2 * e + 1]]);
             eo[neo++] = e;
         }
-    sortKey = bend;
-    qsort(eo, neo, sizeof(int), cmp_key_idx);
-    for (int i = 0; i < neo; i++) {
-        int e = eo[i], f[2] = { m->ef[2 * e], m->ef[2 * e + 1] };
-        for (int k = 0; k < 2; k++)
-            if (isl[f[k]] < 0) grow_seed(m, wp, fn, c2, bb, isl, nextf, gr, nb++, f[k]);
-        if (isl[f[0]] != isl[f[1]]) grow_join(m, c2, t2, bb, isl, nextf, gr, e, bend[e] > 4e-5f);
+    if (quads) {
+        nb = q_grow(m, wp, fn, fa, use, join, ce, bend, density, c2, t2, bb, isl, nextf, gr);
+    } else {
+        sortKey = bend;
+        qsort(eo, neo, sizeof(int), cmp_key_idx);
+        for (int i = 0; i < neo; i++) {
+            int e = eo[i], f[2] = { m->ef[2 * e], m->ef[2 * e + 1] };
+            for (int k = 0; k < 2; k++)
+                if (isl[f[k]] < 0) grow_seed(m, wp, fn, c2, bb, isl, nextf, gr, nb++, f[k]);
+            if (isl[f[0]] != isl[f[1]]) grow_join(m, c2, t2, bb, isl, nextf, gr, e, bend[e] > 4e-5f);
+        }
+        for (int f = 0; f < nf; f++)
+            if (use[f] && isl[f] < 0) grow_seed(m, wp, fn, c2, bb, isl, nextf, gr, nb++, f);
     }
-    for (int f = 0; f < nf; f++)
-        if (use[f] && isl[f] < 0) grow_seed(m, wp, fn, c2, bb, isl, nextf, gr, nb++, f);
     Isl *is = xrealloc(NULL, (nb + 1) * sizeof(Isl));
     for (int g = 0; g < nb; g++) {
         if (!gr[g].n) continue;
@@ -1366,15 +1777,18 @@ int mesh_pixel_unwrap(Mesh *m, M4 xf, float density, float angle, const unsigned
             if (fa[f] > fa[big]) big = f;
         }
         I->n = nl - I->first;
-        /* the biggest face sets which way is up, then the pixel grid lines up with it */
-        upright(m, wp, fn, c2, big, list + I->first, I->n);
-        straighten(m, c2, big, list + I->first, I->n);
+        /* the biggest face sets which way is up, then the pixel grid lines up with it (Follow Quads
+           islands start from their biggest face, already upright and in pixels) */
+        if (!quads) {
+            upright(m, wp, fn, c2, big, list + I->first, I->n);
+            straighten(m, c2, big, list + I->first, I->n);
+        }
         /* to pixels, y down, every corner on a pixel corner */
-        float mnx = 1e30f, mny = 1e30f;
+        float mnx = 1e30f, mny = 1e30f, sc = quads ? 1 : density;
         for (int j = 0; j < I->n; j++)
             for (int c = m->fo[list[I->first + j]]; c < m->fo[list[I->first + j] + 1]; c++) {
-                c2[2 * c] *= density;
-                c2[2 * c + 1] *= -density;
+                c2[2 * c] *= sc;
+                c2[2 * c + 1] *= -sc;
                 mnx = fminf(mnx, c2[2 * c]);
                 mny = fminf(mny, c2[2 * c + 1]);
             }

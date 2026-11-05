@@ -128,12 +128,15 @@ int mesh_bridge(Mesh *m, const unsigned char *emask, int divs);
    xf), every corner on a pixel corner, walls upright. Faces join one island across edges that are
    flat or soft (within 'angle' degrees or Soften Edge; Harden Edge always splits) as long as the
    unfolded island doesn't overlap itself, and bends only go across edges parallel to the island's
-   other bends, so curved surfaces come out as strips. fmask NULL (or a mesh without uvs): every face, packed
+   other bends, so curved surfaces come out as strips. quads (Follow Quads): each quad becomes a
+   rectangle of whole pixels and strips of quads keep one row height, so the pixel grid follows the
+   mesh's edges like a UV map, even on slanted or tapered faces; otherwise every face keeps its true
+   shape (square pixels). fmask NULL (or a mesh without uvs): every face, packed
    into a new power-of-two texture; otherwise only those faces, placed in free space so the rest
    keep their pixels where they are. Painted pixels follow their faces; faces with no pixels yet
    get their vertex colors (and the vertex colors turn white). Returns faces laid out, 0 if none,
    -1 if the texture would be larger than maxsize. */
-int mesh_pixel_unwrap(Mesh *m, M4 xf, float density, float angle, const unsigned char *fmask, int maxsize);
+int mesh_pixel_unwrap(Mesh *m, M4 xf, float density, float angle, const unsigned char *fmask, int maxsize, int quads);
 /* pixels per unit (world space) of the faces that have pixels (the median), 0 if none do */
 float mesh_uv_density(const Mesh *m, M4 xf);
 /* marks the faces whose pixels are missing: squashed flat or to a line (walls of an extrusion, a

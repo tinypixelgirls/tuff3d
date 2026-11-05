@@ -293,7 +293,7 @@ static void test_tex(void)
     /* a cube at 16 pixels per unit: six 16x16 islands with every corner on a pixel corner */
     Mesh m = cube();
     m.c[0] = v3(1, 0, 0);
-    CHECK(mesh_pixel_unwrap(&m, id, 16, 0, NULL, 4096) == 6);
+    CHECK(mesh_pixel_unwrap(&m, id, 16, 0, NULL, 4096, 0) == 6);
     CHECK(m.uv && m.tex && m.tex->w == 64 && m.tex->h == 64);
     CHECK(uv_integral(&m));
     for (int f = 0; f < m.nf; f++) CHECK(fabsf(uv_area(&m, f) - 256) < 1e-3f);
@@ -357,7 +357,7 @@ static void test_tex(void)
     memcpy(walls, nm, sizeof walls);
     float keep[200];
     memcpy(keep, t.uv, 2 * t.fo[t.nf] * sizeof(float));
-    CHECK(mesh_pixel_unwrap(&t, id, 16, 0, walls, 4096) == 4);
+    CHECK(mesh_pixel_unwrap(&t, id, 16, 0, walls, 4096, 0) == 4);
     CHECK(mesh_uv_needy(&t, id, nm) == 0 && uv_integral(&t));
     memcpy(nm, walls, sizeof nm);
     {
@@ -391,7 +391,7 @@ static void test_tex(void)
 
     /* flood fill stays inside an island */
     Mesh w = cube();
-    mesh_pixel_unwrap(&w, id, 16, 0, NULL, 4096);
+    mesh_pixel_unwrap(&w, id, 16, 0, NULL, 4096, 0);
     {
         int *tf = malloc(64 * 64 * sizeof(int));
         mesh_texel_faces(&w, tf);
@@ -449,9 +449,9 @@ static void test_tex(void)
     p.csides = 8;
     Mesh c = mesh_prim(&p);
     int ci[64];
-    CHECK(mesh_pixel_unwrap(&c, id, 16, 0, NULL, 4096) == 10 && mesh_uv_islands(&c, ci) == 10);
-    CHECK(mesh_pixel_unwrap(&c, id, 16, 50, NULL, 4096) == 10 && mesh_uv_islands(&c, ci) == 3 && uv_integral(&c));
-    CHECK(mesh_pixel_unwrap(&c, id, 16, 180, NULL, 4096) == 10 && mesh_uv_islands(&c, ci) == 3);   /* caps don't fork the strip */
+    CHECK(mesh_pixel_unwrap(&c, id, 16, 0, NULL, 4096, 0) == 10 && mesh_uv_islands(&c, ci) == 10);
+    CHECK(mesh_pixel_unwrap(&c, id, 16, 50, NULL, 4096, 0) == 10 && mesh_uv_islands(&c, ci) == 3 && uv_integral(&c));
+    CHECK(mesh_pixel_unwrap(&c, id, 16, 180, NULL, 4096, 0) == 10 && mesh_uv_islands(&c, ci) == 3);   /* caps don't fork the strip */
     {
         /* the side strip stands upright: 8 faces side by side, 32 pixels tall */
         int tall = 0;
@@ -464,20 +464,157 @@ static void test_tex(void)
     }
     /* a smooth cube unwraps into a band of four walls plus a top and a bottom */
     Mesh sc = cube();
-    CHECK(mesh_pixel_unwrap(&sc, id, 16, 180, NULL, 4096) == 6 && mesh_uv_islands(&sc, ci) == 3 && uv_integral(&sc));
+    CHECK(mesh_pixel_unwrap(&sc, id, 16, 180, NULL, 4096, 0) == 6 && mesh_uv_islands(&sc, ci) == 3 && uv_integral(&sc));
     mesh_free(&sc);
     mesh_free(&c);
 
     /* a turned cube still gets square pixels on top */
     Mesh r = cube();
     M4 rot = m4_trs(v3(0, 0, 0), v3(0, 30, 0), v3(1, 1, 1));
-    CHECK(mesh_pixel_unwrap(&r, rot, 16, 0, NULL, 4096) == 6);
+    CHECK(mesh_pixel_unwrap(&r, rot, 16, 0, NULL, 4096, 0) == 6);
     for (int f = 0; f < r.nf; f++) CHECK(fabsf(uv_area(&r, f) - 256) < 1e-3f);
     CHECK(uv_integral(&r));
     /* too many pixels: nothing changes */
     Tex *was = r.tex;
-    CHECK(mesh_pixel_unwrap(&r, id, 5000, 0, NULL, 4096) == -1 && r.tex == was);
+    CHECK(mesh_pixel_unwrap(&r, id, 5000, 0, NULL, 4096, 0) == -1 && r.tex == was);
     mesh_free(&r);
+    mesh_free(&m);
+}
+
+/* face f's uvs are an upright rectangle (width / height out) */
+static int uv_rect(const Mesh *m, int f, float *w, float *h)
+{
+    int s = m->fo[f];
+    if (m->fo[f + 1] - s != 4) return 0;
+    float lo[2] = { 1e9f, 1e9f }, hi[2] = { -1e9f, -1e9f };
+    for (int k = 0; k < 4; k++) {
+        const float *p = m->uv + 2 * (s + k), *q = m->uv + 2 * (s + (k + 1) % 4);
+        if ((p[0] != q[0]) == (p[1] != q[1])) return 0;   /* each side runs along x or along y */
+        for (int j = 0; j < 2; j++) { lo[j] = fminf(lo[j], p[j]); hi[j] = fmaxf(hi[j], p[j]); }
+    }
+    if (w) *w = hi[0] - lo[0];
+    if (h) *h = hi[1] - lo[1];
+    return hi[0] > lo[0] && hi[1] > lo[1];
+}
+
+/* the quads' rectangles cover exactly their area in pixels: none of them overlap */
+static int quads_apart(const Mesh *m)
+{
+    int *tf = malloc((size_t)m->tex->w * m->tex->h * sizeof(int)), cov = 0;
+    float want = 0, w, h;
+    mesh_texel_faces(m, tf);
+    for (int f = 0; f < m->nf; f++) if (uv_rect(m, f, &w, &h)) want += w * h;
+    for (int i = 0; i < m->tex->w * m->tex->h; i++) cov += tf[i] >= 0 && uv_rect(m, tf[i], NULL, NULL);
+    free(tf);
+    return fabsf(want - cov) < 0.5f;
+}
+
+static int all_quads_rect(const Mesh *m)
+{
+    for (int f = 0; f < m->nf; f++) if (m->fo[f + 1] - m->fo[f] == 4 && !uv_rect(m, f, NULL, NULL)) return 0;
+    return 1;
+}
+
+static void test_quads(void)
+{
+    M4 id = m4_id();
+    int isl[2048];
+    /* a cube: six 16x16 squares, as before */
+    Mesh m = cube();
+    CHECK(mesh_pixel_unwrap(&m, id, 16, 0, NULL, 4096, 1) == 6 && uv_integral(&m) && all_quads_rect(&m));
+    CHECK(mesh_uv_islands(&m, isl) == 6 && texels_covered(&m) == 6 * 256 && fabsf(mesh_uv_density(&m, id) - 16) < 1e-3f);
+    mesh_free(&m);
+
+    /* a frustum: the tapered walls are rectangles as wide as their middle, as tall as their slanted
+       sides (1.06 units: 17 pixels) */
+    m = cube();
+    for (int v = 0; v < m.nv; v++) if (m.p[v].y > 0) { m.p[v].x *= 0.5f; m.p[v].z *= 0.5f; }
+    CHECK(mesh_pixel_unwrap(&m, id, 16, 0, NULL, 4096, 1) == 6 && uv_integral(&m) && all_quads_rect(&m) && quads_apart(&m));
+    {
+        int walls = 0;
+        float w, h;
+        for (int f = 0; f < m.nf; f++)
+            if (fabsf(mesh_fnormal(&m, f).y) < 0.9f && uv_rect(&m, f, &w, &h)) walls += w == 12 && h == 17;
+        CHECK(walls == 4);
+    }
+    /* the old way keeps their true shape: not rectangles */
+    CHECK(mesh_pixel_unwrap(&m, id, 16, 0, NULL, 4096, 0) == 6 && !all_quads_rect(&m));
+    mesh_free(&m);
+
+    /* a sheared plane (parallelograms) is one grid of rectangles */
+    m = plane(4);
+    for (int v = 0; v < m.nv; v++) m.p[v].x += 0.8f * m.p[v].z;
+    CHECK(mesh_pixel_unwrap(&m, id, 16, 30, NULL, 4096, 1) == 16 && all_quads_rect(&m) && quads_apart(&m));
+    CHECK(mesh_uv_islands(&m, isl) == 1);
+    mesh_free(&m);
+
+    /* a subdivided cube: each side stays one piece, and rounding doesn't lose pixels along it */
+    Prim p;
+    prim_defaults(&p, PRIM_CUBE);
+    p.sw = p.sh = p.sd = 3;
+    m = mesh_prim(&p);
+    CHECK(mesh_pixel_unwrap(&m, id, 16, 30, NULL, 4096, 1) == 54 && uv_integral(&m) && all_quads_rect(&m));
+    CHECK(mesh_uv_islands(&m, isl) == 6 && texels_covered(&m) == 6 * 256 && quads_apart(&m));
+    mesh_free(&m);
+
+    /* faces smaller than a pixel squash like before instead of each taking a pixel */
+    p.sw = p.sh = p.sd = 60;
+    m = mesh_prim(&p);
+    CHECK(mesh_pixel_unwrap(&m, id, 16, 30, NULL, 4096, 1) == m.nf && m.tex->w <= 64 && m.tex->h <= 64);
+    {
+        int *big = malloc(m.nf * sizeof(int));
+        CHECK(mesh_uv_islands(&m, big) == 6);
+        free(big);
+    }
+    mesh_free(&m);
+
+    /* a smooth cube unfolds into one cross of six squares */
+    m = cube();
+    CHECK(mesh_pixel_unwrap(&m, id, 16, 180, NULL, 4096, 1) == 6 && mesh_uv_islands(&m, isl) == 1 && quads_apart(&m));
+    mesh_free(&m);
+
+    /* a sphere: its middle is one grid (rows follow the edge loops), every quad a rectangle */
+    prim_defaults(&p, PRIM_SPHERE);
+    p.scols = 12; p.srows = 8;
+    m = mesh_prim(&p);
+    CHECK(mesh_pixel_unwrap(&m, id, 16, 30, NULL, 4096, 1) == m.nf && uv_integral(&m) && all_quads_rect(&m) && quads_apart(&m));
+    {
+        int n = mesh_uv_islands(&m, isl), big = 0;
+        for (int i = 0; i < n; i++) {
+            int k = 0;
+            for (int f = 0; f < m.nf; f++) k += isl[f] == i;
+            if (k > big) big = k;
+        }
+        CHECK(big == 48);
+    }
+    mesh_free(&m);
+
+    /* a cylinder: the side is one upright strip, the caps don't fork it */
+    prim_defaults(&p, PRIM_CYL);
+    p.csides = 8;
+    m = mesh_prim(&p);
+    CHECK(mesh_pixel_unwrap(&m, id, 16, 180, NULL, 4096, 1) == 10 && mesh_uv_islands(&m, isl) == 3);
+    {
+        int tall = 0;
+        float w, h;
+        for (int f = 0; f < m.nf; f++) tall += uv_rect(&m, f, &w, &h) && h == 32;
+        CHECK(tall == 8);
+    }
+    mesh_free(&m);
+
+    /* extruded walls get rectangles of their own; the rest keep their pixels */
+    m = cube();
+    CHECK(mesh_pixel_unwrap(&m, id, 16, 0, NULL, 4096, 1) == 6);
+    int top = -1;
+    for (int f = 0; f < m.nf; f++) if (mesh_fnormal(&m, f).y > 0.9f) top = f;
+    m.fs[top] = 1;
+    CHECK(mesh_extrude_faces(&m) && m.nf == 10);
+    unsigned char vm[64], nm[64];
+    mesh_vmask(&m, COMP_FACE, vm);
+    for (int v = 0; v < m.nv; v++) if (vm[v]) { m.p[v].y += 1; m.p[v].x *= 0.5f; }
+    CHECK(mesh_uv_needy(&m, id, nm) == 4);
+    CHECK(mesh_pixel_unwrap(&m, id, 16, 0, nm, 4096, 1) == 4 && all_quads_rect(&m) && quads_apart(&m));
+    CHECK(mesh_uv_needy(&m, id, nm) == 0);
     mesh_free(&m);
 }
 
@@ -776,6 +913,7 @@ int main(void)
 
     test_ops();
     test_tex();
+    test_quads();
     printf(fails ? "%d FAILED\n" : "all tests passed\n", fails);
     return fails != 0;
 }

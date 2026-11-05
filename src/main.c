@@ -49,6 +49,7 @@ static int liveCmd;                 /* the last step was this op: its settings r
 static V3 paintCol = { 1, 0, 0 };
 static float paintOpa = 1, paintRad = 40;
 static int pixDens = 16, pixBrush = 1, pixFill, pixGrid = 1, pixErase;   /* Pixel Paint: pixels per unit, brush, bucket, grid, eraser */
+static int pixQuads = 1;   /* Pixel Unwrap: Follow Quads (quads become pixel rectangles, like a UV map) or true shapes */
 static char g_path[MAX_PATH];
 static char g_msg[200];
 static int lastCmd, lastHandle, hover, modified, snapGrid, snapPoint;
@@ -2285,7 +2286,8 @@ static void cmd_image(int i)
 /* ================================================================ Pixel Paint
 
    Pixel art painted straight onto the model, like Aseprite on a 3D canvas. Pixel Unwrap lays the
-   faces out flat at Pixels / Unit with every corner on a pixel corner; the Pixel Paint tool then
+   faces out flat at Pixels / Unit with every corner on a pixel corner (with Follow Quads, each quad
+   is a rectangle of pixels, so the grid follows the mesh's edges like a UV map); the Pixel Paint tool then
    sets single pixels (or a square brush, or a bucket fill), with Ctrl+click to pick a color and
    Shift+click for a straight line. Textures live in the .tuff scene and go out as PNG with an OBJ;
    Edit in Aseprite saves a PNG, opens it there, and reloads it here whenever Aseprite saves. */
@@ -2601,7 +2603,7 @@ static int pix_unwrap(int i, const unsigned char *fmask)
     Obj *o = &ob[i];
     M4 M = obj_mat(o);
     float d = fmask && o->m.uv ? mesh_uv_density(&o->m, M) : 0;
-    int r = mesh_pixel_unwrap(&o->m, M, d > 0 ? d : (float)pixDens, o->nangle, fmask, 4096);
+    int r = mesh_pixel_unwrap(&o->m, M, d > 0 ? d : (float)pixDens, o->nangle, fmask, 4096, pixQuads);
     if (r > 0) o->prim.type = PRIM_NONE;
     if (r > 0 && o->tex[0] && o->m.tex) tex_write(i, o->tex);   /* keep the linked picture in step */
     return r;
@@ -3398,7 +3400,7 @@ enum {
 /* later commands start at 400, so ids saved with hotkeys never change */
 enum {
     CM_TPIXEL = 400, CM_UNWRAP, CM_ASEPRITE, CM_TEXLOAD, CM_TEXSAVE, CM_TEXREMOVE,
-    CM_PALLOAD, CM_PALTEX, CM_PALRESET, CM_PIXFILL, CM_PIXGRID
+    CM_PALLOAD, CM_PALTEX, CM_PALRESET, CM_PIXFILL, CM_PIXGRID, CM_PIXQUADS
 };
 
 /* the command that picks tool t */
@@ -3459,6 +3461,7 @@ static Bind binds[] = {
     { CM_UNWRAP, "Texture", "Pixel Unwrap", { 0 }, { 0 } },
     { CM_PIXFILL, "Texture", "Bucket Fill On/Off", { 0 }, { 0 } },
     { CM_PIXGRID, "Texture", "Pixel Grid On/Off", { 0 }, { 0 } },
+    { CM_PIXQUADS, "Texture", "Follow Quads On/Off", { 0 }, { 0 } },
     { CM_ASEPRITE, "Texture", "Edit Texture in Aseprite", { 0 }, { 0 } },
     { CM_TEXLOAD, "Texture", "Load Texture", { 0 }, { 0 } },
     { CM_TEXSAVE, "Texture", "Save Texture As", { 0 }, { 0 } },
@@ -4037,27 +4040,98 @@ static void cmd_bridge(void)
     liveCmd = CM_BRIDGE;
 }
 
-/* Harden / Soften Edge: per edge shading on the selected edges; on whole objects it is
-   the same as Hard / Smooth Shade */
-static void cmd_shade(float angle, const char *what);
+/* ---- shading the selection. In component mode Hard Shade, Smooth Shade and Auto Smooth (and
+   Harden / Soften Edge) work on just the selected part: they set the per edge override of the
+   selected edges, every edge of the selected faces, and the edges between selected vertices (a
+   vertex selected on its own: all its edges). Auto Smooth puts those edges back on the object's
+   Normal Angle. In object mode, or with nothing selected, they shade whole objects (cmd_shade). */
 
-static void cmd_edge_shade(int hard)
+static unsigned char *shade_edges(const Obj *o)
 {
-    if (mode == M_OBJ) { cmd_shade(hard ? 0 : 180, hard ? "Harden Edge" : "Soften Edge"); return; }
+    const Mesh *m = &o->m;
+    unsigned char *em = calloc(m->ne + 1, 1), *pair = NULL;
     int n = 0;
-    undo_push(hard ? "Harden Edge" : "Soften Edge");
+    if (!em) return NULL;
+    for (int e = 0; e < m->ne; e++) {
+        int f0 = m->ef[2 * e], f1 = m->ef[2 * e + 1], a = m->ev[2 * e], b = m->ev[2 * e + 1];
+        if (shows(M_EDGE) && m->es[e]) em[e] = 1;
+        if (shows(M_FACE) && ((f0 >= 0 && m->fs[f0]) || (f1 >= 0 && m->fs[f1]))) em[e] = 1;
+        if (shows(M_VERT) && m->vs[a] && m->vs[b]) {
+            em[e] = 1;
+            if (!pair && !(pair = calloc(m->nv + 1, 1))) continue;
+            pair[a] = pair[b] = 1;   /* these vertices have a selected neighbor */
+        }
+    }
+    if (shows(M_VERT))
+        for (int e = 0; e < m->ne; e++) {
+            int a = m->ev[2 * e], b = m->ev[2 * e + 1];
+            if ((m->vs[a] && !(pair && pair[a])) || (m->vs[b] && !(pair && pair[b]))) em[e] = 1;
+        }
+    free(pair);
+    for (int e = 0; e < m->ne; e++) n += em[e];
+    if (!n) { free(em); return NULL; }
+    return em;
+}
+
+/* how edge e of o looks: EH_HARD, EH_SOFT or EH_AUTO (smooth below the Normal Angle) */
+static int edge_look(const Obj *o, int e)
+{
+    if (o->m.eh[e] != EH_AUTO) return o->m.eh[e];
+    return o->nangle <= 0 ? EH_HARD : o->nangle >= 180 ? EH_SOFT : EH_AUTO;
+}
+
+/* the shading button for the lead object's selected edges when they all look the same, else -1;
+   0 when nothing is selected (the buttons then show the whole object's shading) */
+static int sel_look(void)
+{
+    Obj *l = lead();
+    if (mode == M_OBJ || !l) return 0;
+    unsigned char *em = shade_edges(l);
+    if (!em) return 0;
+    int look = -2;
+    for (int e = 0; e < l->m.ne && look != -1; e++)
+        if (em[e]) look = look == -2 || look == edge_look(l, e) ? edge_look(l, e) : -1;
+    free(em);
+    return look == EH_HARD ? CM_HARD : look == EH_SOFT ? CM_SMOOTH : look == EH_AUTO ? CM_AUTOSMOOTH : -1;
+}
+
+/* sets the override of the selection's edges to eh. 0 if nothing is selected (the caller shades
+   whole objects instead) */
+static int sel_shade(int eh, const char *what)
+{
+    int sel = 0, n = 0;
     for (int i = 0; i < nob; i++) {
         if (!ob[i].hil) continue;
-        unsigned char *em = op_edges(&ob[i]);
+        unsigned char *em = shade_edges(&ob[i]);
         if (!em) continue;
-        for (int e = 0; e < ob[i].m.ne; e++)
-            if (em[e]) { ob[i].m.eh[e] = hard ? EH_HARD : EH_SOFT; n++; }
+        for (int e = 0; e < ob[i].m.ne; e++) {
+            if (!em[e]) continue;
+            sel++;
+            if (ob[i].m.eh[e] != eh) {
+                if (!n++) undo_push(what);
+                ob[i].m.eh[e] = (unsigned char)eh;
+            }
+        }
         free(em);
     }
-    if (!n) { undo_drop(); msg("Harden / Soften Edge: select edges, faces or objects"); return; }
-    char b[64];
-    snprintf(b, sizeof b, hard ? "Hardened %d edge(s)" : "Softened %d edge(s)", n);
+    if (!sel) return 0;
+    static const char *const how[] = { "back on the Normal Angle", "hard", "smooth" };
+    char b[128];
+    if (n) snprintf(b, sizeof b, "%s: %d edge(s) of the selection %s", what, n, n == 1 ? "is now" : "are now");
+    else snprintf(b, sizeof b, "%s: the selection's %d edge(s) %s already", what, sel, sel == 1 ? "is" : "are");
+    snprintf(b + strlen(b), sizeof b - strlen(b), " %s", how[eh]);
     msg(b);
+    return 1;
+}
+
+static void cmd_shade(float angle, const char *what);
+
+/* Harden / Soften Edge: the same as Hard / Smooth Shade */
+static void cmd_edge_shade(int hard)
+{
+    const char *what = hard ? "Harden Edge" : "Soften Edge";
+    if (mode != M_OBJ && !sel_shade(hard ? EH_HARD : EH_SOFT, what)) { msg("Harden / Soften Edge: select edges, faces, vertices or objects"); return; }
+    if (mode == M_OBJ) cmd_shade(hard ? 0 : 180, what);
 }
 
 /* a tool setting changed right after its op: undo the op and run it again with the new value */
@@ -4069,31 +4143,36 @@ static void live_redo(int cmd)
     else cmd_bridge();
 }
 
-/* Hard / smooth / auto smooth shading on the selected (or hilited) objects.
-   The choice also becomes the default for new objects. */
+/* Hard / smooth / auto smooth shading on the selected components (sel_shade), or else on the
+   selected (or hilited) objects. An object-wide choice also becomes the default for new objects. */
 static void cmd_shade(float angle, const char *what)
 {
+    if (mode != M_OBJ && sel_shade(angle <= 0 ? EH_HARD : angle >= 180 ? EH_SOFT : EH_AUTO, what)) return;
     if (angle > 0 && angle < 180) {
         Obj *l = lead();
         float a = l ? l->nangle : defAngle;
         angle = a > 0 && a < 180 ? a : 30;   /* keep a custom angle */
     }
+    /* in object mode an object-wide choice also drops the per edge overrides; in component mode
+       (nothing selected) it only changes the rest of the object, so shaded selections stay */
+    int keep = mode != M_OBJ, n = 0;
     defAngle = angle;
-    int n = 0;
     for (int i = 0; i < nob; i++) {
         if (!active(&ob[i])) continue;
         int over = 0;
-        for (int e = 0; e < ob[i].m.ne && !over; e++) over = ob[i].m.eh[e];
+        for (int e = 0; e < ob[i].m.ne && !over && !keep; e++) over = ob[i].m.eh[e];
         n += ob[i].nangle != angle || over;
     }
     if (n) {
-        /* an object-wide choice also drops per edge Harden / Soften overrides */
         undo_push(what);
         for (int i = 0; i < nob; i++)
-            if (active(&ob[i])) { ob[i].nangle = angle; memset(ob[i].m.eh, 0, ob[i].m.ne); }
+            if (active(&ob[i])) {
+                ob[i].nangle = angle;
+                if (!keep) memset(ob[i].m.eh, 0, ob[i].m.ne);
+            }
     }
-    char b[96];
-    snprintf(b, sizeof b, "%s%s", what, lead() ? "" : " (for new objects)");
+    char b[128];
+    snprintf(b, sizeof b, "%s%s", what, !lead() ? " (for new objects)" : keep ? " on the whole object (select faces, edges or vertices to shade just those)" : "");
     msg(b);
 }
 
@@ -5465,7 +5544,8 @@ static const char *HELP_TEXT =
     "  Click / drag\tPaint pixels (a model without pixels gets them first)\n"
     "  Ctrl+click / Shift+click\tPick that color / straight line from the last pixel\n"
     "  B + drag\tBrush size\n"
-    "  Texture menu\tPixel Unwrap, Bucket Fill, Edit in Aseprite, palettes\n\n"
+    "  Texture menu\tPixel Unwrap, Follow Quads, Bucket Fill, Edit in Aseprite, palettes\n"
+    "  Follow Quads\tUnwrap quads as pixel rectangles (grid follows the edges); off: square pixels\n\n"
     "Edit\n"
     "  Ctrl+E / Ctrl+B\tExtrude / bevel (Bevel Width in the side panel)\n"
     "  Ctrl+D / Delete\tDuplicate / delete (edges and vertices: their faces join)\n"
@@ -5607,6 +5687,11 @@ static void do_cmd(int id)
     case CM_PALRESET: pal_default(); pal_save(); msg("Default palette"); break;
     case CM_PIXFILL: pixFill = !pixFill; msg(pixFill ? "Bucket fill: a click fills the area of one color" : "Pencil: a click paints the brush's pixels"); break;
     case CM_PIXGRID: pixGrid = !pixGrid; msg(pixGrid ? "Pixel grid on (shows once you zoom in)" : "Pixel grid off"); break;
+    case CM_PIXQUADS:
+        pixQuads = !pixQuads;
+        msg(pixQuads ? "Follow Quads: Pixel Unwrap makes each quad a rectangle of pixels (the grid follows the edges)"
+                     : "Follow Quads off: Pixel Unwrap keeps each face's true shape (square pixels)");
+        break;
     case CM_REVERSE: cmd_face_op(mesh_reverse, "Reverse Normals", "Reversed %d face(s)"); break;
     case CM_TRIANG: cmd_face_op(mesh_triangulate, "Triangulate", "Triangulated %d face(s)"); break;
     case CM_QUAD: cmd_face_op(quad30, "Quadrangulate", "Joined %d triangle pair(s) into quads"); break;
@@ -5654,7 +5739,7 @@ enum {
     PF_OPA, PF_RAD, PF_COLOR, PF_APPLY,
     PF_MERGED, PF_BEVELW, PF_BRIDGED,
     PF_IMG,  /* + plane * 4 + (size, offset x, offset y, opacity) */
-    PF_PBRUSH = PF_IMG + 16, PF_PFILL, PF_PGRID, PF_PDENS
+    PF_PBRUSH = PF_IMG + 16, PF_PFILL, PF_PGRID, PF_PDENS, PF_PQUADS
 };
 enum { RK_HEAD = 1, RK_FLOAT, RK_INT, RK_BOOL, RK_COLOR, RK_BUTTON, RK_NAME, RK_TIP, RK_PALETTE };   /* a button's id is its command */
 #define NROW 64
@@ -5702,6 +5787,7 @@ static int *fld_i(int id)
     if (id == PF_PFILL) return &pixFill;
     if (id == PF_PGRID) return &pixGrid;
     if (id == PF_PDENS) return &pixDens;
+    if (id == PF_PQUADS) return &pixQuads;
     if (!o) return NULL;
     switch (id) {
     case PF_CSW: return &o->prim.sw;
@@ -5776,6 +5862,7 @@ static void panel_build(void)
         add_row(RK_BOOL, PF_PGRID, "Pixel Grid");
         add_row(RK_HEAD, 0, "Texture");
         add_row(RK_INT, PF_PDENS, "Pixels / Unit");
+        add_row(RK_BOOL, PF_PQUADS, "Follow Quads");
         add_row(RK_BUTTON, CM_UNWRAP, mode == M_OBJ ? "Pixel Unwrap" : "Pixel Unwrap Selected Faces");
         add_row(RK_BUTTON, CM_ASEPRITE, "Edit in Aseprite");
         if (o && o->m.tex) {
@@ -5949,7 +6036,7 @@ static void panel_set(int r, double v)
         if (id == PF_BRIDGED) { bridgeDivs = v < 0 ? 0 : v > 50 ? 50 : (int)v; live_redo(CM_BRIDGE); return; }
         if (id == PF_PBRUSH) { pixBrush = v < 1 ? 1 : v > 32 ? 32 : (int)v; return; }
         if (id == PF_PDENS) { pixDens = v < 1 ? 1 : v > 256 ? 256 : (int)v; return; }
-        if (id == PF_PFILL || id == PF_PGRID) { *fld_i(id) = v != 0; return; }
+        if (id == PF_PFILL || id == PF_PGRID || id == PF_PQUADS) { *fld_i(id) = v != 0; return; }
         *fld_i(id) = (int)v;
     }
     prim_rebuild(&ob[panelObj]);
@@ -6188,7 +6275,7 @@ static const Tool tbItems[] = {
     { "Rotate", "E", CM_TROT, "Rotate tool: drag a ring; hold J for 15 degree steps" },
     { "Scale", "R", CM_TSCALE, "Scale tool: drag a handle; drag components past the center to flatten them" },
     { "Paint", "", CM_TPAINT, "Paint vertex colors: drag over a mesh; B + drag sets the brush size" },
-    { "Pixel", "P", CM_TPIXEL, "Pixel Paint: paint pixel art right on the model (it gets square pixels the first time you click it)" }, { 0 },
+    { "Pixel", "P", CM_TPIXEL, "Pixel Paint: paint pixel art right on the model (it gets pixels the first time you click it)" }, { 0 },
     { "Object", "F8", CM_MOBJ, "Object mode: pick whole objects (F8 toggles object/component)" },
     { "Vertex", "F9", CM_MVERT, "Vertex mode (Ctrl+F9 converts the selection to vertices)" },
     { "Edge", "F10", CM_MEDGE, "Edge mode: double-click an edge to select its loop" },
@@ -6212,9 +6299,9 @@ static const Tool tbItems[] = {
     { "Grid Snap", "X", CM_SNAPGRID, "Toggle snapping moves to the grid (or hold X while dragging)" },
     { "Point Snap", "V", CM_SNAPPOINT, "Toggle snapping moves onto vertices (or hold V while dragging)" }, { 0 },
     { "Wire", "4 / 5", CM_WIRETOG, "Toggle wireframe (4) and shaded (5) display" },
-    { "Hard", "", CM_HARD, "Hard Shade: every edge looks sharp (faceted)" },
-    { "Smooth", "", CM_SMOOTH, "Smooth Shade: every edge looks soft" },
-    { "Auto", "", CM_AUTOSMOOTH, "Auto Smooth: edges sharper than the Normal Angle (side panel) stay hard" },
+    { "Hard", "", CM_HARD, "Hard Shade: edges look sharp (faceted) - the whole object, or just the selected faces, edges or vertices" },
+    { "Smooth", "", CM_SMOOTH, "Smooth Shade: edges look soft - the whole object, or just the selected faces, edges or vertices" },
+    { "Auto", "", CM_AUTOSMOOTH, "Auto Smooth: edges sharper than the Normal Angle (side panel) stay hard; on a selection, back to that" },
     { "Frame", "F", CM_FRAMESEL, "Frame the selection (A frames everything, Home resets the view)" }, { 0 },
     { "Undo", "Z", CM_UNDO, "Undo the last change" },
     { "Redo", "Shift+Z", CM_REDO, "Redo" },
@@ -6229,7 +6316,10 @@ static int tb_on(int cmd)
     if (cmd == CM_TPIXEL) return tool == T_PIXEL;
     if (cmd == CM_PIXFILL) return pixFill;
     if (cmd == CM_PIXGRID) return pixGrid;
+    if (cmd == CM_PIXQUADS) return pixQuads;
     if (cmd >= CM_HARD && cmd <= CM_AUTOSMOOTH) {
+        int sl = sel_look();   /* a component selection shows how its edges look */
+        if (sl) return cmd == sl;
         Obj *l = lead();
         float a = l ? l->nangle : defAngle;
         return cmd == (a <= 0 ? CM_HARD : a >= 180 ? CM_SMOOTH : CM_AUTOSMOOTH);
@@ -6433,12 +6523,16 @@ static void status_update(void)
     for (int i = 0; i < NTOOL; i++) CheckMenuItem(hMenu, tool_cmd(i), MF_BYCOMMAND | (tool == i ? MF_CHECKED : MF_UNCHECKED));
     CheckMenuItem(hMenu, CM_PIXFILL, MF_BYCOMMAND | (pixFill ? MF_CHECKED : MF_UNCHECKED));
     CheckMenuItem(hMenu, CM_PIXGRID, MF_BYCOMMAND | (pixGrid ? MF_CHECKED : MF_UNCHECKED));
+    CheckMenuItem(hMenu, CM_PIXQUADS, MF_BYCOMMAND | (pixQuads ? MF_CHECKED : MF_UNCHECKED));
     for (int i = 0; i < 5; i++) CheckMenuItem(hMenu, CM_MOBJ + i, MF_BYCOMMAND | (mode == i ? MF_CHECKED : MF_UNCHECKED));
     CheckMenuItem(hMenu, CM_WIRE, MF_BYCOMMAND | (wire ? MF_CHECKED : MF_UNCHECKED));
     CheckMenuItem(hMenu, CM_SHADED, MF_BYCOMMAND | (!wire ? MF_CHECKED : MF_UNCHECKED));
     Obj *l = lead();
     float a = l ? l->nangle : defAngle;
-    CheckMenuRadioItem(hMenu, CM_HARD, CM_AUTOSMOOTH, a <= 0 ? CM_HARD : a >= 180 ? CM_SMOOTH : CM_AUTOSMOOTH, MF_BYCOMMAND);
+    int look = sel_look();   /* a component selection: how its edges look (-1: mixed) */
+    if (!look) look = a <= 0 ? CM_HARD : a >= 180 ? CM_SMOOTH : CM_AUTOSMOOTH;
+    if (look > 0) CheckMenuRadioItem(hMenu, CM_HARD, CM_AUTOSMOOTH, look, MF_BYCOMMAND);
+    else for (int c = CM_HARD; c <= CM_AUTOSMOOTH; c++) CheckMenuItem(hMenu, c, MF_BYCOMMAND | MF_UNCHECKED);
     CheckMenuItem(hMenu, CM_PANEL, MF_BYCOMMAND | (panelOn ? MF_CHECKED : MF_UNCHECKED));
     CheckMenuItem(hMenu, CM_HUD, MF_BYCOMMAND | (hudOn ? MF_CHECKED : MF_UNCHECKED));
     CheckMenuItem(hMenu, CM_ORTHO, MF_BYCOMMAND | (ortho ? MF_CHECKED : MF_UNCHECKED));
@@ -7008,11 +7102,20 @@ static void marking_menu(int x, int y)
     AppendMenuA(m, MF_STRING | (mode == M_FACE ? MF_CHECKED : 0), CM_MFACE, "Face");
     AppendMenuA(m, MF_STRING | (mode == M_MULTI ? MF_CHECKED : 0), CM_MMULTI, "Multi");
     AppendMenuA(m, MF_STRING | (mode == M_OBJ ? MF_CHECKED : 0), CM_MOBJ, "Object Mode");
+    if (lead()) {
+        /* shading for what is selected (in component mode, just the selected faces, edges or vertices) */
+        int part = mode != M_OBJ && sel_look();
+        AppendMenuA(m, MF_SEPARATOR, 0, NULL);
+        AppendMenuA(m, MF_STRING, CM_HARD, part ? "Hard Shade Selection" : "Hard Shade");
+        AppendMenuA(m, MF_STRING, CM_SMOOTH, part ? "Smooth Shade Selection" : "Smooth Shade");
+        AppendMenuA(m, MF_STRING, CM_AUTOSMOOTH, part ? "Auto Smooth Selection" : "Auto Smooth");
+    }
     POINT pt = { x, y };
     ClientToScreen(hView, &pt);
     int cmd = TrackPopupMenu(m, TPM_RETURNCMD | TPM_RIGHTBUTTON | TPM_LEFTALIGN | TPM_TOPALIGN, pt.x, pt.y, 0, hView, NULL);
     DestroyMenu(m);
     if (!cmd) return;
+    if (cmd >= CM_HARD && cmd <= CM_AUTOSMOOTH) { do_cmd(cmd); return; }
     int nm = cmd - CM_MOBJ;
     set_mode(nm);
     if (nm != M_OBJ && hit >= 0) {
@@ -7426,6 +7529,7 @@ static HMENU build_menu(void)
     m = CreatePopupMenu();
     AppendMenuA(m, MF_STRING, CM_TPIXEL, "Pixel &Paint Tool\tP");
     AppendMenuA(m, MF_STRING, CM_UNWRAP, "Pixel &Unwrap");
+    AppendMenuA(m, MF_STRING, CM_PIXQUADS, "Follow &Quads");
     AppendMenuA(m, MF_STRING, CM_PIXFILL, "&Bucket Fill");
     AppendMenuA(m, MF_STRING, CM_PIXGRID, "Pixel &Grid");
     AppendMenuA(m, MF_SEPARATOR, 0, NULL);
@@ -7574,6 +7678,7 @@ static LRESULT CALLBACK MainProc(HWND h, UINT m, WPARAM wp, LPARAM lp)
         reg_set_int("PixelDensity", pixDens);
         reg_set_int("PixelBrush", pixBrush);
         reg_set_int("PixelGrid", pixGrid);
+        reg_set_int("PixelQuads", pixQuads);
         autosave_remove();
         PostQuitMessage(0);
         return 0;
@@ -7608,6 +7713,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmd, int show)
     pixBrush = reg_int("PixelBrush", 1);
     if (pixBrush < 1 || pixBrush > 32) pixBrush = 1;
     pixGrid = reg_int("PixelGrid", 1) != 0;
+    pixQuads = reg_int("PixelQuads", 1) != 0;
     pal_load_reg();
     recent_load();
     binds_load();
