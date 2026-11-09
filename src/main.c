@@ -10,6 +10,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include "mesh.h"
+#include "anim.h"
+#include "gltf.h"
 
 #define PI_F 3.14159265358979f
 #define APP_NAME "tuff3d"
@@ -27,10 +29,21 @@ typedef struct {
     float nangle;        /* normal angle: 0 = hard shade, 180 = smooth, between = hard over that angle */
     int smooth;          /* smooth mesh preview (3 on, 1 off): drawn subdivided, edited as the cage */
     int isoHid;          /* hidden by Isolate Select, shown again when it ends */
+    unsigned id, parent; /* stable id (never 0) and the parent's id (0: none); t r s are relative to the parent */
+    int kind;            /* OK_MESH, OK_JOINT (a bone, no mesh) or OK_IK (an IK handle) */
+    int nodeform;        /* joint: moves its children but takes no skin weights (a rig's root) */
+    V3 bt, br, bs;       /* joint: its rest pose, from when a mesh was bound to it */
+    int rest;            /* joint: has a rest pose */
+    unsigned ikA, ikB, ikC;   /* IK handle: the start, middle and end joints */
+    V3 ikPole, ikRa, ikRb;    /* bend direction (world); A's and B's rotations when the handle was made */
+    M4 ikCw;                  /* C's world rotation then */
+    int ikOrient;             /* the end joint turns with the handle */
 } Obj;
 
+enum { OK_MESH, OK_JOINT, OK_IK };
+
 enum { M_OBJ, M_VERT, M_EDGE, M_FACE, M_MULTI };   /* component modes match COMP_* */
-enum { T_SELECT, T_MOVE, T_ROTATE, T_SCALE, T_PAINT, T_WELD, T_LOOP, T_CUT, NTOOL };
+enum { T_SELECT, T_MOVE, T_ROTATE, T_SCALE, T_PAINT, T_WELD, T_LOOP, T_CUT, T_JOINT, T_WEIGHT, NTOOL };
 enum { H_NONE, H_X, H_Y, H_Z, H_YZ, H_XZ, H_XY, H_C, H_VIEW };
 
 static Obj *ob;
@@ -53,16 +66,20 @@ static float softRad = 1;           /* its falloff radius, world units */
 static int xray, cullBack, isolateOn;
 static int smoothLv = 2;            /* smooth mesh preview subdivision level */
 static float exThick, exOff;        /* Extrude Thickness / Offset (redo the last extrude live) */
+static Anim anim;                   /* animation clips (keys per object id) */
+static float curFrame;              /* the frame the scene shows */
+static int autoKey = 1, playing, loopPlay = 1, onion, pivotMode;
 static V3 paintCol = { 1, 0, 0 };
 static float paintOpa = 1, paintRad = 40;
 static char g_path[MAX_PATH];
+static char g_suggest[MAX_PATH];   /* default export name for a scene that has no OBJ path yet */
 static char g_msg[200];
 static int lastCmd, lastHandle, hover, modified, snapGrid, snapPoint;
 static unsigned editStamp;
 static int hvObj = -1, hvKind, hvIdx, tracking, hudOn = 1;
 static int dk, dkBtn, mx0, my0, curx = -1000, cury = -1000, selMod;
 static float rad0;
-enum { D_NONE, D_PEND, D_MARQ, D_MANIP, D_TUMBLE, D_PAN, D_DOLLY, D_PAINT, D_BRUSH, D_WELD, D_SOFTRAD };
+enum { D_NONE, D_PEND, D_MARQ, D_MANIP, D_TUMBLE, D_PAN, D_DOLLY, D_PAINT, D_BRUSH, D_WELD, D_SOFTRAD, D_WPAINT, D_SCRUB };
 static int bHeld, bUsed;   /* the soft selection key is down / was used for a radius drag meanwhile */   /* preselection highlight (hvKind 0 = whole object) */
 
 static HWND hMain, hView, hPanel, hStatus, hBar, hBox;
@@ -86,10 +103,80 @@ static int key(int vk) { return GetKeyState(vk) < 0; }
 static void toast(const char *s);
 static void ui_size(int pct);
 static void ui_step(int up);
+static void obj_move_pivot(int i, V3 w);
+static void rig_update(void);
+static int reparent(int i, unsigned p);
 static DWORD msgT;
 static void msg(const char *s) { snprintf(g_msg, sizeof g_msg, "%s", s); msgT = GetTickCount(); toast(s); }
 
-static M4 obj_mat(const Obj *o) { return m4_trs(o->t, o->r, o->s); }
+static unsigned idSeq;   /* the last object id handed out */
+
+static int obj_index(unsigned id)
+{
+    for (int i = 0; id && i < nob; i++) if (ob[i].id == id) return i;
+    return -1;
+}
+
+static M4 obj_local(const Obj *o) { return m4_trs(o->t, o->r, o->s); }
+
+/* the world matrix of the parent (identity for a root) */
+static M4 parent_mat(const Obj *o)
+{
+    M4 m = m4_id();
+    int guard = 0;
+    for (unsigned p = o->parent; p && guard < 256; guard++) {
+        int i = obj_index(p);
+        if (i < 0) break;
+        m = m4_mul(obj_local(&ob[i]), m);
+        p = ob[i].parent;
+    }
+    return m;
+}
+
+/* object to world, through the parents */
+static M4 obj_mat(const Obj *o) { return o->parent ? m4_mul(parent_mat(o), obj_local(o)) : obj_local(o); }
+
+/* is a an ancestor of object o? */
+static int is_ancestor(unsigned a, const Obj *o)
+{
+    int guard = 0;
+    for (unsigned p = o->parent; p && guard < 256; guard++) {
+        if (p == a) return 1;
+        int i = obj_index(p);
+        if (i < 0) break;
+        p = ob[i].parent;
+    }
+    return 0;
+}
+
+static int skinned(const Obj *o) { return o->kind == OK_MESH && o->m.ww && o->m.nsj; }
+static unsigned wpJoint;   /* the joint the Weights tool paints */
+
+/* weight colors: blue (none) through green and yellow to red (all) */
+static V3 heat(float w)
+{
+    static const float c[5][3] = { { .08f, .1f, .45f }, { .1f, .65f, .95f }, { .25f, .9f, .3f }, { 1, .9f, .15f }, { .95f, .2f, .12f } };
+    w = w < 0 ? 0 : w > 1 ? 1 : w;
+    float f = w * 4;
+    int i = (int)f;
+    if (i >= 4) return v3(c[4][0], c[4][1], c[4][2]);
+    f -= i;
+    return v3(c[i][0] + (c[i + 1][0] - c[i][0]) * f, c[i][1] + (c[i + 1][1] - c[i][1]) * f, c[i][2] + (c[i + 1][2] - c[i][2]) * f);
+}
+
+static int skin_index(const Obj *o, unsigned id)
+{
+    for (int k = 0; k < o->m.nsj; k++) if (o->m.sj[k] == id) return k;
+    return -1;
+}
+
+static float vert_weight(const Mesh *m, int v, int k)
+{
+    float w = 0;
+    for (int q = 0; q < 4; q++) if (m->ww[4 * v + q] > 0 && m->wj[4 * v + q] == k) w += m->ww[4 * v + q];
+    return w;
+}
+
 
 /* ================================================================ themes */
 
@@ -388,9 +475,21 @@ static Obj *obj_new(const char *base)
     Obj *o = &ob[nob];
     memset(o, 0, sizeof *o);
     o->s = v3(1, 1, 1);
+    o->bs = v3(1, 1, 1);
     o->nangle = defAngle;
+    o->id = ++idSeq;
     unique_name(o->name, base);
     nob++;
+    return o;
+}
+
+/* a joint or IK handle: an object with an empty mesh */
+static Obj *obj_new_node(const char *base, int kind)
+{
+    static const int fo0 = 0;
+    Obj *o = obj_new(base);
+    o->kind = kind;
+    o->m = mesh_from_arrays(0, NULL, NULL, 0, &fo0, NULL);
     return o;
 }
 
@@ -459,7 +558,7 @@ static void clear_sel(void)
 
 /* ================================================================ undo */
 
-typedef struct { Obj *o; int n, mode; char what[40]; } Snap;   /* what: the action it undoes */
+typedef struct { Obj *o; int n, mode; char what[40]; Anim an; } Snap;   /* what: the action it undoes */
 #define UNDO_MAX 60
 static Snap undo_s[UNDO_MAX], redo_s[UNDO_MAX];
 static int nundo, nredo;
@@ -474,6 +573,7 @@ static Snap snap_take(void)
         s.o[i] = ob[i];
         s.o[i].m = mesh_copy(&ob[i].m);
     }
+    s.an = anim_copy(&anim);
     return s;
 }
 
@@ -482,6 +582,7 @@ static void snap_free(Snap *s)
     for (int i = 0; i < s->n; i++) mesh_free(&s->o[i].m);
     free(s->o);
     s->o = NULL;
+    anim_free(&s->an);
 }
 
 static void snap_restore(Snap *s)
@@ -493,6 +594,9 @@ static void snap_restore(Snap *s)
     if (!cob) { free(ob); ob = NULL; }
     mode = s->mode;
     s->o = NULL;
+    anim_free(&anim);
+    anim = s->an;
+    memset(&s->an, 0, sizeof s->an);
     normalFrame = 0;
 }
 
@@ -707,6 +811,53 @@ static unsigned geoGen = 1;
 
 static void geo_changed(void) { geoGen++; }
 
+/* ---- bound (skinned) meshes are drawn bent by their joints, except while their components are
+   being edited: then they show their rest shape, which is what the edits change */
+
+typedef struct { unsigned gen; const V3 *key; int nv; V3 *p; } SkinCache;
+static SkinCache *skc;
+static int nskc, showJoints = 1;
+
+static int skin_rest(int i) { return mode != M_OBJ && ob[i].hil; }
+
+/* joint k of object i's skin, in the world (its bind pose when the joint is gone) */
+static M4 skin_joint(const Obj *o, int k)
+{
+    int j = obj_index(o->m.sj[k]);
+    if (j >= 0) return obj_mat(&ob[j]);
+    M4 ib;
+    memcpy(ib.m, o->m.ibm + 16 * k, sizeof ib.m);
+    return m4_inv(ib);
+}
+
+/* the positions object i is drawn with: its mesh's, or for a bound mesh the bent shape (world) */
+static const V3 *obj_P(int i)
+{
+    Obj *o = &ob[i];
+    if (!skinned(o) || skin_rest(i)) return o->m.p;
+    if (i >= nskc) {
+        skc = realloc(skc, (i + 1) * sizeof *skc);
+        memset(skc + nskc, 0, (i + 1 - nskc) * sizeof *skc);
+        nskc = i + 1;
+    }
+    SkinCache *c = &skc[i];
+    if (c->p && c->gen == geoGen && c->key == o->m.p && c->nv == o->m.nv) return c->p;
+    c->p = realloc(c->p, (o->m.nv + 1) * sizeof(V3));
+    M4 *jw = malloc((o->m.nsj + 1) * sizeof(M4));
+    for (int k = 0; k < o->m.nsj; k++) jw[k] = skin_joint(o, k);
+    skin_deform(&o->m, jw, c->p);
+    free(jw);
+    c->gen = geoGen; c->key = o->m.p; c->nv = o->m.nv;
+    return c->p;
+}
+
+static Mesh obj_view(int i)
+{
+    Mesh v = ob[i].m;
+    v.p = (V3 *)obj_P(i);
+    return v;
+}
+
 static DrawCache *cache_get(int i)
 {
     if (i >= ndcache) {
@@ -716,7 +867,8 @@ static DrawCache *cache_get(int i)
     }
     DrawCache *c = &dcache[i];
     const Obj *o = &ob[i];
-    const Mesh *m = &o->m;
+    Mesh view = obj_view(i);
+    const Mesh *m = &view;
     if (c->gen == geoGen && c->key == m->p && c->nv == m->nv && c->nf == m->nf) return c;
     const Mesh *cage = m;
     Mesh sm;
@@ -727,6 +879,8 @@ static DrawCache *cache_get(int i)
         if (lv > 0) { sm = mesh_smooth(m, lv); m = &sm; }
     }
     int tint = o->hil && shows(M_FACE), nt = 0;
+    int heatK = tool == T_WEIGHT && skinned(o) ? skin_index(o, wpJoint) : -1;   /* Weights tool: show the weights */
+    if (heatK >= 0 && m != cage) heatK = -1;
     float alpha = xray ? 0.42f : 1;
     for (int f = 0; f < m->nf; f++) nt += m->fo[f + 1] - m->fo[f] - 2;
     c->v = realloc(c->v, (size_t)(nt > 0 ? nt : 1) * 30 * sizeof(float));
@@ -740,6 +894,7 @@ static DrawCache *cache_get(int i)
             for (int j = 0; j < 3; j++) {
                 V3 col = m->c[m->fi[cs[j]]], p = m->p[m->fi[cs[j]]], nn = cn[cs[j]];
                 if (tint && m->fs[f]) col = v3lerp(col, v3(1, 0.45f, 0.1f), 0.65f);
+                if (heatK >= 0) col = heat(vert_weight(m, m->fi[cs[j]], heatK));
                 *w++ = col.x; *w++ = col.y; *w++ = col.z; *w++ = alpha;
                 *w++ = nn.x; *w++ = nn.y; *w++ = nn.z;
                 *w++ = p.x; *w++ = p.y; *w++ = p.z;
@@ -798,15 +953,17 @@ static void draw_cached(int i, int shade)
     glDisableClientState(GL_VERTEX_ARRAY);
 }
 
-/* all edges straight from the mesh arrays (ev holds vertex index pairs) */
-static void draw_all_edges(const Mesh *m)
+/* all edges straight from the mesh arrays (ev holds vertex index pairs); P: positions (NULL: the mesh's) */
+static void draw_all_edges_p(const Mesh *m, const V3 *P)
 {
     if (!m->ne) return;
     glEnableClientState(GL_VERTEX_ARRAY);
-    glVertexPointer(3, GL_FLOAT, sizeof(V3), m->p);
+    glVertexPointer(3, GL_FLOAT, sizeof(V3), P ? P : m->p);
     glDrawElements(GL_LINES, m->ne * 2, GL_UNSIGNED_INT, m->ev);
     glDisableClientState(GL_VERTEX_ARRAY);
 }
+
+static void draw_all_edges(const Mesh *m) { draw_all_edges_p(m, NULL); }
 
 static int ray_box(V3 o, V3 d, V3 lo, V3 hi)
 {
@@ -831,7 +988,8 @@ static int obj_raycast(int i, V3 o, V3 d, float *t)
     V3 lo = m4_pt(iM, o), ld = m4_dir(iM, d);
     V3 pad = v3mul(v3sub(c->hi, c->lo), 1e-3f);
     if (!ray_box(lo, ld, v3sub(c->lo, pad), v3add(c->hi, pad))) return -1;
-    return mesh_raycast(&ob[i].m, lo, ld, t);
+    Mesh v = obj_view(i);
+    return mesh_raycast(&v, lo, ld, t);
 }
 
 /* ================================================================ symmetry and soft selection
@@ -1136,8 +1294,34 @@ static void select_obj_flag(Obj *o, int mod)
     if (o->sel) o->order = ++stamp;
 }
 
+/* the joint or IK handle at the cursor (object mode): near its point, or along a bone (its parent) */
+static int pick_joint(int mx, int my)
+{
+    if (!showJoints || mode != M_OBJ) return -1;
+    float best = 10 * ds, bestBone = 5 * ds;
+    int hit = -1, hitBone = -1;
+    for (int i = 0; i < nob; i++) {
+        Obj *o = &ob[i];
+        float x, y;
+        if (o->kind == OK_MESH || o->hidden || !proj(m4_col(obj_mat(o), 3), &x, &y, NULL)) continue;
+        float d = hypotf(x - mx, y - my);
+        if (d < best) { best = d; hit = i; }
+        if (o->kind != OK_JOINT) continue;
+        for (int k = 0; k < nob; k++) {
+            float cx, cy;
+            if (ob[k].parent != o->id || ob[k].kind != OK_JOINT || ob[k].hidden) continue;
+            if (!proj(m4_col(obj_mat(&ob[k]), 3), &cx, &cy, NULL)) continue;
+            float u, db = seg_dist((float)mx, (float)my, x, y, cx, cy, &u);
+            if (db < bestBone && u > 0.05f && u < 0.95f) { bestBone = db; hitBone = i; }
+        }
+    }
+    return hit >= 0 ? hit : hitBone;
+}
+
 static int pick_object(int mx, int my, float *tout)
 {
+    int j = pick_joint(mx, my);
+    if (j >= 0) { if (tout) *tout = 0; return j; }
     V3 o, d;
     mouse_ray((float)mx, (float)my, &o, &d);
     int best = -1;
@@ -1250,8 +1434,13 @@ static void select_rect(int x0, int y0, int x1, int y1, int mod)
         float x, y, z;
         if (o->hidden) continue;
         if (mode == M_OBJ) {
+            const V3 *P = obj_P(i);
+            if (o->kind != OK_MESH) {
+                if (showJoints && proj(m4_col(M, 3), &x, &y, NULL) && INSIDE(x, y)) select_obj_flag(o, mod);
+                continue;
+            }
             for (int v = 0; v < m->nv; v++)
-                if (proj(m4_pt(M, m->p[v]), &x, &y, NULL) && INSIDE(x, y)) { select_obj_flag(o, mod); break; }
+                if (proj(m4_pt(M, P[v]), &x, &y, NULL) && INSIDE(x, y)) { select_obj_flag(o, mod); break; }
             continue;
         }
         if (!o->hil) continue;
@@ -1569,10 +1758,17 @@ static int sel_bbox(V3 *mn, V3 *mx, int all)
         }
         M4 M = obj_mat(o);
         SymMap *sm = mask ? sym_get(i) : NULL;
+        const V3 *P = mask ? m->p : obj_P(i);
+        if (o->kind != OK_MESH) {
+            V3 p = m4_col(M, 3);
+            mn->x = fminf(mn->x, p.x); mn->y = fminf(mn->y, p.y); mn->z = fminf(mn->z, p.z);
+            mx->x = fmaxf(mx->x, p.x); mx->y = fmaxf(mx->y, p.y); mx->z = fmaxf(mx->z, p.z);
+            any = 1;
+        }
         for (int v = 0; v < m->nv; v++) {
             if (mask && !mask[v]) continue;
             if (sm && sm->vm[v] >= 0 && sm->vm[v] != v && mask[sm->vm[v]] && sym_coord(o, m->p[v]) * symSide < 0) continue;
-            V3 p = m4_pt(M, m->p[v]);
+            V3 p = m4_pt(M, P[v]);
             mn->x = fminf(mn->x, p.x); mn->y = fminf(mn->y, p.y); mn->z = fminf(mn->z, p.z);
             mx->x = fmaxf(mx->x, p.x); mx->y = fmaxf(mx->y, p.y); mx->z = fmaxf(mx->z, p.z);
             any = 1;
@@ -1586,7 +1782,7 @@ static V3 sel_pivot(void)
 {
     if (mode == M_OBJ) {
         Obj *l = lead();
-        return l ? l->t : v3(0, 0, 0);
+        return l ? m4_col(obj_mat(l), 3) : v3(0, 0, 0);
     }
     V3 a, b;
     if (!sel_bbox(&a, &b, 0)) return v3(0, 0, 0);
@@ -1684,6 +1880,9 @@ static void set_mode(int m)
     normalFrame = 0;
 }
 
+static struct { unsigned last; } jt;
+static int wp_target(void);
+
 static void set_tool(int t)
 {
     if (t != tool) lastHandle = H_NONE;
@@ -1692,6 +1891,17 @@ static void set_tool(int t)
     tool = t;
     normalFrame = 0;
     if (t == T_WELD && mode != M_VERT && mode != M_MULTI) set_mode(M_VERT);
+    if ((t == T_JOINT || t == T_WEIGHT) && mode != M_OBJ) set_mode(M_OBJ);
+    if (t != T_JOINT) jt.last = 0;
+    if (t == T_WEIGHT) {
+        /* paint the selected joint, else keep the last one, else the first of the mesh's skin */
+        Obj *l = lead();
+        int tg = wp_target();
+        if (l && l->kind == OK_JOINT) wpJoint = l->id;
+        if (tg >= 0 && skin_index(&ob[tg], wpJoint) < 0) wpJoint = ob[tg].m.sj[ob[tg].m.nsj > 1];
+        msg(tg < 0 ? "Weights: bind a mesh first (select a mesh and a joint, Rig shelf: Bind)"
+                   : "Weights: click a joint to pick it, drag over the mesh to add (Ctrl: remove, Shift: smooth)");
+    }
     if ((t == T_LOOP || t == T_CUT) && mode != M_EDGE && mode != M_MULTI) set_mode(M_EDGE);
 }
 
@@ -1723,7 +1933,7 @@ static M4 manip_frame(void)
     if (normalFrame && shows(M_FACE) && tool != T_ROTATE) return nframe;
     if (tool == T_SCALE && mode == M_OBJ) {
         Obj *l = lead();
-        if (l) return m4_euler(l->r);
+        if (l) return m4_rot3(obj_mat(l));
     }
     return m4_id();
 }
@@ -1737,6 +1947,7 @@ static struct {
     V3 delta, sv;      /* this step's move and scale */
     M4 R;              /* and rotation (full weight) */
     float a;           /* rotation angle */
+    int pivot, pobj;   /* Edit Pivot: the lead object's pivot moves instead */
 } dg;
 
 static MG mg_get(void)
@@ -1815,8 +2026,11 @@ static int manip_hit(int mx, int my)
     return h;
 }
 
+static void play(int on);
+
 static void drag_begin(int h, int mx, int my)
 {
+    if (playing) play(0);
     cam_update();
     MG g = mg_get();
     memset(&dg, 0, sizeof dg);
@@ -1887,8 +2101,16 @@ static void drag_begin(int h, int mx, int my)
 
     /* remember the original state; every drag step is applied from it */
     dg.e = calloc(nob + 1, sizeof(DEnt));
-    for (int i = 0; i < nob; i++)
-        if (active(&ob[i]) && edit_build(i, &dg.e[dg.ne])) dg.ne++;
+    for (int i = 0; i < nob; i++) {
+        if (!active(&ob[i])) continue;
+        if (mode == M_OBJ && skinned(&ob[i])) continue;   /* a bound mesh goes where its joints take it */
+        int up = 0;   /* a child of something being moved already moves with it */
+        for (int k = 0; k < nob && mode == M_OBJ && !up; k++) up = active(&ob[k]) && is_ancestor(ob[k].id, &ob[i]);
+        if (!up && edit_build(i, &dg.e[dg.ne])) dg.ne++;
+    }
+    Obj *pl = lead();
+    dg.pivot = pivotMode && mode == M_OBJ && tool == T_MOVE && pl && !skinned(pl);
+    dg.pobj = pl ? (int)(pl - ob) : -1;
     dg.on = 1;
 }
 
@@ -1921,7 +2143,7 @@ static int snap_target(int mx, int my, V3 *out)
         DEnt *e = NULL;
         if (o->hidden) continue;
         for (int k = 0; k < dg.ne; k++) if (dg.e[k].obj == i) e = &dg.e[k];
-        if (e && mode == M_OBJ) continue;
+        if (e && mode == M_OBJ && !dg.pivot) continue;
         unsigned char *skip = e ? calloc(o->m.nv + 1, 1) : NULL;
         for (int j = 0; e && j < e->n; j++) skip[e->vi[j]] = 1;
         M4 M = obj_mat(o);
@@ -2004,6 +2226,15 @@ static void drag_move(int mx, int my)
         else if (h >= H_X && h <= H_Z) (&sv.x)[h - H_X] = f;
         else { int i = h - H_YZ; (&sv.x)[(i + 1) % 3] = f; (&sv.x)[(i + 2) % 3] = f; }
     }
+    if (dg.pivot) {
+        if (!dg.dirty && mx == dg.mx0 && my == dg.my0) return;
+        if (!dg.dirty) { undo_push("Move Pivot"); dg.dirty = 1; }
+        obj_move_pivot(dg.pobj, v3add(dg.piv, delta));
+        dg.cur = v3add(dg.piv, delta);
+        rig_update();
+        geo_changed();
+        return;
+    }
     if (!dg.dirty) {
         if (mx == dg.mx0 && my == dg.my0) return;
         undo_push(tool == T_MOVE ? "Move" : tool == T_ROTATE ? "Rotate" : "Scale");
@@ -2016,14 +2247,17 @@ static void drag_move(int mx, int my)
         DEnt *e = &dg.e[k];
         Obj *ob_ = &ob[e->obj];
         if (mode == M_OBJ) {
-            if (tool == T_MOVE) ob_->t = v3add(e->t0, delta);
-            else if (tool == T_ROTATE) ob_->r = m4_to_euler(m4_mul(R, m4_euler(e->r0)));
+            /* the drag is in the world; t r s are in the parent's space */
+            M4 P = parent_mat(ob_), Pr = m4_rot3(P), iPr = m4_inv(Pr);
+            if (tool == T_MOVE) ob_->t = v3add(e->t0, m4_dir(m4_inv(P), delta));
+            else if (tool == T_ROTATE) ob_->r = m4_to_euler(m4_mul(m4_mul(iPr, m4_mul(R, Pr)), m4_euler(e->r0)));
             else ob_->s = v3(e->s0.x * sv.x, e->s0.y * sv.y, e->s0.z * sv.z);
             continue;
         }
         edit_apply(e, drag_xf, NULL);
     }
     dg.cur = v3add(dg.piv, delta);
+    rig_update();
     geo_changed();
 }
 
@@ -2126,6 +2360,18 @@ static void draw_manip(void)
         glEnd();
     }
 #undef HCOL
+    if (pivotMode && mode == M_OBJ) {
+        /* Edit Pivot: a yellow ring marks the pivot being moved */
+        float r = 16 * ds * wpp(g.piv);
+        glColor3f(1, .85f, .1f);
+        glLineWidth(2.5f * ds);
+        glBegin(GL_LINE_LOOP);
+        for (int k = 0; k < 32; k++) {
+            V3 q = v3add(g.piv, v3add(v3mul(camR, r * cosf(2 * PI_F * k / 32)), v3mul(camU, r * sinf(2 * PI_F * k / 32))));
+            glVertex3fv(&q.x);
+        }
+        glEnd();
+    }
     glLineWidth(1);
     glEnable(GL_DEPTH_TEST);
 }
@@ -2141,9 +2387,10 @@ static void paint_dab(int mx, int my)
         Obj *o = &ob[ps.obj[k]];
         Mesh *m = &o->m;
         M4 M = obj_mat(o);
+        const V3 *P = obj_P(ps.obj[k]);
         for (int v = 0; v < m->nv; v++) {
             float x, y, z;
-            if (!proj(m4_pt(M, m->p[v]), &x, &y, &z)) continue;
+            if (!proj(m4_pt(M, P[v]), &x, &y, &z)) continue;
             float dd = hypotf(x - mx, y - my);
             if (dd >= r || !visible(x, y, z)) continue;
             float t = dd / r, f = t < 0.5f ? 1 : 1 - (t - 0.5f) * 2;
@@ -2413,11 +2660,26 @@ enum {
     CM_SYMTOG, CM_SYMOFF, CM_SYMX, CM_SYMY, CM_SYMZ, CM_SYMWORLD, CM_SOFTTOG,
     CM_MIRROR, CM_MIRRORX, CM_MIRRORY, CM_MIRRORZ, CM_SMOOTHMESH, CM_PREVON, CM_PREVOFF, CM_PREVTOG,
     CM_XRAY, CM_CULL, CM_ISOLATE, CM_RING, CM_CONE, CM_TORUS, CM_PIPE, CM_UIBIGGER, CM_UISMALLER,
+    CM_TJOINT, CM_TWEIGHT, CM_PARENT, CM_UNPARENT, CM_PIVOT, CM_PIVOTBASE, CM_RIGBIPED, CM_RIGQUAD, CM_RIGCHAIN,
+    CM_MIRRORJOINTS, CM_BIND, CM_UNBIND, CM_REBIND, CM_AUTOWEIGHTS, CM_MIRRORWEIGHTS, CM_RESTPOSE, CM_ADDIK,
+    CM_SHOWJOINTS, CM_OUTLINER, CM_SELHIER,
+    CM_KEY, CM_DELKEY, CM_AUTOKEY, CM_PLAY, CM_NEXTFRAME, CM_PREVFRAME, CM_NEXTKEY, CM_PREVKEY, CM_FIRSTFRAME,
+    CM_LASTFRAME, CM_ONION, CM_TURNTABLE, CM_MIRRORPOSE, CM_NEWCLIP, CM_DELCLIP, CM_LOOPPLAY, CM_EXPORTGLB,
+    CM_EASESMOOTH, CM_EASELINEAR, CM_EASESTEP, CM_COPYKEY, CM_PASTEKEY, CM_RENAMECLIP,
     CM_LAST,
     CM_THEME = 500,              /* + theme index */
     CM_RECENT = 600,             /* + recent file index */
-    CM_UIS = 700                 /* + UI size choice */
+    CM_UIS = 700,                /* + UI size choice */
+    CM_CLIP = 800                /* + animation clip index */
 };
+
+/* tools T_JOINT and T_WEIGHT came after the CM_TSEL + T_* run of commands */
+static int tool_cmd(int t) { return t <= T_CUT ? CM_TSEL + t : t == T_JOINT ? CM_TJOINT : CM_TWEIGHT; }
+static int cmd_tool(int c)
+{
+    if (c >= CM_TSEL && c <= CM_TCUT) return c - CM_TSEL;
+    return c == CM_TJOINT ? T_JOINT : c == CM_TWEIGHT ? T_WEIGHT : -1;
+}
 typedef char cm_ids_fit[CM_LAST <= CM_THEME ? 1 : -1];
 
 /* ---- hotkeys: each command can have two keys. The defaults are Maya's; Help > Hotkey Editor
@@ -2437,6 +2699,28 @@ static Bind binds[] = {
     { CM_TWELD, "Tools", "Target Weld Tool", { 0 }, { 0 } },
     { CM_TLOOP, "Tools", "Insert Edge Loop Tool", { 0 }, { 0 } },
     { CM_TCUT, "Tools", "Multi-Cut Tool", { 0 }, { 0 } },
+    { CM_TJOINT, "Rig", "Joint Tool", { 0 }, { 0 } },
+    { CM_TWEIGHT, "Rig", "Paint Weights Tool", { 0 }, { 0 } },
+    { CM_PARENT, "Rig", "Parent (to the last selected)", { 'P' }, { 0 } },
+    { CM_UNPARENT, "Rig", "Unparent", { KC_SHIFT | 'P' }, { 0 } },
+    { CM_PIVOT, "Rig", "Edit Pivot On/Off", { 'D' }, { 0 } },
+    { CM_PIVOTBASE, "Rig", "Pivot to Base", { 0 }, { 0 } },
+    { CM_BIND, "Rig", "Bind Skin", { 0 }, { 0 } },
+    { CM_ADDIK, "Rig", "Add IK Handle", { 0 }, { 0 } },
+    { CM_RESTPOSE, "Rig", "Rest Pose", { 0 }, { 0 } },
+    { CM_KEY, "Animate", "Set Key", { 'K' }, { 0 } },
+    { CM_DELKEY, "Animate", "Delete Key", { KC_SHIFT | 'K' }, { 0 } },
+    { CM_AUTOKEY, "Animate", "Auto Key On/Off", { 0 }, { 0 } },
+    { CM_PLAY, "Animate", "Play / Stop", { VK_SPACE }, { 0 } },
+    { CM_NEXTFRAME, "Animate", "Next Frame", { VK_RIGHT }, { 0 } },
+    { CM_PREVFRAME, "Animate", "Previous Frame", { VK_LEFT }, { 0 } },
+    { CM_NEXTKEY, "Animate", "Next Key", { KC_SHIFT | VK_RIGHT }, { 0 } },
+    { CM_PREVKEY, "Animate", "Previous Key", { KC_SHIFT | VK_LEFT }, { 0 } },
+    { CM_FIRSTFRAME, "Animate", "First Frame", { KC_CTRL | VK_LEFT }, { 0 } },
+    { CM_LASTFRAME, "Animate", "Last Frame", { KC_CTRL | VK_RIGHT }, { 0 } },
+    { CM_ONION, "Animate", "Onion Skin On/Off", { 0 }, { 0 } },
+    { CM_MIRRORPOSE, "Animate", "Mirror Pose", { 0 }, { 0 } },
+    { CM_EXPORTGLB, "File", "Export glTF (.glb)", { KC_CTRL | KC_SHIFT | 'E' }, { 0 } },
     { CM_MANIPUP, "Tools", "Bigger Manipulator", { VK_OEM_PLUS, VK_ADD }, { 0 } },
     { CM_MANIPDOWN, "Tools", "Smaller Manipulator", { VK_OEM_MINUS, VK_SUBTRACT }, { 0 } },
     { CM_SYMTOG, "Tools", "Symmetry On/Off", { 'S' }, { 0 } },
@@ -2748,9 +3032,29 @@ static void cmd_delete(void)
     if (mode == M_OBJ) {
         if (!has_sel()) return;
         undo_push("Delete");
+        /* children of what goes stay, under the nearest parent that stays */
+        for (int k = 0; k < nob; k++) {
+            if (ob[k].sel) continue;
+            unsigned p = ob[k].parent;
+            int guard = 0;
+            while (p && guard++ < 256) {
+                int pi = obj_index(p);
+                if (pi < 0 || !ob[pi].sel) break;
+                p = ob[pi].parent;
+            }
+            if (p != ob[k].parent) reparent(k, p);
+        }
+        int joints = 0;
         for (int i = nob - 1; i >= 0; i--)
-            if (ob[i].sel) obj_remove(i);
-        msg("Deleted");
+            if (ob[i].sel) {
+                joints |= ob[i].kind == OK_JOINT;
+                for (int c = 0; c < anim.n; c++) clip_drop_obj(&anim.c[c], ob[i].id);
+                obj_remove(i);
+            }
+        int orphan = 0;
+        for (int i = 0; i < nob && joints; i++)
+            for (int k = 0; skinned(&ob[i]) && k < ob[i].m.nsj; k++) orphan |= obj_index(ob[i].m.sj[k]) < 0;
+        msg(orphan ? "Deleted - a bound mesh lost joints (its weights there stay put; Unbind and Bind again to redo them)" : "Deleted");
     } else if (shows(M_FACE)) {
         int any = 0;
         for (int i = 0; i < nob; i++)
@@ -2769,20 +3073,38 @@ static void cmd_dup(void)
 {
     if (mode != M_OBJ || !has_sel()) { msg("Duplicate: select objects"); return; }
     undo_push("Duplicate");
-    int n0 = nob;
+    int n0 = nob, nd = 0;
+    /* the selection and everything under it, with parents pointing at the copies */
+    unsigned char *in = calloc(n0 + 1, 1);
+    unsigned *from = malloc((n0 + 1) * sizeof(unsigned)), *to = malloc((n0 + 1) * sizeof(unsigned));
     for (int i = 0; i < n0; i++) {
-        if (!ob[i].sel) continue;
+        in[i] = ob[i].sel != 0;
+        for (int k = 0; k < n0 && !in[i]; k++) in[i] = ob[k].sel && is_ancestor(ob[k].id, &ob[i]);
+    }
+    for (int i = 0; i < n0; i++) {
+        if (!in[i]) continue;
         Obj src = ob[i];
         ob[i].sel = 0;
         Obj *o = obj_new(src.name);
         char nm[32];
+        unsigned id = o->id;
         memcpy(nm, o->name, 32);
         *o = src;
         memcpy(o->name, nm, 32);
+        o->id = id;
         o->m = mesh_copy(&src.m);
-        o->sel = 1;
         o->order = ++stamp;
+        from[nd] = src.id;
+        to[nd++] = id;
     }
+    for (int i = n0; i < nob; i++)
+        for (int k = 0; k < nd; k++) {
+            if (ob[i].parent == from[k]) ob[i].parent = to[k];
+            if (ob[i].ikA == from[k]) ob[i].ikA = to[k];
+            if (ob[i].ikB == from[k]) ob[i].ikB = to[k];
+            if (ob[i].ikC == from[k]) ob[i].ikC = to[k];
+        }
+    free(in); free(from); free(to);
     msg("Duplicated");
 }
 
@@ -3122,6 +3444,1240 @@ static void cmd_shade(float angle, const char *what)
     }
     char b[96];
     snprintf(b, sizeof b, "%s%s", what, lead() ? "" : " (for new objects)");
+    msg(b);
+}
+
+/* ================================================================ hierarchy, pivots and rigging */
+
+/* local t r s so that object o sits at world matrix W under its current parent */
+static void obj_set_world(Obj *o, M4 W)
+{
+    m4_decompose(m4_mul(m4_inv(parent_mat(o)), W), &o->t, &o->r, &o->s);
+}
+
+/* keys are local to the parent: when the parent changes, carry them over so the object keeps
+   moving through the same places (exact while the parents are not themselves animated) */
+static void keys_rebase(unsigned id, M4 from, M4 to)
+{
+    M4 X = m4_mul(m4_inv(to), from);
+    for (int c = 0; c < anim.n; c++) {
+        Track *t = clip_track(&anim.c[c], id, 0);
+        for (int k = 0; t && k < t->n; k++) {
+            Key *q = &t->k[k];
+            m4_decompose(m4_mul(X, m4_trs(q->t, q->r, q->s)), &q->t, &q->r, &q->s);
+        }
+    }
+}
+
+/* make p (an id, 0 for none) the parent of object i, keeping it where it is in the world */
+static int reparent(int i, unsigned p)
+{
+    Obj *o = &ob[i];
+    int pi = obj_index(p);
+    if (p == o->id || (p && pi < 0) || (pi >= 0 && (ob[pi].id == o->id || is_ancestor(o->id, &ob[pi])))) return 0;
+    if (skinned(o) && p) return 0;   /* a bound mesh stays at the root, its joints move it */
+    if (o->parent == p) return 1;
+    M4 W = obj_mat(o), from = parent_mat(o);
+    o->parent = p;
+    obj_set_world(o, W);
+    keys_rebase(o->id, from, parent_mat(o));
+    return 1;
+}
+
+/* P: the selected objects become children of the last one selected */
+static void cmd_parent(void)
+{
+    Obj *l = lead();
+    int n = 0, sel = 0;
+    if (mode != M_OBJ || !l) { msg("Parent: select the children, then the parent last (object mode)"); return; }
+    for (int i = 0; i < nob; i++) sel += ob[i].sel;
+    if (sel < 2) { msg("Parent: select the children, then (Shift+click) the parent last"); return; }
+    unsigned pid = l->id;
+    undo_push("Parent");
+    for (int i = 0; i < nob; i++)
+        if (ob[i].sel && ob[i].id != pid) n += reparent(i, pid);
+    if (!n) { undo_drop(); msg("Parent: those can't go under it (it would loop, or a bound mesh)"); return; }
+    char b[96];
+    snprintf(b, sizeof b, "Parented %d object(s) to %s - Shift+P unparents", n, ob[obj_index(pid)].name);
+    msg(b);
+}
+
+static void cmd_unparent(void)
+{
+    int n = 0;
+    for (int i = 0; i < nob; i++) n += active(&ob[i]) && ob[i].parent;
+    if (!n) { msg("Unparent: select objects that have a parent"); return; }
+    undo_push("Unparent");
+    for (int i = 0; i < nob; i++) if (active(&ob[i]) && ob[i].parent) reparent(i, 0);
+    msg("Unparented");
+}
+
+/* select the selected objects' children too, all the way down */
+static void cmd_select_hierarchy(void)
+{
+    if (mode != M_OBJ) set_mode(M_OBJ);
+    for (int i = 0; i < nob; i++)
+        for (int k = 0; k < nob; k++)
+            if (ob[k].sel && is_ancestor(ob[k].id, &ob[i])) ob[i].sel = 1;
+    msg("Selected the hierarchy");
+}
+
+/* keys of an object whose pivot moved by d (parent space) with its mesh / children shifted by off
+   (its own space): each key keeps the same placement in the world */
+static void keys_pivot(unsigned id, V3 off)
+{
+    for (int c = 0; c < anim.n; c++) {
+        Track *t = clip_track(&anim.c[c], id, 0);
+        for (int k = 0; t && k < t->n; k++) {
+            Key *q = &t->k[k];
+            M4 L = m4_trs(v3(0, 0, 0), q->r, q->s);
+            q->t = v3sub(q->t, m4_dir(L, off));
+        }
+        for (int i = 0; i < nob; i++) {
+            if (ob[i].parent != id) continue;
+            Track *ct = clip_track(&anim.c[c], ob[i].id, 0);
+            for (int k = 0; ct && k < ct->n; k++) ct->k[k].t = v3add(ct->k[k].t, off);
+        }
+    }
+}
+
+/* move object i's pivot (its origin) to world point w; its mesh and children stay where they are */
+static void obj_move_pivot(int i, V3 w)
+{
+    Obj *o = &ob[i];
+    if (skinned(o)) return;
+    M4 P = parent_mat(o), L = obj_local(o);
+    V3 nt = m4_pt(m4_inv(P), w), d = v3sub(nt, o->t);
+    L.m[12] = L.m[13] = L.m[14] = 0;
+    V3 off = v3mul(m4_dir(m4_inv(L), d), -1);
+    if (v3len(d) < 1e-9f) return;
+    for (int v = 0; v < o->m.nv; v++) o->m.p[v] = v3add(o->m.p[v], off);
+    for (int k = 0; k < nob; k++) if (ob[k].parent == o->id) ob[k].t = v3add(ob[k].t, off);
+    keys_pivot(o->id, off);
+    o->t = nt;
+    if (o->m.nv) o->prim.type = PRIM_NONE;
+}
+
+static void cmd_pivot_mode(void)
+{
+    pivotMode = !pivotMode;
+    if (pivotMode) {
+        if (mode != M_OBJ) set_mode(M_OBJ);
+        if (tool != T_MOVE) set_tool(T_MOVE);
+        msg("Edit Pivot: drag to move the pivot (a joint moves alone); hold V to snap it to a vertex. D finishes");
+    } else msg("Edit Pivot off");
+}
+
+/* the pivot of each selected object to the bottom center of what it shows: it then sits on the floor */
+static void cmd_pivot_base(void)
+{
+    int n = 0;
+    for (int i = 0; i < nob; i++) {
+        Obj *o = &ob[i];
+        if (!active(o) || o->kind != OK_MESH || skinned(o) || !o->m.nv) continue;
+        if (!n++) undo_push("Pivot to Base");
+        M4 M = obj_mat(o);
+        V3 lo = v3(1e30f, 1e30f, 1e30f), hi = v3(-1e30f, -1e30f, -1e30f);
+        for (int v = 0; v < o->m.nv; v++) {
+            V3 p = m4_pt(M, o->m.p[v]);
+            lo = v3(fminf(lo.x, p.x), fminf(lo.y, p.y), fminf(lo.z, p.z));
+            hi = v3(fmaxf(hi.x, p.x), fmaxf(hi.y, p.y), fmaxf(hi.z, p.z));
+        }
+        obj_move_pivot(i, v3((lo.x + hi.x) * .5f, lo.y, (lo.z + hi.z) * .5f));
+    }
+    msg(n ? "Moved the pivot to the bottom center (handy for game engines: it stands on the floor)" : "Pivot to Base: select meshes");
+}
+
+/* ---- joints */
+
+static unsigned skel_root(const Obj *o)
+{
+    unsigned r = o->id;
+    int guard = 0;
+    while (guard++ < 256) {
+        int i = obj_index(r);
+        int p = i >= 0 ? obj_index(ob[i].parent) : -1;
+        if (p < 0 || ob[p].kind != OK_JOINT) break;
+        r = ob[p].id;
+    }
+    return r;
+}
+
+/* the joints under (and including) root, parents before children; returns how many */
+static int skel_joints(unsigned root, unsigned *out, int max)
+{
+    int n = 0;
+    if (obj_index(root) < 0 || max < 1) return 0;
+    out[n++] = root;
+    for (int h = 0; h < n; h++)
+        for (int i = 0; i < nob && n < max; i++)
+            if (ob[i].kind == OK_JOINT && ob[i].parent == out[h]) out[n++] = ob[i].id;
+    return n;
+}
+
+static Obj *add_joint(const char *name, unsigned parent, V3 world)
+{
+    Obj *o = obj_new_node(name, OK_JOINT);   /* may move ob */
+    o->parent = parent;
+    obj_set_world(o, m4_trs(world, v3(0, 0, 0), v3(1, 1, 1)));
+    o->r = v3(0, 0, 0);
+    o->s = v3(1, 1, 1);
+    return o;
+}
+
+/* rig templates, in a box: x and z -0.5..0.5 across the mesh's bounds, y 0 (feet) to 1 (top). The
+   biped uses Roblox's R15 body part names, so the joints pair up left / right for symmetry too. */
+typedef struct { const char *name; int parent; float x, y, z; int nodeform; } TJ;
+static const TJ BIPED[] = {
+    { "Root", -1, 0, 0, 0, 1 }, { "LowerTorso", 0, 0, .50f, 0, 0 }, { "UpperTorso", 1, 0, .63f, 0, 0 }, { "Head", 2, 0, .84f, 0, 0 },
+    { "LeftUpperArm", 2, .19f, .81f, 0, 0 }, { "LeftLowerArm", 4, .32f, .81f, -.03f, 0 }, { "LeftHand", 5, .45f, .81f, 0, 0 },
+    { "RightUpperArm", 2, -.19f, .81f, 0, 0 }, { "RightLowerArm", 7, -.32f, .81f, -.03f, 0 }, { "RightHand", 8, -.45f, .81f, 0, 0 },
+    { "LeftUpperLeg", 1, .09f, .48f, 0, 0 }, { "LeftLowerLeg", 10, .09f, .26f, .05f, 0 }, { "LeftFoot", 11, .09f, .05f, 0, 0 },
+    { "RightUpperLeg", 1, -.09f, .48f, 0, 0 }, { "RightLowerLeg", 13, -.09f, .26f, .05f, 0 }, { "RightFoot", 14, -.09f, .05f, 0, 0 },
+};
+static const TJ QUAD[] = {
+    { "Root", -1, 0, 0, 0, 1 }, { "Hips", 0, 0, .62f, -.30f, 0 }, { "Spine", 1, 0, .64f, 0, 0 }, { "Chest", 2, 0, .66f, .26f, 0 },
+    { "Neck", 3, 0, .76f, .38f, 0 }, { "Head", 4, 0, .86f, .46f, 0 }, { "Tail", 1, 0, .64f, -.44f, 0 },
+    { "FrontLeftUpperLeg", 3, .30f, .58f, .26f, 0 }, { "FrontLeftLowerLeg", 7, .30f, .30f, .23f, 0 }, { "FrontLeftFoot", 8, .30f, .05f, .26f, 0 },
+    { "FrontRightUpperLeg", 3, -.30f, .58f, .26f, 0 }, { "FrontRightLowerLeg", 10, -.30f, .30f, .23f, 0 }, { "FrontRightFoot", 11, -.30f, .05f, .26f, 0 },
+    { "BackLeftUpperLeg", 1, .30f, .58f, -.30f, 0 }, { "BackLeftLowerLeg", 13, .30f, .30f, -.27f, 0 }, { "BackLeftFoot", 14, .30f, .05f, -.30f, 0 },
+    { "BackRightUpperLeg", 1, -.30f, .58f, -.30f, 0 }, { "BackRightLowerLeg", 16, -.30f, .30f, -.27f, 0 }, { "BackRightFoot", 17, -.30f, .05f, -.30f, 0 },
+};
+
+/* world bounds of the selected meshes (as drawn); 0 if there are none */
+static int sel_mesh_bounds(V3 *lo, V3 *hi)
+{
+    int any = 0;
+    *lo = v3(1e30f, 1e30f, 1e30f);
+    *hi = v3(-1e30f, -1e30f, -1e30f);
+    for (int i = 0; i < nob; i++) {
+        Obj *o = &ob[i];
+        if (!active(o) || o->kind != OK_MESH || o->hidden) continue;
+        M4 M = obj_mat(o);
+        const V3 *P = obj_P(i);
+        for (int v = 0; v < o->m.nv; v++) {
+            V3 p = m4_pt(M, P[v]);
+            *lo = v3(fminf(lo->x, p.x), fminf(lo->y, p.y), fminf(lo->z, p.z));
+            *hi = v3(fmaxf(hi->x, p.x), fmaxf(hi->y, p.y), fmaxf(hi->z, p.z));
+            any = 1;
+        }
+    }
+    return any;
+}
+
+static void cmd_rig(int which)
+{
+    V3 lo, hi;
+    int fit = sel_mesh_bounds(&lo, &hi);
+    if (!fit) {
+        lo = which == 1 ? v3(-.4f, 0, -.8f) : v3(-.9f, 0, -.25f);
+        hi = which == 1 ? v3(.4f, 1.2f, .8f) : v3(.9f, 2, .25f);
+    }
+    undo_push(which == 0 ? "Biped Rig" : which == 1 ? "Quadruped Rig" : "Joint Chain");
+    set_mode(M_OBJ);
+    clear_sel();
+    V3 c = v3mul(v3add(lo, hi), .5f), sz = v3sub(hi, lo);
+    unsigned ids[32];
+    int n = 0;
+    if (which < 2) {
+        const TJ *t = which ? QUAD : BIPED;
+        int nt = which ? (int)(sizeof QUAD / sizeof *QUAD) : (int)(sizeof BIPED / sizeof *BIPED);
+        for (int k = 0; k < nt; k++) {
+            V3 w = v3(c.x + t[k].x * sz.x, lo.y + t[k].y * sz.y, c.z + t[k].z * sz.z);
+            Obj *o = add_joint(t[k].name, t[k].parent >= 0 ? ids[t[k].parent] : 0, w);
+            o->nodeform = t[k].nodeform;
+            ids[n++] = o->id;
+        }
+    } else {
+        /* a chain of four joints along the longest side, for bending props */
+        int ax = sz.x >= sz.y && sz.x >= sz.z ? 0 : sz.y >= sz.z ? 1 : 2;
+        for (int k = 0; k < 4; k++) {
+            V3 w = c;
+            (&w.x)[ax] = (&lo.x)[ax] + (&sz.x)[ax] * k / 3.0f;
+            char nm[16];
+            snprintf(nm, sizeof nm, "Bone%d", k + 1);
+            Obj *o = add_joint(nm, k ? ids[k - 1] : 0, w);
+            ids[n++] = o->id;
+        }
+    }
+    int r = obj_index(ids[0]);
+    ob[r].sel = 1;
+    ob[r].order = ++stamp;
+    set_tool(T_MOVE);
+    msg(which == 2 ? "Made a joint chain - select the mesh and the chain, then Bind (Rig shelf)"
+                   : "Made a rig - fit the joints (D moves one alone, Symmetry X keeps left and right matched), then select the mesh + a joint and Bind");
+}
+
+/* copy each selected joint chain to the other side, named Left <-> Right */
+static void cmd_mirror_joints(void)
+{
+    int n = 0, axis = symAxis ? symAxis - 1 : 0, n0 = nob;
+    unsigned *made = malloc((nob + 1) * sizeof(unsigned)), *from = malloc((nob + 1) * sizeof(unsigned));
+    for (int i = 0; i < n0; i++) {
+        Obj *o = &ob[i];
+        if (!o->sel || o->kind != OK_JOINT) continue;
+        int up = 0;
+        for (int k = 0; k < n0 && !up; k++) up = ob[k].sel && ob[k].kind == OK_JOINT && is_ancestor(ob[k].id, o);
+        if (up) continue;
+        if (!n) undo_push("Mirror Joints");
+        unsigned chain[256];
+        int nc = skel_joints(o->id, chain, 256), nm = 0;
+        for (int k = 0; k < nc; k++) {
+            int si = obj_index(chain[k]);
+            M4 W = obj_mat(&ob[si]), F = m4_id();
+            F.m[axis * 5] = -1;
+            W = m4_mul(m4_mul(F, W), F);
+            char name[64];
+            if (!name_mirror(ob[si].name, name, sizeof name)) snprintf(name, sizeof name, "%s_mirror", ob[si].name);
+            unsigned par = ob[si].parent, nodef = ob[si].nodeform;
+            for (int q = 0; q < nm && k; q++) if (from[q] == par) par = made[q];
+            Obj *c = obj_new_node(name, OK_JOINT);   /* may move ob */
+            c->parent = par;
+            c->nodeform = nodef;
+            obj_set_world(c, W);
+            from[nm] = chain[k];
+            made[nm++] = c->id;
+            n++;
+        }
+    }
+    free(made);
+    free(from);
+    char b[64];
+    snprintf(b, sizeof b, "Mirrored %d joint(s) across %s", n, SYM_NAME[axis + 1]);
+    msg(n ? b : "Mirror Joints: select the first joint of a left or right chain");
+}
+
+/* the bones of a skeleton (world, as it stands now) for automatic weights; skin joint k owns them */
+static int skin_bones(const Obj *m, Bone *b, int max)
+{
+    int nb = 0;
+    for (int k = 0; k < m->m.nsj && nb < max; k++) {
+        int j = obj_index(m->m.sj[k]);
+        if (j < 0 || ob[j].nodeform) continue;
+        V3 a = m4_col(obj_mat(&ob[j]), 3);
+        int kids = 0;
+        for (int c = 0; c < nob && nb < max; c++) {
+            if (ob[c].parent != ob[j].id || ob[c].kind != OK_JOINT) continue;
+            b[nb].a = a; b[nb].b = m4_col(obj_mat(&ob[c]), 3); b[nb].owner = k; nb++;
+            kids++;
+        }
+        if (!kids && nb < max) {
+            /* an end joint: a short bone on along its parent's direction */
+            int p = obj_index(ob[j].parent);
+            V3 e = a;
+            if (p >= 0 && ob[p].kind == OK_JOINT) e = v3add(a, v3mul(v3sub(a, m4_col(obj_mat(&ob[p]), 3)), .5f));
+            b[nb].a = a; b[nb].b = e; b[nb].owner = k; nb++;
+        }
+    }
+    return nb;
+}
+
+/* set the skeleton of mesh object o to its rest pose, remembering the current pose in save[] */
+static void skel_to_rest(const Obj *m, V3 *save)
+{
+    for (int k = 0; k < m->m.nsj; k++) {
+        int j = obj_index(m->m.sj[k]);
+        if (j < 0) continue;
+        save[3 * k] = ob[j].t; save[3 * k + 1] = ob[j].r; save[3 * k + 2] = ob[j].s;
+        if (ob[j].rest) { ob[j].t = ob[j].bt; ob[j].r = ob[j].br; ob[j].s = ob[j].bs; }
+    }
+}
+
+static void skel_restore(const Obj *m, const V3 *save)
+{
+    for (int k = 0; k < m->m.nsj; k++) {
+        int j = obj_index(m->m.sj[k]);
+        if (j >= 0) { ob[j].t = save[3 * k]; ob[j].r = save[3 * k + 1]; ob[j].s = save[3 * k + 2]; }
+    }
+}
+
+static void auto_weights(Obj *o)
+{
+    V3 *save = malloc((o->m.nsj + 1) * 3 * sizeof(V3));
+    Bone *bones = malloc((o->m.nsj * 8 + 8) * sizeof(Bone));
+    skel_to_rest(o, save);
+    int nb = skin_bones(o, bones, o->m.nsj * 8 + 8);
+    M4 id = m4_id();
+    skin_auto(&o->m, &id, bones, nb, 3);
+    skel_restore(o, save);
+    free(save);
+    free(bones);
+}
+
+/* Bind Skin: the selected meshes follow the skeleton of the selected joint, with automatic weights */
+static void cmd_bind(void)
+{
+    int jsel = -1, nm = 0;
+    for (int i = 0; i < nob; i++) {
+        if (!ob[i].sel) continue;
+        if (ob[i].kind == OK_JOINT && (jsel < 0 || ob[i].order > ob[jsel].order)) jsel = i;
+        nm += ob[i].kind == OK_MESH && ob[i].m.nf > 0;
+    }
+    if (mode != M_OBJ || jsel < 0 || !nm) { msg("Bind: select the mesh(es) and a joint of the skeleton (object mode), then Bind"); return; }
+    unsigned js[256];
+    int nj = skel_joints(skel_root(&ob[jsel]), js, 256);
+    undo_push("Bind Skin");
+    for (int k = 0; k < nj; k++) {
+        Obj *j = &ob[obj_index(js[k])];
+        j->bt = j->t; j->br = j->r; j->bs = j->s; j->rest = 1;
+    }
+    for (int i = 0; i < nob; i++) {
+        Obj *o = &ob[i];
+        if (!o->sel || o->kind != OK_MESH || !o->m.nf) continue;
+        if (skinned(o)) mesh_unskin(&o->m);
+        /* the mesh goes into world space at the root: from now on only its joints move it */
+        M4 M = obj_mat(o);
+        M4 *cw = malloc((nob + 1) * sizeof(M4));
+        for (int k = 0; k < nob; k++) if (ob[k].parent == o->id) cw[k] = obj_mat(&ob[k]);
+        for (int v = 0; v < o->m.nv; v++) o->m.p[v] = m4_pt(M, o->m.p[v]);
+        if (o->s.x * o->s.y * o->s.z < 0) mesh_flip(&o->m);
+        o->t = o->r = v3(0, 0, 0);
+        o->s = v3(1, 1, 1);
+        o->parent = 0;
+        for (int a = 0; a < anim.n; a++) clip_drop_obj(&anim.c[a], o->id);
+        for (int k = 0; k < nob; k++) if (ob[k].parent == o->id) obj_set_world(&ob[k], cw[k]);
+        free(cw);
+        mesh_skin_alloc(&o->m, nj);
+        for (int k = 0; k < nj; k++) {
+            o->m.sj[k] = js[k];
+            M4 ib = m4_inv(obj_mat(&ob[obj_index(js[k])]));
+            memcpy(o->m.ibm + 16 * k, ib.m, sizeof ib.m);
+        }
+        auto_weights(o);
+        o->prim.type = PRIM_NONE;
+    }
+    char b[128];
+    snprintf(b, sizeof b, "Bound %d mesh(es) to %d joints - pose the joints to try it; the Weights tool fixes any spots", nm, nj);
+    msg(b);
+}
+
+static void cmd_unbind(void)
+{
+    int n = 0;
+    for (int i = 0; i < nob; i++)
+        if (active(&ob[i]) && skinned(&ob[i])) {
+            if (!n++) undo_push("Unbind Skin");
+            mesh_unskin(&ob[i].m);
+        }
+    msg(n ? "Unbound - the mesh keeps its rest shape" : "Unbind: select a bound mesh");
+}
+
+/* the joints as they stand become the rest pose (after moving joints in a bound skeleton) */
+static void cmd_rebind(void)
+{
+    int n = 0;
+    for (int i = 0; i < nob; i++) {
+        Obj *o = &ob[i];
+        if (!active(o) || !skinned(o)) continue;
+        if (!n++) undo_push("Rebind");
+        for (int k = 0; k < o->m.nsj; k++) {
+            int j = obj_index(o->m.sj[k]);
+            if (j < 0) continue;
+            M4 ib = m4_inv(obj_mat(&ob[j]));
+            memcpy(o->m.ibm + 16 * k, ib.m, sizeof ib.m);
+            ob[j].bt = ob[j].t; ob[j].br = ob[j].r; ob[j].bs = ob[j].s; ob[j].rest = 1;
+        }
+    }
+    msg(n ? "Rebound: the joints as they stand are the new rest pose (the mesh keeps its shape)" : "Rebind: select a bound mesh");
+}
+
+static void cmd_auto_weights(void)
+{
+    int n = 0;
+    for (int i = 0; i < nob; i++)
+        if (active(&ob[i]) && skinned(&ob[i])) {
+            if (!n++) undo_push("Automatic Weights");
+            auto_weights(&ob[i]);
+        }
+    msg(n ? "Weights redone automatically from the rest pose" : "Automatic Weights: select a bound mesh");
+}
+
+/* the skin joint index that mirrors skin joint k of o (by Left / Right names), or k */
+static int skin_partner(const Obj *o, int k)
+{
+    int j = obj_index(o->m.sj[k]);
+    char nm[64];
+    if (j < 0 || !name_mirror(ob[j].name, nm, sizeof nm)) return k;
+    for (int q = 0; q < o->m.nsj; q++) {
+        int jq = obj_index(o->m.sj[q]);
+        if (jq >= 0 && !strcmp(ob[jq].name, nm)) return q;
+    }
+    return k;
+}
+
+/* copy one side's weights over to the other (the side you work on, see symmetry) */
+static int mirror_weights(Obj *o, int axis, int side)
+{
+    Mesh *m = &o->m;
+    int *vm = malloc((m->nv + 1) * sizeof(int)), *pk = malloc((m->nsj + 1) * sizeof(int)), n = 0;
+    mesh_sym_map(m, NULL, axis, fmaxf(symTol, 1e-4f), NULL, vm);
+    for (int k = 0; k < m->nsj; k++) pk[k] = skin_partner(o, k);
+    for (int v = 0; v < m->nv; v++) {
+        int u = vm[v];
+        if (u < 0 || u == v || (&m->p[v].x)[axis] * side >= 0) continue;   /* v is on the side that receives */
+        for (int k = 0; k < 4; k++) {
+            m->wj[4 * v + k] = (unsigned char)pk[m->wj[4 * u + k]];
+            m->ww[4 * v + k] = m->ww[4 * u + k];
+        }
+        n++;
+    }
+    free(vm);
+    free(pk);
+    return n;
+}
+
+static void cmd_mirror_weights(void)
+{
+    int n = 0, any = 0;
+    for (int i = 0; i < nob; i++)
+        if (active(&ob[i]) && skinned(&ob[i])) {
+            if (!any++) undo_push("Mirror Weights");
+            n += mirror_weights(&ob[i], symAxis ? symAxis - 1 : 0, symSide);
+        }
+    char b[96];
+    snprintf(b, sizeof b, "Mirrored the weights of %d vertices from the %s side", n, symSide > 0 ? "+" : "-");
+    msg(any ? b : "Mirror Weights: select a bound mesh");
+}
+
+/* ---- IK handles: drag the handle and a two bone chain (hip, knee, ankle) bends to reach it */
+
+static void ik_solve(Obj *h)
+{
+    int a = obj_index(h->ikA), b = obj_index(h->ikB), c = obj_index(h->ikC);
+    if (a < 0 || b < 0 || c < 0) return;
+    Obj *A = &ob[a], *B = &ob[b], *C = &ob[c];
+    A->r = h->ikRa;
+    B->r = h->ikRb;
+    M4 WA = obj_mat(A), WB = obj_mat(B), WC = obj_mat(C);
+    V3 pa = m4_col(WA, 3), b0 = m4_col(WB, 3), c0 = m4_col(WC, 3), tg = m4_col(obj_mat(h), 3), b1, c1;
+    float l1 = v3len(v3sub(b0, pa)), l2 = v3len(v3sub(c0, b0));
+    if (l1 < 1e-6f || l2 < 1e-6f) return;
+    ik_two_bone(pa, l1, l2, tg, h->ikPole, &b1, &c1);
+    V3 n0 = v3cross(v3sub(b0, pa), v3sub(c0, pa)), n1 = v3cross(v3sub(b1, pa), v3sub(c1, pa));
+    if (v3len(n0) < 1e-9f) n0 = v3cross(v3sub(b0, pa), h->ikPole);
+    if (v3len(n1) < 1e-9f) n1 = v3cross(v3sub(b1, pa), h->ikPole);
+    M4 Q = m4_align(v3sub(b0, pa), n0, v3sub(b1, pa), n1);
+    M4 RA = m4_mul(Q, m4_rot3(WA)), RB = m4_mul(Q, m4_rot3(WB));
+    RB = m4_mul(m4_rot_between(m4_dir(Q, v3sub(c0, b0)), v3sub(c1, b1)), RB);
+    M4 PA = m4_rot3(parent_mat(A));
+    A->r = m4_to_euler(m4_mul(m4_inv(PA), RA));
+    B->r = m4_to_euler(m4_mul(m4_inv(RA), RB));
+    if (h->ikOrient) C->r = m4_to_euler(m4_mul(m4_inv(RB), m4_mul(m4_rot3(obj_mat(h)), h->ikCw)));
+}
+
+/* solve every IK handle (after anything moved) */
+static void rig_update(void)
+{
+    for (int i = 0; i < nob; i++) if (ob[i].kind == OK_IK) ik_solve(&ob[i]);
+}
+
+/* Add IK: for the selected end joint (ankle / wrist) and the two joints above it */
+static void cmd_add_ik(void)
+{
+    Obj *l = lead();
+    int c = l ? (int)(l - ob) : -1, b = c >= 0 ? obj_index(ob[c].parent) : -1, a = b >= 0 ? obj_index(ob[b].parent) : -1;
+    if (mode != M_OBJ || c < 0 || ob[c].kind != OK_JOINT || b < 0 || ob[b].kind != OK_JOINT || a < 0 || ob[a].kind != OK_JOINT) {
+        msg("Add IK: select an end joint (a hand or foot) that has two joints above it");
+        return;
+    }
+    undo_push("Add IK Handle");
+    unsigned ia = ob[a].id, ib = ob[b].id, ic = ob[c].id;
+    V3 pa = m4_col(obj_mat(&ob[a]), 3), pb = m4_col(obj_mat(&ob[b]), 3), pc = m4_col(obj_mat(&ob[c]), 3);
+    V3 chord = v3norm(v3sub(pc, pa)), pole = v3sub(v3sub(pb, pa), v3mul(chord, v3dot(v3sub(pb, pa), chord)));
+    if (v3len(pole) < 1e-5f) pole = v3cross(chord, fabsf(chord.y) < .9f ? v3(0, 1, 0) : v3(1, 0, 0));
+    V3 ra = ob[a].r, rb = ob[b].r;
+    M4 cw = m4_rot3(obj_mat(&ob[c]));
+    char nm[48];
+    snprintf(nm, sizeof nm, "%sIK", ob[c].name);
+    Obj *h = obj_new_node(nm, OK_IK);   /* may move ob */
+    h->t = pc;
+    h->ikA = ia; h->ikB = ib; h->ikC = ic;
+    h->ikPole = v3norm(pole);
+    h->ikRa = ra; h->ikRb = rb;
+    h->ikCw = cw;
+    h->ikOrient = 1;
+    clear_sel();
+    h->sel = 1;
+    h->order = ++stamp;
+    set_tool(T_MOVE);
+    msg("Added an IK handle - drag it and the chain bends to reach it (Pole in the side panel sets the bend)");
+}
+
+/* Rest Pose: every bound skeleton back to how it was bound */
+static void cmd_rest_pose(void)
+{
+    int n = 0;
+    undo_push("Rest Pose");
+    for (int i = 0; i < nob; i++)
+        if (ob[i].kind == OK_JOINT && ob[i].rest) { ob[i].t = ob[i].bt; ob[i].r = ob[i].br; ob[i].s = ob[i].bs; n++; }
+    if (!n) { undo_drop(); msg("Rest Pose: nothing is bound yet"); return; }
+    msg("Rest pose");
+}
+
+/* ---- Joint tool: each click adds a joint to the chain. Clicked on a mesh, the joint goes halfway
+   through it (inside an arm, say); elsewhere onto the ground, or the view plane through the last
+   joint. Clicking an existing joint continues the chain from it. Enter, Esc or right click ends. */
+
+static int joint_place_point(int x, int y, V3 *out)
+{
+    V3 o, d;
+    float bt = 1e30f, t;
+    int hit = -1;
+    cam_update();
+    mouse_ray((float)x, (float)y, &o, &d);
+    for (int i = 0; i < nob; i++)
+        if (ob[i].kind == OK_MESH && obj_raycast(i, o, d, &t) >= 0 && t < bt) { bt = t; hit = i; }
+    if (hit >= 0) {
+        DrawCache *c = cache_get(hit);
+        M4 M = obj_mat(&ob[hit]);
+        float diag = v3len(v3sub(m4_pt(M, c->hi), m4_pt(M, c->lo))) * 2 + 1, t2;
+        V3 farp = v3add(o, v3mul(d, bt + diag));
+        float back = obj_raycast(hit, farp, v3mul(d, -1), &t2) >= 0 ? bt + diag - t2 : bt;
+        *out = v3add(o, v3mul(d, (bt + back) * .5f));
+    } else {
+        int li = obj_index(jt.last);
+        V3 p = li >= 0 ? m4_col(obj_mat(&ob[li]), 3) : v3(0, 0, 0), n = li >= 0 || ortho ? camF : v3(0, 1, 0);
+        if (fabsf(v3dot(n, d)) < 0.05f) n = camF;
+        if (!ray_plane(o, d, p, n, out)) return 0;
+    }
+    if (key('X') || snapGrid) *out = v3(roundf(out->x * 4) / 4, roundf(out->y * 4) / 4, roundf(out->z * 4) / 4);
+    return 1;
+}
+
+static void joint_click(int x, int y)
+{
+    int j = pick_joint(x, y);
+    if (j >= 0 && ob[j].kind == OK_JOINT) {   /* continue from an existing joint */
+        clear_sel();
+        ob[j].sel = 1;
+        ob[j].order = ++stamp;
+        jt.last = ob[j].id;
+        msg("Continuing the chain from this joint");
+        return;
+    }
+    V3 w;
+    if (!joint_place_point(x, y, &w)) return;
+    undo_push("Place Joint");
+    unsigned par = jt.last && obj_index(jt.last) >= 0 ? jt.last : 0;
+    Obj *o = add_joint("joint", par, w);
+    clear_sel();
+    o->sel = 1;
+    o->order = ++stamp;
+    jt.last = o->id;
+}
+
+/* ---- Weights tool: paint how much the picked joint moves each vertex (shown with heat()). */
+
+static float wpStr = 0.5f;
+static int wpMode, wpModeSel;   /* this stroke's / the panel's: 0 add, 1 remove, 2 smooth */
+
+
+/* the mesh the Weights tool paints: the lead bound mesh */
+static int wp_target(void)
+{
+    int best = -1;
+    for (int i = 0; i < nob; i++)
+        if (ob[i].sel && skinned(&ob[i]) && (best < 0 || ob[i].order > ob[best].order)) best = i;
+    if (best < 0) for (int i = 0; i < nob && best < 0; i++) if (skinned(&ob[i]) && !ob[i].hidden) best = i;
+    return best;
+}
+
+static struct { int obj, k, pk, dirty; float *orig, *amt; unsigned char *oj; int *vm; } wps = { -1, 0, 0, 0, NULL, NULL, NULL, NULL };
+
+/* the new weights of vertex v from its stroke start (orig) for skin joint k at stroke amount s */
+static void wp_apply(Mesh *m, int v, int k, float s)
+{
+    float w[8];
+    int j[8], n = 0;
+    for (int q = 0; q < 4; q++)
+        if (wps.orig[4 * v + q] > 0) { j[n] = wps.oj[4 * v + q]; w[n] = wps.orig[4 * v + q]; n++; }
+    int at = -1;
+    for (int q = 0; q < n; q++) if (j[q] == k) at = q;
+    if (wpMode == 2) {
+        /* smooth: toward the average of the neighbors */
+        float acc[64] = { 0 };
+        int cnt = 0;
+        for (int e = 0; e < m->ne; e++) {
+            int a = m->ev[2 * e], b = m->ev[2 * e + 1], u = a == v ? b : b == v ? a : -1;
+            if (u < 0) continue;
+            for (int q = 0; q < 4; q++) if (m->ww[4 * u + q] > 0 && m->wj[4 * u + q] < 64) acc[m->wj[4 * u + q]] += m->ww[4 * u + q];
+            cnt++;
+        }
+        if (!cnt) return;
+        memset(m->wj + 4 * v, 0, 4);
+        memset(m->ww + 4 * v, 0, 4 * sizeof(float));
+        float mix_[64] = { 0 };
+        for (int q = 0; q < n; q++) if (j[q] < 64) mix_[j[q]] += w[q] * (1 - s);
+        for (int q = 0; q < 64; q++) mix_[q] += acc[q] / cnt * s;
+        for (int q = 0; q < 64 && q < m->nsj; q++) if (mix_[q] > 1e-4f) skin_add(m->wj, m->ww, v, q, mix_[q]);
+        skin_normalize(m->wj, m->ww, v);
+        return;
+    }
+    float old = at >= 0 ? w[at] : 0, nw = wpMode == 0 ? old + (1 - old) * s : old * (1 - s), rest = 1 - old;
+    if (at < 0 && n < 8) { at = n; j[n] = k; w[n] = 0; n++; }
+    if (at < 0) return;
+    if (rest > 1e-6f) {
+        for (int q = 0; q < n; q++) if (q != at) w[q] *= (1 - nw) / rest;
+    } else if (nw < 1) {
+        /* it was all this joint's: what is taken goes to the parent joint */
+        int p = obj_index(ob[obj_index(m->sj[k])].parent), pk = p >= 0 ? skin_index(&ob[wps.obj], ob[p].id) : -1;
+        if (pk >= 0 && n < 8) { j[n] = pk; w[n] = 1 - nw; n++; }
+        else nw = 1;
+    }
+    w[at] = nw;
+    memset(m->wj + 4 * v, 0, 4);
+    memset(m->ww + 4 * v, 0, 4 * sizeof(float));
+    for (int q = 0; q < n; q++) if (w[q] > 1e-4f) skin_add(m->wj, m->ww, v, j[q], w[q]);
+    skin_normalize(m->wj, m->ww, v);
+}
+
+static void wp_dab(int mx, int my)
+{
+    if (wps.obj < 0 || wps.obj >= nob) return;
+    Obj *o = &ob[wps.obj];
+    Mesh *m = &o->m;
+    const V3 *P = obj_P(wps.obj);
+    float r = paintRad * ds;
+    for (int v = 0; v < m->nv; v++) {
+        float x, y, z;
+        if (!proj(P[v], &x, &y, &z)) continue;
+        float dd = hypotf(x - mx, y - my);
+        if (dd >= r || !visible(x, y, z)) continue;
+        float t = dd / r, f = t < 0.5f ? 1 : 1 - (t - 0.5f) * 2;
+        f = f * f * (3 - 2 * f) * wpStr;
+        if (f <= wps.amt[v]) continue;
+        if (!wps.dirty) { undo_push("Paint Weights"); wps.dirty = 1; o = &ob[wps.obj]; m = &o->m; }
+        wps.amt[v] = f;
+        wp_apply(m, v, wps.k, f);
+        int u = wps.vm ? wps.vm[v] : -1;   /* symmetry: the mirror vertex with the mirror joint */
+        if (u >= 0 && u != v && f > wps.amt[u]) { wps.amt[u] = f; wp_apply(m, u, wps.pk, f); }
+    }
+    geo_changed();
+}
+
+static int wp_begin(int mx, int my)
+{
+    int t = wp_target();
+    if (t < 0) { msg("Weights: bind a mesh to a skeleton first (Rig shelf: Bind)"); return 0; }
+    int k = skin_index(&ob[t], wpJoint);
+    if (k < 0) { msg("Weights: click a joint of this mesh's skeleton to pick what to paint"); return 0; }
+    Mesh *m = &ob[t].m;
+    wps.obj = t;
+    wps.k = k;
+    wps.pk = symAxis ? skin_partner(&ob[t], k) : k;
+    wps.dirty = 0;
+    wps.orig = malloc((m->nv + 1) * 4 * sizeof(float));
+    wps.oj = malloc((m->nv + 1) * 4);
+    wps.amt = calloc(m->nv + 1, sizeof(float));
+    memcpy(wps.orig, m->ww, m->nv * 4 * sizeof(float));
+    memcpy(wps.oj, m->wj, m->nv * 4);
+    wps.vm = NULL;
+    if (symAxis) {
+        wps.vm = malloc((m->nv + 1) * sizeof(int));
+        mesh_sym_map(m, NULL, symAxis - 1, fmaxf(symTol, 1e-4f), NULL, wps.vm);
+    }
+    cam_update();
+    depth_capture(0, 0, vw - 1, vh - 1);
+    wp_dab(mx, my);
+    return 1;
+}
+
+static void wp_end(void)
+{
+    free(wps.orig); free(wps.oj); free(wps.amt); free(wps.vm);
+    wps.orig = wps.amt = NULL;
+    wps.oj = NULL;
+    wps.vm = NULL;
+    wps.obj = -1;
+}
+
+/* ================================================================ animation
+
+   Each clip holds keys per object (by id): its whole transform on that frame. Moving to a frame
+   sets every keyed object from its keys, then IK solves. Auto Key re-keys objects that already have
+   keys whenever they are moved; K sets the first key. */
+
+static void timeline_sync(void);
+
+static int clip_has_keys(const Clip *c)
+{
+    for (int i = 0; i < c->nt; i++) if (c->t[i].n) return 1;
+    return 0;
+}
+
+/* put every keyed object where its keys say for the current frame */
+static void anim_eval(void)
+{
+    Clip *c = anim_clip(&anim);
+    for (int i = 0; i < c->nt; i++) {
+        int o = obj_index(c->t[i].obj);
+        if (o >= 0) track_eval(&c->t[i], curFrame, &ob[o].t, &ob[o].r, &ob[o].s);
+    }
+    rig_update();
+    geo_changed();
+}
+
+static void set_frame(float f)
+{
+    Clip *c = anim_clip(&anim);
+    f = roundf(f);
+    if (f < c->start) f = (float)c->start;
+    if (f > c->end) f = (float)c->end;
+    curFrame = f;
+    anim_eval();
+    timeline_sync();
+}
+
+/* which objects keys go to: the selected ones (object mode), or the objects being edited */
+static int key_target(const Obj *o) { return active(o) && !skinned(o) && !(o->kind == OK_MESH && mode != M_OBJ); }
+
+static void key_obj(Clip *c, Obj *o)
+{
+    Track *t = clip_track(c, o->id, 1);
+    int k = track_find(t, curFrame);
+    track_set(t, curFrame, o->t, o->r, o->s, k >= 0 ? t->k[k].ease : EASE_SMOOTH);
+}
+
+static void cmd_setkey(void)
+{
+    Clip *c = anim_clip(&anim);
+    int n = 0, sk = 0;
+    for (int i = 0; i < nob; i++) {
+        if (active(&ob[i]) && skinned(&ob[i])) sk++;
+        if (!key_target(&ob[i])) continue;
+        if (!n++) { undo_push("Set Key"); c = anim_clip(&anim); }
+        key_obj(c, &ob[i]);
+    }
+    char b[128];
+    if (!n) snprintf(b, sizeof b, sk ? "Set Key: a bound mesh moves with its joints - key the joints (or IK handles) instead"
+                                    : "Set Key: select the objects or joints to key (object mode)");
+    else snprintf(b, sizeof b, "Keyed %d object(s) on frame %g%s", n, curFrame, autoKey ? " - Auto Key keeps keying them as you move them" : "");
+    msg(b);
+}
+
+static void cmd_delkey(void)
+{
+    Clip *c = anim_clip(&anim);
+    int n = 0;
+    for (int i = 0; i < nob; i++) {
+        Track *t = active(&ob[i]) ? clip_track(c, ob[i].id, 0) : NULL;
+        if (!t || track_find(t, curFrame) < 0) continue;
+        if (!n++) { undo_push("Delete Key"); c = anim_clip(&anim); t = clip_track(c, ob[i].id, 0); }
+        track_remove(t, curFrame);
+        if (!t->n) clip_drop_obj(c, ob[i].id);
+    }
+    msg(n ? "Deleted the keys on this frame" : "Delete Key: no key here on the selected objects");
+}
+
+/* Auto Key: after a move, re-key the moved objects that already have keys */
+static void autokey(void)
+{
+    if (!autoKey) return;
+    Clip *c = anim_clip(&anim);
+    int hint = 0;
+    for (int i = 0; i < nob; i++) {
+        if (!key_target(&ob[i])) continue;
+        Track *t = clip_track(c, ob[i].id, 0);
+        if (t && t->n) key_obj(c, &ob[i]);
+        else if (clip_has_keys(c) || curFrame != c->start) hint = 1;
+    }
+    if (hint) msg("Not animated yet - press K to set its first key (Auto Key takes over from there)");
+}
+
+static float keys_neighbor(int dir)
+{
+    Clip *c = anim_clip(&anim);
+    int any = 0;
+    float best = curFrame, f;
+    for (int i = 0; i < nob; i++) any |= active(&ob[i]);
+    for (int i = 0; i < c->nt; i++) {
+        int o = obj_index(c->t[i].obj);
+        if (any && (o < 0 || !active(&ob[o]))) continue;
+        if (track_neighbor(&c->t[i], curFrame, dir, &f) && (best == curFrame || (dir > 0 ? f < best : f > best))) best = f;
+    }
+    return best;
+}
+
+static void cmd_ease(int ease)
+{
+    static const char *nm[3] = { "Smooth", "Linear", "Step" };
+    Clip *c = anim_clip(&anim);
+    int any = 0, n = 0;
+    for (int i = 0; i < nob; i++) any |= active(&ob[i]);
+    for (int pass = 0; pass < 2; pass++)
+        for (int i = 0; i < c->nt; i++) {
+            int o = obj_index(c->t[i].obj), k = track_find(&c->t[i], curFrame);
+            if (k < 0 || (any && (o < 0 || !active(&ob[o])))) continue;
+            if (!pass) { n++; continue; }
+            c->t[i].k[k].ease = (unsigned char)ease;
+        }
+    if (!n) { msg("Ease: go to a frame with keys (Shift+Left / Right jumps between keys)"); return; }
+    char b[96];
+    snprintf(b, sizeof b, "Keys on frame %g ease %s", curFrame, nm[ease]);
+    undo_push("Ease");
+    c = anim_clip(&anim);
+    for (int i = 0; i < c->nt; i++) {
+        int o = obj_index(c->t[i].obj), k = track_find(&c->t[i], curFrame);
+        if (k >= 0 && (!any || (o >= 0 && active(&ob[o])))) c->t[i].k[k].ease = (unsigned char)ease;
+    }
+    anim_eval();
+    msg(b);
+}
+
+/* Mirror Pose: each selected joint's Left / Right partner takes its mirror image pose */
+static void cmd_mirror_pose(void)
+{
+    int axis = symAxis ? symAxis - 1 : 0, n = 0;
+    int *to = malloc((nob + 1) * sizeof(int));
+    M4 *W = malloc((nob + 1) * sizeof(M4)), F = m4_id();
+    F.m[axis * 5] = -1;
+    for (int i = 0; i < nob; i++) {
+        char nm[64];
+        to[i] = -1;
+        if (!active(&ob[i]) || ob[i].kind == OK_MESH || !name_mirror(ob[i].name, nm, sizeof nm)) continue;
+        for (int k = 0; k < nob; k++) if (!strcmp(ob[k].name, nm)) to[i] = k;
+        if (to[i] >= 0) W[i] = m4_mul(m4_mul(F, obj_mat(&ob[i])), F);
+    }
+    for (int i = 0; i < nob; i++) n += to[i] >= 0;
+    if (n) {
+        undo_push("Mirror Pose");
+        /* parents first, so each child is placed under its parent's new pose */
+        for (int pass = 0; pass < nob; pass++) {
+            int done = 1;
+            for (int i = 0; i < nob; i++) {
+                if (to[i] < 0) continue;
+                int up = 0;
+                for (int k = 0; k < nob && !up; k++) up = to[k] >= 0 && is_ancestor(ob[to[k]].id, &ob[to[i]]);
+                if (up) { done = 0; continue; }
+                int k = to[i];
+                obj_set_world(&ob[k], W[i]);
+                if (ob[k].kind == OK_JOINT) ob[k].s = v3(1, 1, 1);
+                to[i] = -2;
+            }
+            for (int i = 0; i < nob; i++) if (to[i] == -2) to[i] = -1;
+            if (done) break;
+        }
+        rig_update();
+        if (autoKey) {
+            Clip *c = anim_clip(&anim);
+            for (int i = 0; i < nob; i++) {
+                char nm[64];
+                if (!name_mirror(ob[i].name, nm, sizeof nm)) continue;
+                for (int k = 0; k < nob; k++)
+                    if (active(&ob[k]) && !strcmp(ob[k].name, nm) && clip_track(c, ob[i].id, 0)) key_obj(c, &ob[i]);
+            }
+        }
+    }
+    free(to);
+    free(W);
+    msg(n ? "Mirrored the pose to the other side" : "Mirror Pose: select Left or Right joints (their partners get the pose)");
+}
+
+/* copy / paste the selected objects' transforms (by name, so it works across rigs and clips) */
+static struct { int n; char name[64][32]; V3 t[64], r[64], s[64]; } poseBuf;
+
+static void cmd_copy_pose(void)
+{
+    poseBuf.n = 0;
+    for (int i = 0; i < nob && poseBuf.n < 64; i++) {
+        if (!active(&ob[i])) continue;
+        memcpy(poseBuf.name[poseBuf.n], ob[i].name, 32);
+        poseBuf.t[poseBuf.n] = ob[i].t; poseBuf.r[poseBuf.n] = ob[i].r; poseBuf.s[poseBuf.n] = ob[i].s;
+        poseBuf.n++;
+    }
+    char b[64];
+    snprintf(b, sizeof b, "Copied the pose of %d object(s)", poseBuf.n);
+    msg(poseBuf.n ? b : "Copy Pose: select objects or joints");
+}
+
+static void cmd_paste_pose(void)
+{
+    int n = 0;
+    for (int k = 0; k < poseBuf.n; k++)
+        for (int i = 0; i < nob; i++) {
+            if (strcmp(ob[i].name, poseBuf.name[k])) continue;
+            if (!n++) undo_push("Paste Pose");
+            ob[i].t = poseBuf.t[k]; ob[i].r = poseBuf.r[k]; ob[i].s = poseBuf.s[k];
+            Clip *c = anim_clip(&anim);
+            Track *t = clip_track(c, ob[i].id, 0);
+            if (autoKey && t) key_obj(c, &ob[i]);
+        }
+    msg(n ? "Pasted the pose" : "Paste Pose: copy a pose first");
+}
+
+static void cmd_new_clip(int turntable)
+{
+    char nm[32];
+    Clip *c = anim_clip(&anim);
+    int start = c->start, end = c->end;
+    undo_push(turntable ? "Turntable" : "New Clip");
+    for (int k = 1;; k++) {
+        snprintf(nm, sizeof nm, turntable ? (k == 1 ? "Turntable" : "Turntable%d") : "Clip%d", k + (turntable ? 0 : anim.n));
+        int used = 0;
+        for (int i = 0; i < anim.n; i++) used |= !strcmp(anim.c[i].name, nm);
+        if (!used) break;
+    }
+    anim.cur = anim_add_clip(&anim, nm, turntable ? 0 : start, turntable ? (int)(anim.fps * 4) : end);
+    if (turntable) {
+        /* the selected objects (or every top object) spin once, evenly */
+        c = anim_clip(&anim);
+        int any = 0, n = 0;
+        for (int i = 0; i < nob; i++) any |= active(&ob[i]) && !skinned(&ob[i]);
+        for (int i = 0; i < nob; i++) {
+            Obj *o = &ob[i];
+            if (any ? !active(o) || skinned(o) : o->parent || o->hidden || skinned(o) || o->kind == OK_IK) continue;
+            Track *t = clip_track(c, o->id, 1);
+            track_set(t, (float)c->start, o->t, o->r, o->s, EASE_LINEAR);
+            track_set(t, (float)c->end, o->t, v3add(o->r, v3(0, 360, 0)), o->s, EASE_LINEAR);
+            n++;
+        }
+        char b[96];
+        snprintf(b, sizeof b, "Turntable: %d object(s) spin once over %d frames - press Space to play", n, c->end - c->start);
+        msg(b);
+    } else {
+        msg("New clip - its keys are separate, and it exports as its own animation (rename it in the side panel)");
+    }
+    set_frame((float)anim_clip(&anim)->start);
+}
+
+static void cmd_del_clip(void)
+{
+    if (anim.n < 2) { msg("Delete Clip: this is the only clip (its keys can be deleted with Shift+K)"); return; }
+    undo_push("Delete Clip");
+    anim_remove_clip(&anim, anim.cur);
+    set_frame(curFrame);
+    msg("Deleted the clip");
+}
+
+static void clip_pick(int i)
+{
+    if (i < 0 || i >= anim.n) return;
+    anim.cur = i;
+    set_frame(curFrame);
+    char b[64];
+    snprintf(b, sizeof b, "Clip: %s", anim.c[i].name);
+    toast(b);
+}
+
+/* ---- playback runs on a timer, at the clip's frame rate */
+
+static DWORD playT0;
+static float playF0;
+
+static void play(int on)
+{
+    playing = on;
+    if (on) {
+        Clip *c = anim_clip(&anim);
+        if (curFrame >= c->end) set_frame((float)c->start);
+        playT0 = GetTickCount();
+        playF0 = curFrame;
+        SetTimer(hView, 3, 1000 / 60, NULL);
+    } else {
+        KillTimer(hView, 3);
+    }
+}
+
+static void play_tick(void)
+{
+    Clip *c = anim_clip(&anim);
+    float f = playF0 + (GetTickCount() - playT0) * anim.fps / 1000.0f, len = (float)(c->end - c->start);
+    if (f > c->end) {
+        if (loopPlay && len > 0) f = c->start + fmodf(f - c->start, len + 1);
+        else { f = (float)c->end; play(0); }
+    }
+    if (floorf(f) != curFrame) set_frame(floorf(f));
+}
+
+/* ---- onion skin: faint ghosts of the poses a few frames before (blue) and after (green) */
+
+static int onionStep = 3;
+
+static void draw_onion(void)
+{
+    Clip *c = anim_clip(&anim);
+    if (!onion || !clip_has_keys(c)) return;
+    V3 *save = malloc((nob + 1) * 3 * sizeof(V3));
+    for (int i = 0; i < nob; i++) { save[3 * i] = ob[i].t; save[3 * i + 1] = ob[i].r; save[3 * i + 2] = ob[i].s; }
+    float f0 = curFrame;
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    glDepthMask(GL_FALSE);
+    glDisable(GL_LIGHTING);
+    for (int side = -1; side <= 1; side += 2) {
+        float f = f0 + side * onionStep;
+        if (f < c->start || f > c->end) continue;
+        curFrame = f;
+        for (int i = 0; i < c->nt; i++) {
+            int o = obj_index(c->t[i].obj);
+            if (o >= 0) track_eval(&c->t[i], f, &ob[o].t, &ob[o].r, &ob[o].s);
+        }
+        rig_update();
+        for (int i = 0; i < nob; i++) {
+            Obj *o = &ob[i];
+            if (o->kind != OK_MESH || o->hidden || !o->m.nf) continue;
+            M4 M = obj_mat(o);
+            const V3 *P = o->m.p;
+            V3 *def = NULL;
+            if (skinned(o)) {
+                def = malloc((o->m.nv + 1) * sizeof(V3));
+                M4 *jw = malloc((o->m.nsj + 1) * sizeof(M4));
+                for (int k = 0; k < o->m.nsj; k++) jw[k] = skin_joint(o, k);
+                skin_deform(&o->m, jw, def);
+                free(jw);
+                P = def;
+            } else {
+                int moves = 0;   /* only what animates */
+                for (int k = 0; k < c->nt && !moves; k++) {
+                    int ko = obj_index(c->t[k].obj);
+                    moves = ko >= 0 && (ko == i || is_ancestor(ob[ko].id, o));
+                }
+                if (!moves) continue;
+            }
+            glPushMatrix();
+            glMultMatrixf(M.m);
+            if (side < 0) glColor4f(.35f, .55f, 1, .22f); else glColor4f(.4f, 1, .5f, .22f);
+            glBegin(GL_TRIANGLES);
+            for (int fc = 0; fc < o->m.nf; fc++) {
+                int s = o->m.fo[fc], n = o->m.fo[fc + 1] - s;
+                for (int k = 1; k + 1 < n; k++) {
+                    glVertex3fv(&P[o->m.fi[s]].x);
+                    glVertex3fv(&P[o->m.fi[s + k]].x);
+                    glVertex3fv(&P[o->m.fi[s + k + 1]].x);
+                }
+            }
+            glEnd();
+            glPopMatrix();
+            free(def);
+        }
+    }
+    glDepthMask(GL_TRUE);
+    glDisable(GL_BLEND);
+    curFrame = f0;
+    for (int i = 0; i < nob; i++) { ob[i].t = save[3 * i]; ob[i].r = save[3 * i + 1]; ob[i].s = save[3 * i + 2]; }
+    rig_update();
+    free(save);
+}
+
+/* ---- File > Export glTF (.glb): every object as a node (joints become bones), bound meshes as
+   skins, and every clip baked frame by frame (IK included) as its own animation */
+
+static int export_glb(const char *path, int *nclips)
+{
+    int *node = malloc((nob + 1) * sizeof(int)), nn = 0;
+    GNode *nd = calloc(nob + 1, sizeof(GNode));
+    int **sj = calloc(nob + 1, sizeof(int *));
+    for (int i = 0; i < nob; i++) node[i] = ob[i].kind == OK_IK ? -1 : nn++;
+    Clip *cl = anim_clip(&anim);
+    float f0 = curFrame;
+    (void)cl;
+    for (int i = 0; i < nob; i++) {
+        Obj *o = &ob[i];
+        if (node[i] < 0) continue;
+        GNode *g = &nd[node[i]];
+        V3 t = o->t, r = o->r, s = o->s;
+        if (o->kind == OK_JOINT && o->rest) { t = o->bt; r = o->br; s = o->bs; }   /* bones rest as bound */
+        int p = obj_index(o->parent);
+        while (p >= 0 && node[p] < 0) p = obj_index(ob[p].parent);
+        g->name = o->name;
+        g->parent = p >= 0 ? node[p] : -1;
+        g->t = t;
+        g->s = s;
+        g->r = quat_from_m4(m4_euler(r));
+        g->angle = o->nangle;
+        if (o->kind == OK_MESH && !o->hidden && o->m.nf) {
+            g->mesh = &o->m;
+            if (skinned(o)) {
+                int ok = 1;
+                sj[i] = malloc(o->m.nsj * sizeof(int));
+                for (int k = 0; k < o->m.nsj; k++) {
+                    int j = obj_index(o->m.sj[k]);
+                    if (j < 0 || node[j] < 0) ok = 0; else sj[i][k] = node[j];
+                }
+                if (ok) g->skinJoints = sj[i];
+            }
+        }
+    }
+    /* bake the clips */
+    int na = 0, oldCur = anim.cur;
+    GAnim *an = calloc(anim.n + 1, sizeof(GAnim));
+    GChan **chs = calloc(anim.n + 1, sizeof(GChan *));
+    float **bufs = calloc((anim.n + 1) * (nob + 1), sizeof(float *));
+    for (int a = 0; a < anim.n; a++) {
+        Clip *c = &anim.c[a];
+        if (!clip_has_keys(c)) continue;
+        anim.cur = a;
+        int nf = c->end - c->start + 1;
+        /* the animated nodes: keyed objects and every joint (IK moves joints without keys) */
+        unsigned char *anim_ = calloc(nob + 1, 1);
+        for (int i = 0; i < c->nt; i++) { int o = obj_index(c->t[i].obj); if (o >= 0) anim_[o] = 1; }
+        for (int i = 0; i < nob; i++) if (ob[i].kind == OK_JOINT) anim_[i] = 1;
+        int nch = 0;
+        for (int i = 0; i < nob; i++) nch += anim_[i] && node[i] >= 0;
+        GChan *ch = calloc(nch + 1, sizeof(GChan));
+        int ci = 0;
+        for (int i = 0; i < nob; i++) {
+            if (!anim_[i] || node[i] < 0) continue;
+            float *b = malloc(nf * 10 * sizeof(float));
+            bufs[a * (nob + 1) + i] = b;
+            ch[ci].node = node[i];
+            ch[ci].t = b;
+            ch[ci].r = b + 3 * nf;
+            ch[ci].s = b + 7 * nf;
+            ci++;
+        }
+        for (int f = 0; f < nf; f++) {
+            curFrame = (float)(c->start + f);
+            anim_eval();
+            for (int i = 0; i < nob; i++) {
+                float *b = bufs[a * (nob + 1) + i];
+                if (!b) continue;
+                Quat q = quat_from_m4(m4_euler(ob[i].r));
+                memcpy(b + 3 * f, &ob[i].t, 3 * sizeof(float));
+                memcpy(b + 3 * nf + 4 * f, &q, 4 * sizeof(float));
+                memcpy(b + 7 * nf + 3 * f, &ob[i].s, 3 * sizeof(float));
+            }
+        }
+        an[na].name = c->name;
+        an[na].nf = nf;
+        an[na].fps = anim.fps;
+        an[na].nch = nch;
+        an[na].ch = ch;
+        chs[na++] = ch;
+        free(anim_);
+    }
+    anim.cur = oldCur;
+    curFrame = f0;
+    anim_eval();
+    int r = gltf_write(path, nd, nn, an, na);
+    for (int i = 0; i < (anim.n + 1) * (nob + 1); i++) free(bufs[i]);
+    for (int i = 0; i < na; i++) free(chs[i]);
+    for (int i = 0; i <= nob; i++) free(sj[i]);
+    free(bufs); free(chs); free(an); free(sj); free(nd); free(node);
+    *nclips = na;
+    return r;
+}
+
+static void cmd_export_glb(void)
+{
+    char path[MAX_PATH] = "", b[MAX_PATH + 96];
+    snprintf(path, sizeof path, "%s", g_path[0] ? g_path : g_suggest);
+    char *dot = strrchr(path, '.');
+    if (dot && (dot > strrchr(path, '\\') || !strrchr(path, '\\'))) *dot = 0;
+    if (path[0]) strcat(path, ".glb");
+    OPENFILENAMEA of;
+    memset(&of, 0, sizeof of);
+    of.lStructSize = sizeof of;
+    of.hwndOwner = hMain;
+    of.lpstrFilter = "glTF binary (*.glb)\0*.glb\0";
+    of.lpstrFile = path;
+    of.nMaxFile = MAX_PATH;
+    of.lpstrDefExt = "glb";
+    of.Flags = OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST;
+    if (!GetSaveFileNameA(&of)) return;
+    int nc = 0;
+    if (export_glb(path, &nc)) { MessageBoxA(hMain, "Could not write the file.", APP_NAME, MB_ICONERROR); return; }
+    snprintf(b, sizeof b, "Exported %s with %d animation clip(s) - Godot and Roblox Studio import it as is", path, nc);
     msg(b);
 }
 
@@ -3471,20 +5027,21 @@ static int save_scene(const char *path, int selOnly)
     const char **names = malloc((nob + 1) * sizeof *names);
     float *angles = malloc((nob + 1) * sizeof *angles);
     int n = 0;
+    Mesh *views = malloc((nob + 1) * sizeof(Mesh));
     for (int i = 0; i < nob; i++) {
         if (selOnly && !active(&ob[i])) continue;
-        ms[n] = &ob[i].m;
+        if (ob[i].kind != OK_MESH) continue;
+        views[i] = obj_view(i);   /* bound meshes as posed */
+        ms[n] = &views[i];
         mats[n] = obj_mat(&ob[i]);
         names[n] = ob[i].name;
         angles[n] = ob[i].nangle;
         n++;
     }
     int ok = obj_save(path, n, ms, mats, names, angles);
-    free(ms); free(mats); free(names); free(angles);
+    free(ms); free(mats); free(names); free(angles); free(views);
     return ok ? n : -1;
 }
-
-static char g_suggest[MAX_PATH];   /* default export name for a scene that has no OBJ path yet */
 
 /* Save (Ctrl+S) writes the current file in its own format; Save As (ask 1) asks for a scene or OBJ.
    Export OBJ (ask 2) / Export Selection write an OBJ and leave the current file alone. */
@@ -3842,26 +5399,26 @@ static void cmd_transform(int what)
     for (int i = 0; i < nob; i++) {
         Obj *o = &ob[i];
         Mesh *m = &o->m;
-        if (!active(o)) continue;
-        M4 M = obj_mat(o);
+        if (!active(o) || skinned(o)) continue;   /* bound meshes are already frozen */
+        M4 M = obj_mat(o), L = obj_local(o);
         if (what == XF_FREEZE) {
-            /* bake into the vertices; a mirrored scale also flips the winding */
-            for (int v = 0; v < m->nv; v++) m->p[v] = m4_pt(M, m->p[v]);
+            if (o->kind != OK_MESH) continue;
+            /* bake into the vertices (children keep their place); a mirrored scale flips the winding */
+            for (int k = 0; k < nob; k++)
+                if (ob[k].parent == o->id) m4_decompose(m4_mul(L, obj_local(&ob[k])), &ob[k].t, &ob[k].r, &ob[k].s);
+            for (int v = 0; v < m->nv; v++) m->p[v] = m4_pt(L, m->p[v]);
             if (o->s.x * o->s.y * o->s.z < 0) mesh_flip(m);
             o->t = o->r = v3(0, 0, 0);
             o->s = v3(1, 1, 1);
             o->prim.type = PRIM_NONE;
         } else if (what == XF_CENTER) {
+            if (!m->nv) continue;
             V3 lo = v3(1e30f, 1e30f, 1e30f), hi = v3(-1e30f, -1e30f, -1e30f);
             for (int v = 0; v < m->nv; v++) {
                 lo = v3(fminf(lo.x, m->p[v].x), fminf(lo.y, m->p[v].y), fminf(lo.z, m->p[v].z));
                 hi = v3(fmaxf(hi.x, m->p[v].x), fmaxf(hi.y, m->p[v].y), fmaxf(hi.z, m->p[v].z));
             }
-            V3 c = v3mul(v3add(lo, hi), 0.5f);
-            if (v3len(c) < 1e-6f) continue;
-            for (int v = 0; v < m->nv; v++) m->p[v] = v3sub(m->p[v], c);
-            o->t = m4_pt(M, c);
-            o->prim.type = PRIM_NONE;
+            obj_move_pivot(i, m4_pt(M, v3mul(v3add(lo, hi), 0.5f)));
         } else {
             o->t = o->r = v3(0, 0, 0);
             o->s = v3(1, 1, 1);
@@ -4538,6 +6095,7 @@ static void do_cmd(int id)
         if (hPick) { pkKept = themeIdx; InvalidateRect(hPick, NULL, FALSE); }
     }
     if (id >= CM_UIS && id < CM_UIS + 5) ui_size(100 + 25 * (id - CM_UIS));
+    if (id >= CM_CLIP && id < CM_CLIP + 100) clip_pick(id - CM_CLIP);
     if (id >= CM_RECENT && id < CM_RECENT + NRECENT && recent[id - CM_RECENT][0]) {
         char p[MAX_PATH];
         strcpy(p, recent[id - CM_RECENT]);
@@ -4552,6 +6110,9 @@ static void do_cmd(int id)
         for (int i = 0; i < 3; i++) img_clear(i);
         mode = M_OBJ;
         isolateOn = 0;
+        anim_free(&anim);
+        anim_init(&anim);
+        curFrame = 0;
         g_path[0] = 0;
         g_suggest[0] = 0;
         modified = 0;
@@ -4605,6 +6166,46 @@ static void do_cmd(int id)
     case CM_TORUS: cmd_create(PRIM_TORUS); break;
     case CM_PIPE: cmd_create(PRIM_PIPE); break;
     case CM_UIBIGGER: ui_step(1); break;
+    case CM_TJOINT: set_tool(T_JOINT); msg("Joint tool: click to place joints (on a mesh they go inside it); Enter ends the chain"); break;
+    case CM_TWEIGHT: set_tool(T_WEIGHT); break;
+    case CM_PARENT: cmd_parent(); break;
+    case CM_UNPARENT: cmd_unparent(); break;
+    case CM_SELHIER: cmd_select_hierarchy(); break;
+    case CM_PIVOT: cmd_pivot_mode(); break;
+    case CM_PIVOTBASE: cmd_pivot_base(); break;
+    case CM_RIGBIPED: cmd_rig(0); break;
+    case CM_RIGQUAD: cmd_rig(1); break;
+    case CM_RIGCHAIN: cmd_rig(2); break;
+    case CM_MIRRORJOINTS: cmd_mirror_joints(); break;
+    case CM_BIND: cmd_bind(); break;
+    case CM_UNBIND: cmd_unbind(); break;
+    case CM_REBIND: cmd_rebind(); break;
+    case CM_AUTOWEIGHTS: cmd_auto_weights(); break;
+    case CM_MIRRORWEIGHTS: cmd_mirror_weights(); break;
+    case CM_RESTPOSE: cmd_rest_pose(); break;
+    case CM_ADDIK: cmd_add_ik(); break;
+    case CM_KEY: cmd_setkey(); break;
+    case CM_DELKEY: cmd_delkey(); break;
+    case CM_AUTOKEY: autoKey = !autoKey; msg(autoKey ? "Auto Key on: moving animated objects keys them" : "Auto Key off: press K to key"); break;
+    case CM_PLAY: play(!playing); break;
+    case CM_LOOPPLAY: loopPlay = !loopPlay; msg(loopPlay ? "Playback loops" : "Playback stops at the end"); break;
+    case CM_NEXTFRAME: set_frame(curFrame + 1); break;
+    case CM_PREVFRAME: set_frame(curFrame - 1); break;
+    case CM_NEXTKEY: set_frame(keys_neighbor(1)); break;
+    case CM_PREVKEY: set_frame(keys_neighbor(-1)); break;
+    case CM_FIRSTFRAME: set_frame((float)anim_clip(&anim)->start); break;
+    case CM_LASTFRAME: set_frame((float)anim_clip(&anim)->end); break;
+    case CM_ONION: onion = !onion; msg(onion ? "Onion skin: blue is a few frames back, green a few ahead" : "Onion skin off"); break;
+    case CM_TURNTABLE: cmd_new_clip(1); break;
+    case CM_NEWCLIP: cmd_new_clip(0); break;
+    case CM_DELCLIP: cmd_del_clip(); break;
+    case CM_RENAMECLIP: msg("Rename the clip in the side panel's Animation section (Clip)"); break;
+    case CM_MIRRORPOSE: cmd_mirror_pose(); break;
+    case CM_COPYKEY: cmd_copy_pose(); break;
+    case CM_PASTEKEY: cmd_paste_pose(); break;
+    case CM_EASESMOOTH: case CM_EASELINEAR: case CM_EASESTEP: cmd_ease(id - CM_EASESMOOTH); break;
+    case CM_EXPORTGLB: cmd_export_glb(); break;
+    case CM_SHOWJOINTS: showJoints = !showJoints; msg(showJoints ? "Showing joints" : "Joints hidden (Display > Joints shows them)"); break;
     case CM_UISMALLER: ui_step(0); break;
     case CM_COMPTOG: set_mode(mode == M_OBJ ? lastComp : M_OBJ); break;
     case CM_HOTKEYS: hotkey_editor(); break;
@@ -4666,6 +6267,7 @@ static void do_cmd(int id)
     }
     case CM_TSEL: case CM_TMOVE: case CM_TROT: case CM_TSCALE: case CM_TPAINT: case CM_TWELD: case CM_TLOOP: case CM_TCUT:
         set_tool(id - CM_TSEL);
+        if (id != CM_TMOVE) pivotMode = 0;
         break;
     case CM_REVERSE: cmd_face_op(mesh_reverse, "Reverse Normals", "Reversed %d face(s)"); break;
     case CM_TRIANG: cmd_face_op(mesh_triangulate, "Triangulate", "Triangulated %d face(s)"); break;
@@ -4716,13 +6318,15 @@ enum {
     PF_TR, PF_TSEC, PF_TSIDES, PF_TSEGS,
     PF_UR, PF_UH, PF_UT, PF_USIDES, PF_UHSEG,
     PF_CX, PF_CY, PF_CZ, PF_BX, PF_BY, PF_BZ,      /* selection center and size (world) */
+    PF_NODEFORM, PF_POLEX, PF_POLEY, PF_POLEZ, PF_IKORIENT, PF_START, PF_END, PF_FPS, PF_CLIPNAME,
     /* from here on: tool settings, not part of the scene, so not undo steps */
     PF_OPA, PF_RAD, PF_COLOR, PF_APPLY,
     PF_MERGED, PF_BEVELW, PF_BRIDGED,
     PF_EXTHICK, PF_EXOFF, PF_SYMAXIS, PF_SYMSPACE, PF_SYMTOL, PF_SOFTON, PF_SOFTR, PF_PREVLV,
+    PF_WSTR, PF_WMODE, PF_FRAME, PF_ONIONSTEP,
     PF_IMG   /* + plane * 4 + (size, offset x, offset y, opacity) */
 };
-enum { RK_HEAD = 1, RK_FLOAT, RK_INT, RK_BOOL, RK_COLOR, RK_BUTTON, RK_NAME, RK_TIP, RK_SEG };
+enum { RK_HEAD = 1, RK_FLOAT, RK_INT, RK_BOOL, RK_COLOR, RK_BUTTON, RK_NAME, RK_TIP, RK_SEG, RK_TEXT };
 #define NROW 96
 typedef struct { int kind, id; char label[40]; const char *opts; int y, h; } Row;   /* opts: "Off|X|Y|Z" for RK_SEG */
 static Row rows[NROW];
@@ -4770,7 +6374,10 @@ static float *fld_f(int id)
     case PF_EXOFF: return &exOff;
     case PF_SYMTOL: return &symTol;
     case PF_SOFTR: return &softRad;
+    case PF_FPS: return &anim.fps;
+    case PF_WSTR: return &wpStr;
     }
+    if (id >= PF_POLEX && id <= PF_POLEZ) return o && o->kind == OK_IK ? &o->ikPole.x + (id - PF_POLEX) : NULL;
     if (id >= PF_IMG && id < PF_IMG + 12) {
         ImgPlane *q = &img[(id - PF_IMG) / 4];
         float *f[4] = { &q->size, &q->ox, &q->oy, &q->opa };
@@ -4812,6 +6419,13 @@ static int *fld_i(int id)
     case PF_SYMSPACE: return &symWorld;
     case PF_SOFTON: return &softOn;
     case PF_PREVLV: return &smoothLv;
+    case PF_WMODE: return &wpModeSel;
+    case PF_ONIONSTEP: return &onionStep;
+    case PF_START: return &anim_clip(&anim)->start;
+    case PF_END: return &anim_clip(&anim)->end;
+    case PF_FRAME: { static int fi; fi = (int)curFrame; return &fi; }
+    case PF_NODEFORM: return o && o->kind == OK_JOINT ? &o->nodeform : NULL;
+    case PF_IKORIENT: return o && o->kind == OK_IK ? &o->ikOrient : NULL;
     }
     if (!o) return NULL;
     Prim *q = &o->prim;
@@ -4852,6 +6466,7 @@ static void row_text(int r)
 {
     char b[64] = "";
     if (rows[r].kind == RK_NAME) { if (panelObj >= 0 && panelObj < nob) SetWindowTextA(rEdit[r], ob[panelObj].name); return; }
+    if (rows[r].kind == RK_TEXT) { SetWindowTextA(rEdit[r], anim_clip(&anim)->name); return; }
     if (rows[r].kind == RK_FLOAT) { float *p = fld_f(rows[r].id); if (p) fmt_float(b, *p); }
     else { int *p = fld_i(rows[r].id); if (p) sprintf(b, "%d", *p); }
     SetWindowTextA(rEdit[r], b);
@@ -4861,7 +6476,7 @@ static void panel_sync(void)
 {
     HWND f = GetFocus();
     for (int r = 0; r < nrows; r++) {
-        if ((rows[r].kind == RK_FLOAT || rows[r].kind == RK_INT || rows[r].kind == RK_NAME) && rEdit[r] != f) row_text(r);
+        if ((rows[r].kind == RK_FLOAT || rows[r].kind == RK_INT || rows[r].kind == RK_NAME || rows[r].kind == RK_TEXT) && rEdit[r] != f) row_text(r);
         if (rows[r].kind == RK_BOOL) { int *p = fld_i(rows[r].id); SendMessage(rChk[r], BM_SETCHECK, p && *p ? BST_CHECKED : BST_UNCHECKED, 0); }
         if (rows[r].kind == RK_SEG) InvalidateRect(rSeg[r], NULL, FALSE);
     }
@@ -4894,8 +6509,26 @@ static void panel_rows(void)
     if (o) {
         add_row(RK_NAME, 0, "Name");
         for (int i = 0; i < 9; i++) add_row(RK_FLOAT, PF_TX + i, trs[i]);
-        add_row(RK_FLOAT, PF_NANGLE, "Normal Angle");
-        switch (o->prim.type) {
+        if (o->kind == OK_MESH) add_row(RK_FLOAT, PF_NANGLE, "Normal Angle");
+        if (o->kind == OK_JOINT) {
+            add_row(RK_HEAD, 0, "Joint");
+            add_row(RK_BOOL, PF_NODEFORM, "Root (no weights)");
+        }
+        if (o->kind == OK_IK) {
+            add_row(RK_HEAD, 0, "IK Handle");
+            add_row(RK_FLOAT, PF_POLEX, "Pole X");
+            add_row(RK_FLOAT, PF_POLEY, "Pole Y");
+            add_row(RK_FLOAT, PF_POLEZ, "Pole Z");
+            add_row(RK_BOOL, PF_IKORIENT, "Turn End Joint");
+        }
+        if (skinned(o)) {
+            static char tip[64];
+            add_row(RK_HEAD, 0, "Skin");
+            snprintf(tip, sizeof tip, "Bound to %d joints.", o->m.nsj);
+            add_row(RK_TIP, 0, tip);
+            add_row(RK_TIP, 0, "Rig shelf: Weights paints them.");
+        }
+        switch (o->kind == OK_MESH ? o->prim.type : PRIM_NONE) {
         case PRIM_CUBE:
             add_row(RK_HEAD, 0, "Cube");
             add_row(RK_FLOAT, PF_CW, "Width");
@@ -4964,6 +6597,23 @@ static void panel_rows(void)
         add_row(RK_TIP, 0, "Drag a label to scrub its value");
         add_row(RK_TIP, 0, "(Shift = fast, Ctrl = fine).");
     }
+    if (tool == T_WEIGHT) {
+        char b[48];
+        int j = obj_index(wpJoint);
+        add_row(RK_HEAD, 0, "Paint Weights");
+        snprintf(b, sizeof b, "Joint: %s", j >= 0 ? ob[j].name : "(click one)");
+        add_row(RK_TIP, 0, b);
+        add_seg(PF_WMODE, "Mode", "Add|Remove|Smooth");
+        add_row(RK_FLOAT, PF_WSTR, "Strength");
+        add_row(RK_FLOAT, PF_RAD, "Brush Radius");
+    }
+    add_row(RK_HEAD, 0, "Animation");
+    add_row(RK_TEXT, PF_CLIPNAME, "Clip");
+    add_row(RK_INT, PF_FRAME, "Frame");
+    add_row(RK_INT, PF_START, "Start");
+    add_row(RK_INT, PF_END, "End");
+    add_row(RK_FLOAT, PF_FPS, "FPS");
+    add_row(RK_INT, PF_ONIONSTEP, "Onion Step");
     add_row(RK_HEAD, 0, "Symmetry");
     add_seg(PF_SYMAXIS, "Axis", "Off|X|Y|Z");
     add_seg(PF_SYMSPACE, "Space", "Object|World");
@@ -5020,14 +6670,14 @@ static void panel_build(void)
     for (int r = 0; r < NROW; r++) {
         int k = r < nrows && (rows[r].h || rows[r].kind == RK_HEAD) ? rows[r].kind : 0;
         int yy = r < nrows ? rows[r].y - pScroll : 0, h = r < nrows ? rows[r].h : 0;
-        int lab = k == RK_HEAD || k == RK_FLOAT || k == RK_INT || k == RK_COLOR || k == RK_TIP || k == RK_SEG;
+        int lab = k == RK_HEAD || k == RK_FLOAT || k == RK_INT || k == RK_COLOR || k == RK_TIP || k == RK_SEG || k == RK_TEXT;
         if (lab) {
             int wide = k == RK_HEAD || k == RK_TIP, ind = k == RK_HEAD ? (int)(16 * ds) : 0;
             SendMessage(rLab[r], WM_SETFONT, (WPARAM)(k == RK_HEAD ? hBold : hFont), FALSE);
             SetWindowTextA(rLab[r], rows[r].label);
             PLACE(rLab[r], pad + ind, yy + (h - (int)(16 * ds)) / 2, wide ? W - 2 * pad - ind - sb : lw - 4, (int)(17 * ds), 1);
         } else PLACE(rLab[r], 0, 0, 0, 0, 0);
-        int fld = k == RK_FLOAT || k == RK_INT || k == RK_NAME;
+        int fld = k == RK_FLOAT || k == RK_INT || k == RK_NAME || k == RK_TEXT;
         if (fld) {
             int x0 = k == RK_NAME ? pad : pad + lw, w = k == RK_NAME ? W - 2 * pad - sb : ew;
             if (k == RK_INT) w -= 2 * bw + (int)(2 * ds);
@@ -5125,6 +6775,9 @@ static void panel_set(int r, double v)
         case PF_EXTHICK: exThick = (float)v; live_redo(CM_EXTRUDE); return;
         case PF_EXOFF: exOff = (float)v; live_redo(CM_EXTRUDE); return;
         case PF_SYMTOL: symTol = (float)(v < 1e-6 ? 1e-6 : v > 10 ? 10 : v); geo_changed(); return;
+        case PF_FPS: anim.fps = (float)(v < 1 ? 1 : v > 240 ? 240 : v); return;
+        case PF_WSTR: wpStr = (float)(v < 0.01 ? 0.01 : v > 1 ? 1 : v); return;
+        case PF_POLEX: case PF_POLEY: case PF_POLEZ: *fld_f(id) = (float)v; rig_update(); return;
         case PF_SOFTR: softRad = (float)(v < 1e-4 ? 1e-4 : v > 1e5 ? 1e5 : v); geo_changed(); return;
         }
         if (id >= PF_IMG) {
@@ -5155,6 +6808,12 @@ static void panel_set(int r, double v)
         case PF_SYMAXIS: sym_set(iv < 0 ? 0 : iv > 3 ? 3 : iv); return;
         case PF_SYMSPACE: symWorld = iv != 0; sym_set(symAxis); return;
         case PF_SOFTON: if ((iv != 0) != softOn) cmd_soft(); return;
+        case PF_WMODE: wpModeSel = iv < 0 ? 0 : iv > 2 ? 2 : iv; return;
+        case PF_ONIONSTEP: onionStep = iv < 1 ? 1 : iv > 100 ? 100 : iv; return;
+        case PF_FRAME: set_frame((float)iv); return;
+        case PF_START: { Clip *c = anim_clip(&anim); c->start = iv >= c->end ? c->end - 1 : iv; set_frame(curFrame); return; }
+        case PF_END: { Clip *c = anim_clip(&anim); c->end = iv <= c->start ? c->start + 1 : iv; set_frame(curFrame); return; }
+        case PF_NODEFORM: case PF_IKORIENT: if (fld_i(id)) *fld_i(id) = iv != 0; rig_update(); return;
         case PF_PREVLV:
             smoothLv = iv < 0 ? 1 : iv > 2 ? 3 : iv + 1;
             reg_set_int("PreviewLevel", smoothLv);
@@ -5174,6 +6833,7 @@ static void panel_commit(int r, double v)
     if (!panel_get(r, &cur) || (rows[r].kind == RK_FLOAT ? fabs(cur - v) < 1e-7 : (int)cur == (int)floor(v + 0.5))) return;
     if (panel_undoable(r)) undo_push(rows[r].label);
     panel_set(r, v);
+    if (rows[r].id <= PF_SZ) { rig_update(); autokey(); }
     refresh_all();
 }
 
@@ -5199,6 +6859,18 @@ static void panel_commit_edit(int r)
 {
     if (building || r >= nrows) return;
     if (rows[r].kind == RK_NAME) { panel_rename(r); return; }
+    if (rows[r].kind == RK_TEXT) {
+        char b[64];
+        Clip *c = anim_clip(&anim);
+        GetWindowTextA(rEdit[r], b, sizeof b);
+        if (b[0] && strcmp(b, c->name)) {
+            undo_push("Rename Clip");
+            snprintf(anim_clip(&anim)->name, sizeof c->name, "%s", b);
+            refresh_all();
+        }
+        row_text(r);
+        return;
+    }
     char b[64];
     GetWindowTextA(rEdit[r], b, sizeof b);
     char *end;
@@ -5243,6 +6915,7 @@ static void scrub_move(int x)
     if (!panel_get(scrub.row, &cur) || cur == v) return;
     if (!scrub.pushed && panel_undoable(scrub.row)) { undo_push(rows[scrub.row].label); scrub.pushed = 1; }
     panel_set(scrub.row, v);
+    rig_update();
     geo_changed();
     panel_sync();
     redraw();
@@ -5729,6 +7402,8 @@ static void ic_arc_arrow(float cx, float cy, float r, float a0, float sweep, DWO
 }
 
 /* an isometric cube centered at (cx, cy); f: fills of top, left, right (0 alpha: none) */
+static DWORD none_c(void) { return 0; }
+
 static void ic_cube(float cx, float cy, float s, DWORD top, DWORD left, DWORD right, DWORD line, float w)
 {
     float T[2] = { cx, cy - s }, UR[2] = { cx + .87f * s, cy - .5f * s }, LR[2] = { cx + .87f * s, cy + .5f * s };
@@ -5754,8 +7429,46 @@ enum {
     IC_CUBE, IC_CYL, IC_SPHERE, IC_PLANE, IC_CONE, IC_TORUS, IC_PIPE,
     IC_EXTRUDE, IC_BEVEL, IC_BRIDGE, IC_MERGE, IC_FILL, IC_MIRROR, IC_SUBDIV, IC_COMBINE, IC_SEPARATE, IC_DUP, IC_DELETE,
     IC_SYM, IC_SOFT, IC_GRID, IC_POINT,
-    IC_WIRE, IC_HARD, IC_SMOOTHS, IC_AUTO, IC_PREVIEW, IC_XRAY, IC_FRAME, IC_UNDO, IC_REDO, IC_ISOLATE
+    IC_WIRE, IC_HARD, IC_SMOOTHS, IC_AUTO, IC_PREVIEW, IC_XRAY, IC_FRAME, IC_UNDO, IC_REDO, IC_ISOLATE,
+    IC_JOINT, IC_BIPED, IC_QUAD, IC_CHAIN, IC_MIRRORJ, IC_PARENT, IC_UNPARENT, IC_PIVOT, IC_PIVOTBASE,
+    IC_BIND, IC_UNBIND, IC_REBIND, IC_WEIGHTS, IC_AUTOW, IC_MIRRORW, IC_IK, IC_REST, IC_SHOWJ,
+    IC_KEY, IC_DELKEY, IC_AUTOKEY, IC_PLAY, IC_ONION, IC_TURNTABLE, IC_MIRRORPOSE, IC_CLIP, IC_EXPORT, IC_EASE
 };
+
+/* a little bone from (x0, y0) to (x1, y1), with a joint ball at each end */
+static void ic_bone(float x0, float y0, float x1, float y1, DWORD fill, DWORD line)
+{
+    float dx = x1 - x0, dy = y1 - y0, l = sqrtf(dx * dx + dy * dy), w = l * .16f;
+    if (l < 1e-3f) return;
+    float nx = -dy / l * w, ny = dx / l * w, mx = x0 + dx * .2f, my = y0 + dy * .2f;
+    float p[8] = { x0, y0, mx + nx, my + ny, x1, y1, mx - nx, my - ny };
+    ic_shape(p, 4, fill, line, 1.2f, 1, 0);
+    ic_ell(x0, y0, 2.4f, 2.4f, fill, line, 1.1f);
+    ic_ell(x1, y1, 1.8f, 1.8f, fill, line, 1.1f);
+}
+
+/* a stick figure; arms out (T) or down */
+static void ic_figure(float cx, DWORD body, DWORD dots, float w)
+{
+    ic_ell(cx, 4.5f, 2.6f, 2.6f, body, body, 1);
+    ic_line(cx, 7.5f, cx, 14, body, w);
+    ic_line(cx - 7, 9.5f, cx + 7, 9.5f, body, w);
+    ic_line(cx, 14, cx - 4.5f, 21, body, w);
+    ic_line(cx, 14, cx + 4.5f, 21, body, w);
+    ic_ell(cx - 7, 9.5f, 1.5f, 1.5f, dots, none_c(), 0);
+    ic_ell(cx + 7, 9.5f, 1.5f, 1.5f, dots, none_c(), 0);
+    ic_ell(cx, 14, 1.6f, 1.6f, dots, none_c(), 0);
+}
+
+/* bands of the weight colors */
+static void ic_heat(float x, float y, float w, float h)
+{
+    static const COLORREF hc[4] = { RGB(30, 60, 200), RGB(40, 200, 90), RGB(250, 220, 40), RGB(235, 60, 40) };
+    for (int i = 0; i < 4; i++) {
+        float q[8] = { x + w * i / 4, y, x + w * (i + 1) / 4, y, x + w * (i + 1) / 4, y + h, x + w * i / 4, y + h };
+        ic_shape(q, 4, ARGB_OF(255, hc[i]), 0, 0, 1, 0);
+    }
+}
 
 /* draws icon id with its top left corner at (x, y), size px */
 static void draw_icon(int id, float x, float y, float px)
@@ -6074,6 +7787,162 @@ static void draw_icon(int id, float x, float y, float px)
     case IC_REDO:
         ic_arc_arrow(12, 13, 7, 150, 250, fg, 2);
         break;
+    case IC_JOINT:
+        ic_bone(5.5f, 18.5f, 18.5f, 5.5f, so, fg);
+        ic_ell(5.5f, 18.5f, 2.4f, 2.4f, ac, fg, 1.1f);
+        break;
+    case IC_BIPED: ic_figure(12, fg, ac, 1.8f); break;
+    case IC_QUAD:
+        ic_line(5, 11, 17, 11, fg, 2);
+        ic_ell(19.5f, 8, 2.6f, 2.4f, so, fg, 1.2f);
+        ic_line(5, 11, 2, 7.5f, fg, 1.5f);
+        ic_line(6, 11, 6, 19.5f, fg, 1.8f); ic_line(9, 11, 9.5f, 19.5f, fg, 1.8f);
+        ic_line(15, 11, 14.5f, 19.5f, fg, 1.8f); ic_line(17.5f, 11, 18, 19.5f, fg, 1.8f);
+        ic_ell(5, 11, 1.5f, 1.5f, ac, none, 0); ic_ell(17, 11, 1.5f, 1.5f, ac, none, 0);
+        break;
+    case IC_CHAIN:
+        ic_bone(4, 19, 9, 13, so, fg);
+        ic_bone(9, 13, 15, 9, so, fg);
+        ic_bone(15, 9, 20, 4, ac, fg);
+        break;
+    case IC_MIRRORJ:
+        ic_bone(10, 4, 4, 19, ac, fg);
+        ic_bone(14, 4, 20, 19, ARGB_OF(120, rgb_of(so)), ARGB_OF(150, rgb_of(fg)));
+        ic_dline(12, 1.5f, 12, 22.5f, fg, 1);
+        break;
+    case IC_PARENT:
+        ic_line(12, 6, 6, 17, fg, 1.4f); ic_line(12, 6, 18, 17, fg, 1.4f);
+        ic_ell(12, 6, 3.2f, 3.2f, ac, fg, 1.2f);
+        ic_ell(6, 18, 2.6f, 2.6f, so, fg, 1.2f); ic_ell(18, 18, 2.6f, 2.6f, so, fg, 1.2f);
+        break;
+    case IC_UNPARENT:
+        ic_dline(12, 6, 7, 15, fg, 1.2f);
+        ic_ell(12, 6, 3.2f, 3.2f, so, fg, 1.2f);
+        ic_ell(6, 18, 2.6f, 2.6f, ac, fg, 1.2f);
+        ic_line(14, 13, 20, 19, fg, 1.6f); ic_line(20, 13, 14, 19, fg, 1.6f);
+        break;
+    case IC_PIVOT:
+        ic_ell(12, 12, 7, 7, none, fg, 1.2f);
+        ic_line(12, 3, 12, 21, fg, 1); ic_line(3, 12, 21, 12, fg, 1);
+        ic_ell(12, 12, 3, 3, ac, fg, 1.2f);
+        break;
+    case IC_PIVOTBASE:
+        ic_cube(12, 10, 6.5f, so, mid, dark, fg, 1.2f);
+        ic_line(3, 20.5f, 21, 20.5f, fg, 1.3f);
+        ic_ell(12, 20.5f, 2.4f, 2.4f, ac, fg, 1);
+        break;
+    case IC_BIND: {
+        float q[] = { 4, 6, 20, 6, 21, 18, 3, 18 };
+        ic_shape(q, 4, so, fg, 1.3f, 1, 0);
+        ic_bone(7, 15, 17, 9, ac, fg);
+        break;
+    }
+    case IC_UNBIND: {
+        float q[] = { 3, 6, 15, 6, 16, 18, 2, 18 };
+        ic_shape(q, 4, so, fg, 1.3f, 1, 0);
+        ic_bone(13, 15, 21, 8, ARGB_OF(150, rgb_of(ac)), fg);
+        break;
+    }
+    case IC_REBIND:
+        ic_bone(6, 17, 15, 9, ac, fg);
+        ic_arc_arrow(14, 12, 7, 300, 230, fg, 1.4f);
+        break;
+    case IC_WEIGHTS:
+        ic_heat(3, 13, 18, 7);
+        ic_line(20, 2.5f, 13.5f, 9, fg, 2.4f);
+        ic_ell(12.5f, 10, 2.6f, 2.2f, ac, fg, 1);
+        break;
+    case IC_AUTOW: {
+        ic_heat(3, 14, 18, 6);
+        ic_line(5, 11, 14, 4, fg, 2);
+        float s1[] = { 18, 2, 19, 5, 22, 6, 19, 7, 18, 10, 17, 7, 14, 6, 17, 5 };
+        ic_shape(s1, 8, ac, none, 0, 1, 0);
+        break;
+    }
+    case IC_MIRRORW:
+        ic_heat(2, 6, 9, 12);
+        ic_shape((const float[]){ 13, 6, 22, 6, 22, 18, 13, 18 }, 4, none, fg, 1.1f, 1, 1);
+        ic_dline(12, 2, 12, 22, fg, 1);
+        break;
+    case IC_IK:
+        ic_line(6, 4, 14, 11, fg, 1.8f); ic_line(14, 11, 8, 19, fg, 1.8f);
+        ic_ell(6, 4, 2, 2, so, fg, 1); ic_ell(14, 11, 2, 2, so, fg, 1);
+        ic_ell(8, 19, 4, 4, none, ac, 1.6f);
+        ic_line(8, 13, 8, 23, ac, 1.4f); ic_line(2, 19, 14, 19, ac, 1.4f);
+        break;
+    case IC_REST:
+        ic_figure(10, fg, ac, 1.6f);
+        ic_arc_arrow(18, 16, 4, 200, 260, ac, 1.4f);
+        break;
+    case IC_SHOWJ:
+        ic_bone(5, 19, 13, 9, so, fg);
+        ic_ell(17, 8, 5.5f, 3.4f, none, fg, 1.2f);
+        ic_ell(17, 8, 1.8f, 1.8f, ac, none, 0);
+        break;
+    case IC_KEY: {
+        float d[] = { 12, 3, 21, 12, 12, 21, 3, 12 };
+        ic_shape(d, 4, ac, fg, 1.4f, 1, 0);
+        break;
+    }
+    case IC_DELKEY: {
+        float d[] = { 12, 3, 21, 12, 12, 21, 3, 12 };
+        ic_shape(d, 4, so, fg, 1.4f, 1, 0);
+        ic_line(8.5f, 8.5f, 15.5f, 15.5f, fg, 1.8f); ic_line(15.5f, 8.5f, 8.5f, 15.5f, fg, 1.8f);
+        break;
+    }
+    case IC_AUTOKEY: {
+        float d[] = { 10, 4, 18, 12, 10, 20, 2, 12 };
+        ic_shape(d, 4, so, fg, 1.4f, 1, 0);
+        ic_ell(18, 17, 4, 4, ARGB_OF(255, RGB(230, 50, 50)), fg, 1);
+        break;
+    }
+    case IC_PLAY: {
+        float t[] = { 7, 4, 20, 12, 7, 20 };
+        ic_shape(t, 3, ac, fg, 1.4f, 1, 0);
+        break;
+    }
+    case IC_ONION:
+        ic_ell(7, 12, 5, 5, ARGB_OF(70, rgb_of(ac)), ARGB_OF(110, rgb_of(fg)), 1);
+        ic_ell(12, 12, 5, 5, ARGB_OF(130, rgb_of(ac)), ARGB_OF(170, rgb_of(fg)), 1);
+        ic_ell(17, 12, 5, 5, ac, fg, 1.2f);
+        break;
+    case IC_TURNTABLE:
+        ic_ell(12, 18, 9, 3, so, fg, 1.2f);
+        ic_cube(12, 10, 5, so, mid, dark, fg, 1);
+        ic_arc_arrow(12, 18, 10.5f, 200, 140, ac, 1.4f);
+        break;
+    case IC_MIRRORPOSE:
+        ic_ell(7, 5, 2.2f, 2.2f, fg, fg, 1);
+        ic_line(7, 7.5f, 7, 14, fg, 1.6f); ic_line(7, 9, 2, 5, fg, 1.6f); ic_line(7, 9, 11, 12, fg, 1.6f);
+        ic_line(7, 14, 4, 21, fg, 1.6f); ic_line(7, 14, 10, 21, fg, 1.6f);
+        ic_ell(17, 5, 2.2f, 2.2f, ac, ac, 1);
+        ic_line(17, 7.5f, 17, 14, ac, 1.6f); ic_line(17, 9, 22, 5, ac, 1.6f); ic_line(17, 9, 13, 12, ac, 1.6f);
+        ic_line(17, 14, 20, 21, ac, 1.6f); ic_line(17, 14, 14, 21, ac, 1.6f);
+        ic_dline(12, 1.5f, 12, 22.5f, fg, 1);
+        break;
+    case IC_CLIP: {
+        float q[] = { 3, 6, 21, 6, 21, 18, 3, 18 };
+        ic_shape(q, 4, so, fg, 1.3f, 1, 0);
+        for (int i = 0; i < 4; i++) { ic_ell(5.5f + i * 4.3f, 8, .9f, .9f, fg, none, 0); ic_ell(5.5f + i * 4.3f, 16, .9f, .9f, fg, none, 0); }
+        float t[] = { 10, 9.5f, 15, 12, 10, 14.5f };
+        ic_shape(t, 3, ac, none, 0, 1, 0);
+        break;
+    }
+    case IC_EXPORT: {
+        float q[] = { 3, 9, 14, 9, 14, 21, 3, 21 };
+        ic_shape(q, 4, so, fg, 1.3f, 1, 0);
+        ic_line(9, 15, 19, 5, ac, 2);
+        ic_head(20, 4, 1, -1, 3, ac);
+        break;
+    }
+    case IC_EASE:
+        ic_line(3, 21, 21, 21, fg, 1); ic_line(3, 21, 3, 3, fg, 1);
+        {
+            float c[2 * 13];
+            for (int i = 0; i <= 12; i++) { float u = i / 12.0f, e = u * u * (3 - 2 * u); c[2 * i] = 4 + u * 16; c[2 * i + 1] = 20 - e * 15; }
+            ic_shape(c, 13, none, ac, 2, 0, 0);
+        }
+        break;
     case IC_ISOLATE: {
         float eye[2 * 26];
         for (int i = 0; i <= 12; i++) { float t = PI_F * i / 12; eye[2 * i] = 12 - 10 * cosf(t); eye[2 * i + 1] = 12 - 6 * sinf(t); }
@@ -6148,7 +8017,7 @@ static const Tool boxItems[] = {
     { "Face", "F11", CM_MFACE, "Face mode (double-click: face loop, Ctrl+F11 converts)", IC_FACE },
     { "Multi", "F7", CM_MMULTI, "Multi mode: vertices, edges and faces at once", IC_MULTI },
 };
-static const Tool shelfItems[] = {
+static const Tool shelfModel[] = {
     { "Cube", "", CM_CUBE, "Make a cube (set its size and divisions in the side panel)", IC_CUBE },
     { "Sphere", "", CM_SPHERE, "Make a sphere (sides, rings and radius in the side panel)", IC_SPHERE },
     { "Cylinder", "", CM_CYL, "Make a cylinder (sides, radius, height and caps in the side panel)", IC_CYL },
@@ -6183,15 +8052,68 @@ static const Tool shelfItems[] = {
     { "Redo", "Shift+Z", CM_REDO, "Redo", IC_REDO },
 };
 
+static const Tool shelfRig[] = {
+    { "Joint", "", CM_TJOINT, "Joint tool: click to place a chain of joints (on a mesh they go inside it); Enter ends the chain", IC_JOINT },
+    { "Biped", "", CM_RIGBIPED, "Make a two-legged skeleton sized to the selected mesh (Roblox R15 names), ready to fit and bind", IC_BIPED },
+    { "Quadruped", "", CM_RIGQUAD, "Make a four-legged skeleton sized to the selected mesh", IC_QUAD },
+    { "Chain", "", CM_RIGCHAIN, "Make a chain of four joints along the selected mesh, to bend and wiggle it", IC_CHAIN },
+    { "Mirror", "", CM_MIRRORJOINTS, "Copy the selected joint chain to the other side (Left <-> Right names)", IC_MIRRORJ }, { 0 },
+    { "Parent", "P", CM_PARENT, "Parent: the selected objects follow the one selected last", IC_PARENT },
+    { "Unparent", "", CM_UNPARENT, "Unparent the selected objects (Shift+P)", IC_UNPARENT },
+    { "Pivot", "D", CM_PIVOT, "Edit Pivot: move the pivot alone (a joint alone, without its children); D again finishes", IC_PIVOT },
+    { "To Base", "", CM_PIVOTBASE, "Put the pivot at the bottom center, so the model stands on the floor in a game engine", IC_PIVOTBASE }, { 0 },
+    { "Bind", "", CM_BIND, "Bind Skin: select the mesh(es) and a joint, and the mesh follows the skeleton (automatic weights)", IC_BIND },
+    { "Weights", "", CM_TWEIGHT, "Paint Weights tool: click a joint, then paint how much it moves the mesh (Ctrl removes, Shift smooths)", IC_WEIGHTS },
+    { "Auto", "", CM_AUTOWEIGHTS, "Redo the selected bound mesh's weights automatically", IC_AUTOW },
+    { "Mirror Wts", "", CM_MIRRORWEIGHTS, "Copy the weights from one side to the other (Left <-> Right joints)", IC_MIRRORW },
+    { "Rebind", "", CM_REBIND, "Make the joints as they stand the rest pose (after moving joints of a bound skeleton)", IC_REBIND },
+    { "Unbind", "", CM_UNBIND, "Unbind the selected mesh: it keeps its rest shape", IC_UNBIND }, { 0 },
+    { "IK", "", CM_ADDIK, "Add an IK handle to the selected hand or foot joint: drag it and the limb bends to reach", IC_IK },
+    { "Rest Pose", "", CM_RESTPOSE, "Put every bound skeleton back the way it was bound", IC_REST },
+    { "Joints", "", CM_SHOWJOINTS, "Show or hide the joints", IC_SHOWJ },
+    { "Symmetry", "S", CM_SYMTOG, "Symmetry: moving a Left joint moves the Right one too, painting weights paints both sides", IC_SYM }, { 0 },
+    { "Undo", "Z", CM_UNDO, "Undo the last change", IC_UNDO },
+    { "Redo", "Shift+Z", CM_REDO, "Redo", IC_REDO },
+};
+static const Tool shelfAnim[] = {
+    { "Key", "K", CM_KEY, "Set a key: the selected objects / joints remember where they are on this frame", IC_KEY },
+    { "Del Key", "", CM_DELKEY, "Delete the selected objects' keys on this frame (Shift+K)", IC_DELKEY },
+    { "Auto Key", "", CM_AUTOKEY, "Auto Key: moving anything that has keys sets a key on this frame by itself", IC_AUTOKEY }, { 0 },
+    { "Play", "Space", CM_PLAY, "Play or stop (Left / Right step frames, Shift+Left / Right jump between keys)", IC_PLAY },
+    { "Onion", "", CM_ONION, "Onion skin: faint ghosts of the poses before and after this frame", IC_ONION }, { 0 },
+    { "Smooth", "", CM_EASESMOOTH, "Ease in and out from the keys on this frame (the default)", IC_EASE },
+    { "Linear", "", CM_EASELINEAR, "Move at an even speed from the keys on this frame", IC_EASE },
+    { "Step", "", CM_EASESTEP, "Hold still until the next key (snappy, stop motion)", IC_EASE }, { 0 },
+    { "Mirror Pose", "", CM_MIRRORPOSE, "Copy the selected joints' pose to their Left / Right partners", IC_MIRRORPOSE },
+    { "Turntable", "", CM_TURNTABLE, "Make a turntable clip: the selected objects spin once around", IC_TURNTABLE },
+    { "New Clip", "", CM_NEWCLIP, "Start a new animation clip (Idle, Walk, Run... each exports as its own animation)", IC_CLIP }, { 0 },
+    { "Export", "Ctrl+Shift+E", CM_EXPORTGLB, "Export glTF (.glb) for Godot, Roblox Studio, Blender...: meshes, bones, weights and every clip", IC_EXPORT }, { 0 },
+    { "Undo", "Z", CM_UNDO, "Undo the last change", IC_UNDO },
+    { "Redo", "Shift+Z", CM_REDO, "Redo", IC_REDO },
+};
+
 #define NBOX ((int)(sizeof boxItems / sizeof *boxItems))
-#define NSHELF ((int)(sizeof shelfItems / sizeof *shelfItems))
-typedef struct { const Tool *it; int n, vert, hover, down; RECT rc[48]; HWND h; } Bar;
-static Bar box = { boxItems, NBOX, 1, -1, -1, { { 0 } }, NULL }, shelf = { shelfItems, NSHELF, 0, -1, -1, { { 0 } }, NULL };
+#define NOF(a) ((int)(sizeof a / sizeof *a))
+typedef struct { const Tool *it; int n, vert, hover, down; RECT rc[48]; HWND h; int tab, tabHover; RECT tabRc[3]; } Bar;
+static const Tool *const shelfSets[3] = { shelfModel, shelfRig, shelfAnim };
+static const int shelfCounts[3] = { NOF(shelfModel), NOF(shelfRig), NOF(shelfAnim) };
+static const char *const shelfTabs[3] = { "Model", "Rig", "Animate" };
+static Bar box = { boxItems, NBOX, 1, -1, -1, { { 0 } }, NULL, -1, -1, { { 0 } } };
+static Bar shelf = { shelfModel, NOF(shelfModel), 0, -1, -1, { { 0 } }, NULL, 0, -1, { { 0 } } };
+
+static void shelf_tab(int t)
+{
+    shelf.tab = t < 0 || t > 2 ? 0 : t;
+    shelf.it = shelfSets[shelf.tab];
+    shelf.n = shelfCounts[shelf.tab];
+    shelf.hover = shelf.down = -1;
+    reg_set_int("ShelfTab", shelf.tab);
+}
 static const char *barTip;   /* the hovered button's description, for the status line */
 
 static int tb_on(int cmd)
 {
-    if (cmd >= CM_TSEL && cmd < CM_TSEL + NTOOL) return tool == cmd - CM_TSEL;
+    if (cmd_tool(cmd) >= 0) return tool == cmd_tool(cmd);
     if (cmd >= CM_HARD && cmd <= CM_AUTOSMOOTH) {
         Obj *l = lead();
         float a = l ? l->nangle : defAngle;
@@ -6209,6 +8131,11 @@ static int tb_on(int cmd)
     case CM_XRAY: return xray;
     case CM_ISOLATE: return isolateOn;
     case CM_PREVTOG: { Obj *l = lead(); return l && l->smooth; }
+    case CM_SHOWJOINTS: return showJoints;
+    case CM_PIVOT: return pivotMode;
+    case CM_AUTOKEY: return autoKey;
+    case CM_PLAY: return playing;
+    case CM_ONION: return onion;
     }
     return 0;
 }
@@ -6275,6 +8202,8 @@ static int bar_layout(Bar *b, int L)
         }
         extent = pad + cols * (colw + 2) + pad;
     } else {
+        int tabw = b->tab >= 0 ? (int)(78 * ds) : 0, x0 = pad + tabw + (tabw ? gap : 0);
+        x = x0;
         for (int i = 0; i < b->n; i++) {
             if (!b->it[i].label) {
                 x += gap;
@@ -6288,10 +8217,17 @@ static int bar_layout(Bar *b, int L)
             int w = a.cx + (int)(16 * ds), bw = badge_w(dc, &b->it[i]);
             if (w < ip + (int)(22 * ds)) w = ip + (int)(22 * ds);
             if (bw && w < ip + 2 * (bw + (int)(5 * ds))) w = ip + 2 * (bw + (int)(5 * ds));
-            if (x + w > L - pad && x > pad) { x = pad; y += bh + 2; }
+            if (x + w > L - pad && x > x0) { x = x0; y += bh + 2; }
             SetRect(&b->rc[i], x, y, x + w, y + bh);
             x += w + 2;
             extent = y + bh + pad + 1;
+        }
+        if (tabw) {
+            /* the tabs stack down the left side; at least room for all three */
+            int th3 = (int)(30 * ds);
+            if (extent < pad * 2 + 3 * th3 + 4) extent = pad * 2 + 3 * th3 + 4;
+            int h3 = (extent - 2 * pad - 4) / 3;
+            for (int t = 0; t < 3; t++) SetRect(&b->tabRc[t], pad, pad + t * (h3 + 2), pad + tabw, pad + t * (h3 + 2) + h3);
         }
     }
     ReleaseDC(hMain, dc);
@@ -6407,6 +8343,22 @@ static void bar_paint(Bar *bar)
     ic.acc = ARGB_OF(255, acc);
     ic.soft = ARGB_OF(255, lerpc(th.ui, acc, .3f));
     ic.bg = ARGB_OF(255, th.ui);
+    if (bar->tab >= 0) {
+        for (int t = 0; t < 3; t++) {
+            RECT r = bar->tabRc[t];
+            int on = t == bar->tab;
+            rrect(dc, r, (int)(7 * ds), on ? lerpc(th.ui, acc, .3f) : t == bar->tabHover ? th.hot : th.ui, on ? acc : th.line);
+            if (on) {
+                RECT u = { r.left + (int)(3 * ds), r.top + (int)(6 * ds), r.left + (int)(6 * ds), r.bottom - (int)(6 * ds) };
+                rrect(dc, u, (int)(1 * ds), acc, acc);
+            }
+            SelectObject(dc, on ? hBold : hFont);
+            SetTextColor(dc, on ? th.text : mix(th.text, th.ui));
+            DrawTextA(dc, shelfTabs[t], -1, &r, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+        }
+        RECT sl = { bar->tabRc[0].right + (int)(4 * ds), (int)(6 * ds), bar->tabRc[0].right + (int)(5 * ds), rc.bottom - (int)(6 * ds) };
+        FillRect(dc, &sl, brLine);
+    }
     /* separators: a faint line */
     for (int i = 1; i < bar->n; i++) {
         if (bar->it[i].label || !bar->it[i - 1].label) continue;
@@ -6495,7 +8447,19 @@ static LRESULT CALLBACK BarProc(HWND h, UINT m, WPARAM wp, LPARAM lp)
     case WM_PAINT: bar_paint(b); return 0;
     case WM_ERASEBKGND: return 1;
     case WM_MOUSEMOVE: {
-        int i = bar_hit(b, x, y);
+        int i = bar_hit(b, x, y), th_ = -1;
+        POINT pt = { x, y };
+        for (int t = 0; t < 3 && b->tab >= 0; t++) if (PtInRect(&b->tabRc[t], pt)) th_ = t;
+        if (th_ != b->tabHover) {
+            static const char *tips[3] = { "Model: shapes, mesh tools, symmetry and display", "Rig: joints, skeletons, binding, weights and IK",
+                                           "Animate: keys, playback, clips and export to game engines" };
+            b->tabHover = th_;
+            barTip = th_ >= 0 ? tips[th_] : NULL;
+            status_text();
+            InvalidateRect(h, NULL, FALSE);
+            TRACKMOUSEEVENT tme = { sizeof tme, TME_LEAVE, h, 0 };
+            TrackMouseEvent(&tme);
+        }
         if (i != b->hover) {
             int wasTip = hTip && IsWindowVisible(hTip);
             b->hover = i;
@@ -6515,6 +8479,7 @@ static LRESULT CALLBACK BarProc(HWND h, UINT m, WPARAM wp, LPARAM lp)
         return 0;
     case WM_MOUSELEAVE:
         b->hover = -1;
+        b->tabHover = -1;
         barTip = NULL;
         tip_hide();
         KillTimer(h, 7);
@@ -6523,6 +8488,14 @@ static LRESULT CALLBACK BarProc(HWND h, UINT m, WPARAM wp, LPARAM lp)
         return 0;
     case WM_LBUTTONDOWN:
         tip_hide();
+        if (b->tabHover >= 0) {
+            shelf_tab(b->tabHover);
+            RECT rc;
+            GetClientRect(hMain, &rc);
+            SendMessage(hMain, WM_SIZE, 0, MAKELPARAM(rc.right, rc.bottom));
+            InvalidateRect(h, NULL, FALSE);
+            return 0;
+        }
         b->down = bar_hit(b, x, y);
         SetCapture(h);
         InvalidateRect(h, NULL, FALSE);
@@ -6546,6 +8519,299 @@ static LRESULT CALLBACK BarProc(HWND h, UINT m, WPARAM wp, LPARAM lp)
     return DefWindowProc(h, m, wp, lp);
 }
 
+/* ================================================================ timeline
+
+   Under the viewport: play controls, a ruler to scrub (key diamonds show the selected objects'
+   keys; drag one to retime it, right-click for more), and the clip and Auto Key buttons. */
+
+static HWND hTime;
+static struct { int x0, x1, btn, drag, dragF, hot; RECT b[5], clip, autok; } tl = { 0, 0, 5, 0, 0, -1, { { 0 } }, { 0 }, { 0 } };
+enum { TL_NONE, TL_SCRUB, TL_KEY };
+
+static void timeline_sync(void)
+{
+    if (hTime) InvalidateRect(hTime, NULL, FALSE);
+    panel_sync();
+}
+
+static void tl_layout(int W, int H)
+{
+    int b = (int)(30 * ds), pad = (int)(6 * ds), y = (H - b) / 2;
+    for (int i = 0; i < 5; i++) SetRect(&tl.b[i], pad + i * (b + 2), y, pad + i * (b + 2) + b, y + b);
+    int cw = (int)(150 * ds), aw = (int)(64 * ds);
+    SetRect(&tl.autok, W - pad - aw, y, W - pad, y + b);
+    SetRect(&tl.clip, tl.autok.left - 6 - cw, y, tl.autok.left - 6, y + b);
+    tl.x0 = tl.b[4].right + (int)(18 * ds);
+    tl.x1 = tl.clip.left - (int)(18 * ds);
+}
+
+static float tl_frame_at(int x)
+{
+    Clip *c = anim_clip(&anim);
+    float u = (float)(x - tl.x0) / (tl.x1 > tl.x0 ? tl.x1 - tl.x0 : 1);
+    return roundf(c->start + u * (c->end - c->start));
+}
+
+static float tl_x(float f)
+{
+    Clip *c = anim_clip(&anim);
+    return tl.x0 + (f - c->start) / (c->end > c->start ? c->end - c->start : 1) * (tl.x1 - tl.x0);
+}
+
+/* the tracks the timeline shows: the selected objects', or everyone's when nothing is selected */
+static int tl_shows(const Track *t)
+{
+    int any = 0, o = obj_index(t->obj);
+    for (int i = 0; i < nob; i++) any |= active(&ob[i]);
+    return !any || (o >= 0 && active(&ob[o]));
+}
+
+/* the key frame nearest to x (within a few pixels) or -1e9 */
+static float tl_key_at(int x)
+{
+    Clip *c = anim_clip(&anim);
+    float best = 7 * ds, f = -1e9f;
+    for (int i = 0; i < c->nt; i++) {
+        if (!tl_shows(&c->t[i])) continue;
+        for (int k = 0; k < c->t[i].n; k++) {
+            float d = fabsf(tl_x(c->t[i].k[k].f) - x);
+            if (d < best) { best = d; f = c->t[i].k[k].f; }
+        }
+    }
+    return f;
+}
+
+static void tl_paint(HWND h)
+{
+    PAINTSTRUCT p;
+    RECT rc;
+    HDC wdc = BeginPaint(h, &p);
+    GetClientRect(h, &rc);
+    tl_layout(rc.right, rc.bottom);
+    HDC dc = CreateCompatibleDC(wdc);
+    HBITMAP bm = CreateCompatibleBitmap(wdc, rc.right, rc.bottom), old = SelectObject(dc, bm);
+    FillRect(dc, &rc, brUi);
+    RECT ln = rc;
+    ln.bottom = 1;
+    FillRect(dc, &ln, brLine);
+    SetBkMode(dc, TRANSPARENT);
+    COLORREF acc = th.sys ? GetSysColor(COLOR_HIGHLIGHT) : th.head;
+    Clip *c = anim_clip(&anim);
+    /* transport buttons */
+    ic.fg = ARGB_OF(255, th.text);
+    ic.acc = ARGB_OF(255, acc);
+    for (int i = 0; i < 5; i++) {
+        RECT r = tl.b[i];
+        int on = i == 2 && playing;
+        if (on || i == tl.hot) rrect(dc, r, (int)(6 * ds), on ? lerpc(th.ui, acc, .3f) : th.hot, th.line);
+        ic_begin(dc);
+        ic.x = (float)r.left; ic.y = (float)r.top; ic.k = (r.right - r.left) / 24.0f;
+        DWORD fg = ic.fg, ac = ic.acc;
+        switch (i) {
+        case 0: { float t[] = { 17, 7, 9, 12, 17, 17 }; ic_shape(t, 3, fg, fg, 1, 1, 0); ic_line(7.5f, 7, 7.5f, 17, fg, 2); break; }
+        case 1: { float t[] = { 15, 7, 9, 12, 15, 17 }; ic_shape(t, 3, fg, fg, 1, 1, 0); float d[] = { 18, 9.5f, 20.5f, 12, 18, 14.5f, 15.5f, 12 }; ic_shape(d, 4, ac, fg, 1, 1, 0); break; }
+        case 2: if (playing) { float q[] = { 8, 7, 16, 7, 16, 17, 8, 17 }; ic_shape(q, 4, ac, fg, 1, 1, 0); }
+                else { float t[] = { 8.5f, 6, 18, 12, 8.5f, 18 }; ic_shape(t, 3, ac, fg, 1.2f, 1, 0); }
+                break;
+        case 3: { float t[] = { 9, 7, 15, 12, 9, 17 }; ic_shape(t, 3, fg, fg, 1, 1, 0); float d[] = { 6, 9.5f, 8.5f, 12, 6, 14.5f, 3.5f, 12 }; ic_shape(d, 4, ac, fg, 1, 1, 0); break; }
+        case 4: { float t[] = { 7, 7, 15, 12, 7, 17 }; ic_shape(t, 3, fg, fg, 1, 1, 0); ic_line(16.5f, 7, 16.5f, 17, fg, 2); break; }
+        }
+        ic_end();
+    }
+    /* ruler */
+    int top = (int)(8 * ds), bot = rc.bottom - (int)(8 * ds);
+    RECT bar = { tl.x0 - (int)(8 * ds), top, tl.x1 + (int)(8 * ds), bot };
+    rrect(dc, bar, (int)(6 * ds), th.field, th.line);
+    int span = c->end - c->start, step = 1;
+    float px = span ? (float)(tl.x1 - tl.x0) / span : 1;
+    static const int steps[] = { 1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 2000, 5000 };
+    for (int k = 0; k < 12; k++) { step = steps[k]; if (step * px >= 7 * ds) break; }
+    int major = step * 5;
+    HPEN tick = CreatePen(PS_SOLID, 1, mix(th.fieldText, th.field)), oldp = SelectObject(dc, tick);
+    SelectObject(dc, hSmall);
+    SetTextColor(dc, mix(th.fieldText, th.field));
+    for (int f = c->start; f <= c->end; f++) {
+        if ((f - c->start) % step) continue;
+        int x = (int)tl_x((float)f), mj = (f - c->start) % major == 0 || f == c->end;
+        MoveToEx(dc, x, bot - (int)((mj ? 9 : 5) * ds), NULL);
+        LineTo(dc, x, bot - (int)(2 * ds));
+        if (mj) {
+            char b[16];
+            snprintf(b, sizeof b, "%d", f);
+            RECT tr = { x - 30, top + (int)(2 * ds), x + 30, bot - (int)(10 * ds) };
+            DrawTextA(dc, b, -1, &tr, DT_CENTER | DT_TOP | DT_SINGLELINE | DT_NOPREFIX);
+        }
+    }
+    SelectObject(dc, oldp);
+    DeleteObject(tick);
+    /* keys */
+    ic_begin(dc);
+    ic.x = 0; ic.y = 0; ic.k = 1;
+    for (int i = 0; i < c->nt; i++) {
+        if (!tl_shows(&c->t[i])) continue;
+        for (int k = 0; k < c->t[i].n; k++) {
+            float f = c->t[i].k[k].f;
+            if (tl.drag == TL_KEY && fabsf(f - tl.dragF) < .5f) f = tl_frame_at(tl.btn);   /* being dragged */
+            float x = tl_x(f), y = (top + bot) * .5f + 4 * ds, r = 5.5f * ds;
+            int here = fabsf(f - curFrame) < .5f, e = c->t[i].k[k].ease;
+            float d[] = { x, y - r, x + r, y, x, y + r, x - r, y };
+            DWORD col = here ? ARGB_OF(255, RGB(255, 80, 60)) : e == EASE_STEP ? ARGB_OF(255, RGB(120, 160, 255)) : e == EASE_LINEAR ? ARGB_OF(255, RGB(120, 220, 140)) : ARGB_OF(255, RGB(250, 200, 40));
+            ic_shape(d, 4, col, ARGB_OF(255, RGB(40, 40, 40)), 1, 1, 0);
+        }
+    }
+    ic_end();
+    /* the current frame */
+    {
+        int x = (int)tl_x(curFrame);
+        RECT cl = { x - (int)(1 * ds), top, x + (int)(1 * ds) + 1, bot };
+        HBRUSH ab = CreateSolidBrush(acc);
+        FillRect(dc, &cl, ab);
+        DeleteObject(ab);
+        char b[24];
+        snprintf(b, sizeof b, "%g", curFrame);
+        SIZE z;
+        SelectObject(dc, hBold);
+        GetTextExtentPoint32A(dc, b, (int)strlen(b), &z);
+        RECT bub = { x - z.cx / 2 - (int)(5 * ds), top - (int)(1 * ds), x + z.cx / 2 + (int)(5 * ds), top + z.cy };
+        rrect(dc, bub, (int)(5 * ds), acc, acc);
+        SetTextColor(dc, th.sys || th.dark ? RGB(255, 255, 255) : th.ui);
+        DrawTextA(dc, b, -1, &bub, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+    }
+    /* clip and auto key */
+    char b[64];
+    snprintf(b, sizeof b, "%s  (%d-%d)", c->name, c->start, c->end);
+    rrect(dc, tl.clip, (int)(6 * ds), tl.hot == 5 ? th.hot : th.field, th.line);
+    RECT tr = tl.clip;
+    tr.left += (int)(8 * ds);
+    tr.right -= (int)(16 * ds);
+    SelectObject(dc, hFont);
+    SetTextColor(dc, th.fieldText);
+    DrawTextA(dc, b, -1, &tr, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
+    ic_begin(dc);
+    ic.x = (float)tl.clip.right - 18 * ds; ic.y = (float)(tl.clip.top + tl.clip.bottom) / 2 - 3 * ds; ic.k = ds;
+    { float t[] = { 0, 0, 10, 0, 5, 6 }; ic_shape(t, 3, ARGB_OF(255, th.fieldText), 0, 0, 1, 0); }
+    ic_end();
+    rrect(dc, tl.autok, (int)(6 * ds), autoKey ? RGB(200, 45, 45) : tl.hot == 6 ? th.hot : th.ui, autoKey ? RGB(120, 20, 20) : th.line);
+    SetTextColor(dc, autoKey ? RGB(255, 255, 255) : th.text);
+    SelectObject(dc, hBold);
+    DrawTextA(dc, "Auto Key", -1, &tl.autok, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+    BitBlt(wdc, 0, 0, rc.right, rc.bottom, dc, 0, 0, SRCCOPY);
+    SelectObject(dc, old);
+    DeleteObject(bm);
+    DeleteDC(dc);
+    EndPaint(h, &p);
+}
+
+static void tl_clip_menu(void)
+{
+    HMENU m = CreatePopupMenu();
+    for (int i = 0; i < anim.n && i < 100; i++)
+        AppendMenuA(m, MF_STRING | (i == anim.cur ? MF_CHECKED : 0), CM_CLIP + i, anim.c[i].name);
+    AppendMenuA(m, MF_SEPARATOR, 0, NULL);
+    AppendMenuA(m, MF_STRING, CM_NEWCLIP, "&New Clip");
+    AppendMenuA(m, MF_STRING, CM_TURNTABLE, "New &Turntable Clip");
+    AppendMenuA(m, MF_STRING, CM_RENAMECLIP, "&Rename / Length (side panel)");
+    AppendMenuA(m, MF_STRING | (anim.n < 2 ? MF_GRAYED : 0), CM_DELCLIP, "&Delete This Clip");
+    POINT pt = { tl.clip.left, tl.clip.top };
+    ClientToScreen(hTime, &pt);
+    int c = TrackPopupMenu(m, TPM_RETURNCMD | TPM_BOTTOMALIGN, pt.x, pt.y, 0, hTime, NULL);
+    DestroyMenu(m);
+    if (c) do_cmd(c);
+}
+
+static LRESULT CALLBACK TimeProc(HWND h, UINT m, WPARAM wp, LPARAM lp)
+{
+    int x = (short)LOWORD(lp), y = (short)HIWORD(lp);
+    POINT pt = { x, y };
+    switch (m) {
+    case WM_PAINT: tl_paint(h); return 0;
+    case WM_ERASEBKGND: return 1;
+    case WM_MOUSEMOVE: {
+        if (tl.drag == TL_SCRUB) { set_frame(tl_frame_at(x)); return 0; }
+        if (tl.drag == TL_KEY) { tl.btn = x; InvalidateRect(h, NULL, FALSE); return 0; }
+        int hot = -1;
+        for (int i = 0; i < 5; i++) if (PtInRect(&tl.b[i], pt)) hot = i;
+        if (PtInRect(&tl.clip, pt)) hot = 5;
+        if (PtInRect(&tl.autok, pt)) hot = 6;
+        if (hot != tl.hot) {
+            static const char *tips[7] = { "First frame (Ctrl+Left)", "Previous key (Shift+Left)", "Play / stop (Space)", "Next key (Shift+Right)",
+                                           "Last frame (Ctrl+Right)", "Animation clips: pick, add or delete", "Auto Key: moving animated objects keys them" };
+            tl.hot = hot;
+            barTip = hot >= 0 ? tips[hot] : x >= tl.x0 - 8 && x <= tl.x1 + 8 ? "Click or drag to change the frame; drag a key diamond to move it; right-click for keys and easing" : NULL;
+            status_text();
+            InvalidateRect(h, NULL, FALSE);
+            TRACKMOUSEEVENT tme = { sizeof tme, TME_LEAVE, h, 0 };
+            TrackMouseEvent(&tme);
+        }
+        return 0;
+    }
+    case WM_MOUSELEAVE:
+        tl.hot = -1;
+        barTip = NULL;
+        status_text();
+        InvalidateRect(h, NULL, FALSE);
+        return 0;
+    case WM_LBUTTONDOWN: {
+        static const int cmds[5] = { CM_FIRSTFRAME, CM_PREVKEY, CM_PLAY, CM_NEXTKEY, CM_LASTFRAME };
+        for (int i = 0; i < 5; i++) if (PtInRect(&tl.b[i], pt)) { do_cmd(cmds[i]); return 0; }
+        if (PtInRect(&tl.clip, pt)) { tl_clip_menu(); return 0; }
+        if (PtInRect(&tl.autok, pt)) { do_cmd(CM_AUTOKEY); InvalidateRect(h, NULL, FALSE); return 0; }
+        if (x < tl.x0 - 10 || x > tl.x1 + 10) return 0;
+        if (playing) play(0);
+        float kf = tl_key_at(x);
+        SetCapture(h);
+        if (kf > -1e8f) { tl.drag = TL_KEY; tl.dragF = (int)kf; tl.btn = x; set_frame(kf); }
+        else { tl.drag = TL_SCRUB; set_frame(tl_frame_at(x)); }
+        return 0;
+    }
+    case WM_LBUTTONUP: case WM_CAPTURECHANGED:
+        if (tl.drag == TL_KEY) {
+            float to = tl_frame_at(tl.btn);
+            tl.drag = TL_NONE;
+            if (fabsf(to - tl.dragF) > .5f) {
+                /* retime: the shown tracks' keys on that frame move together */
+                Clip *c = anim_clip(&anim);
+                undo_push("Move Key");
+                c = anim_clip(&anim);
+                for (int i = 0; i < c->nt; i++) if (tl_shows(&c->t[i])) track_move(&c->t[i], (float)tl.dragF, to);
+                set_frame(to);
+                refresh_all();
+            }
+        }
+        tl.drag = TL_NONE;
+        if (GetCapture() == h) ReleaseCapture();
+        InvalidateRect(h, NULL, FALSE);
+        SetFocus(hView);
+        return 0;
+    case WM_RBUTTONUP: {
+        if (x >= tl.x0 - 10 && x <= tl.x1 + 10) {
+            float kf = tl_key_at(x);
+            set_frame(kf > -1e8f ? kf : tl_frame_at(x));
+        }
+        HMENU mm = CreatePopupMenu();
+        AppendMenuA(mm, MF_STRING, CM_KEY, "Set &Key\tK");
+        AppendMenuA(mm, MF_STRING, CM_DELKEY, "&Delete Key\tShift+K");
+        AppendMenuA(mm, MF_SEPARATOR, 0, NULL);
+        AppendMenuA(mm, MF_STRING, CM_EASESMOOTH, "Ease &Smooth");
+        AppendMenuA(mm, MF_STRING, CM_EASELINEAR, "Ease &Linear");
+        AppendMenuA(mm, MF_STRING, CM_EASESTEP, "Ease S&tep");
+        AppendMenuA(mm, MF_SEPARATOR, 0, NULL);
+        AppendMenuA(mm, MF_STRING, CM_COPYKEY, "&Copy Pose");
+        AppendMenuA(mm, MF_STRING, CM_PASTEKEY, "&Paste Pose");
+        ClientToScreen(h, &pt);
+        int c = TrackPopupMenu(mm, TPM_RETURNCMD | TPM_BOTTOMALIGN, pt.x, pt.y, 0, h, NULL);
+        DestroyMenu(mm);
+        if (c) do_cmd(c);
+        SetFocus(hView);
+        return 0;
+    }
+    case WM_MOUSEWHEEL:
+        set_frame(curFrame + ((short)HIWORD(wp) > 0 ? 1 : -1));
+        return 0;
+    }
+    return DefWindowProc(h, m, wp, lp);
+}
+
 /* ================================================================ status / refresh */
 
 /* The status line: mode, tool, selection, then the most useful hint for right now: the toolbar
@@ -6554,7 +8820,8 @@ static LRESULT CALLBACK BarProc(HWND h, UINT m, WPARAM wp, LPARAM lp)
 static void status_text(void)
 {
     static const char *mn[] = { "Object mode", "Vertex mode", "Edge mode", "Face mode", "Multi mode" };
-    static const char *tn[] = { "Select tool", "Move tool", "Rotate tool", "Scale tool", "Paint tool", "Target Weld", "Insert Edge Loop", "Multi-Cut" };
+    static const char *tn[] = { "Select tool", "Move tool", "Rotate tool", "Scale tool", "Paint tool", "Target Weld", "Insert Edge Loop", "Multi-Cut",
+                                "Joint tool", "Weights tool" };
     static const char *hint[] = {
         "Click to select, drag for a box. Shift: toggle, Ctrl: remove, Ctrl+Shift: add. Alt+drag: orbit/pan/zoom",
         "Drag a handle to move. Hold X: grid snap, V: point snap, Ctrl+handle: other two axes, Esc: cancel",
@@ -6564,6 +8831,8 @@ static void status_text(void)
         "Drag from one vertex onto another to weld them together (the first one moves). Esc cancels",
         "Click an edge to add an edge loop across it, where the yellow preview shows",
         "Click points on edges or vertices to cut. Enter/right click: finish, Backspace: undo point, Esc: drop, Ctrl+click: edge loop",
+        "Click to place joints (clicked on a mesh they sit inside it). Each click adds to the chain; Enter or right click ends it",
+        "Click a joint to pick it, then drag over the mesh: add weight, Ctrl: remove, Shift: smooth. B+drag: brush size",
     };
     int nsel = 0, ncomp = 0;
     for (int i = 0; i < nob; i++) {
@@ -6604,7 +8873,7 @@ static void status_update(void)
         if (*c == '\\' || *c == '/') fn = c + 1;
     snprintf(s, sizeof s, "%s%s - " APP_NAME, fn, modified ? "*" : "");
     SetWindowTextA(hMain, s);
-    for (int i = 0; i < NTOOL; i++) CheckMenuItem(hMenu, CM_TSEL + i, MF_BYCOMMAND | (tool == i ? MF_CHECKED : MF_UNCHECKED));
+    for (int i = 0; i < NTOOL; i++) CheckMenuItem(hMenu, tool_cmd(i), MF_BYCOMMAND | (tool == i ? MF_CHECKED : MF_UNCHECKED));
     for (int i = 0; i < 5; i++) CheckMenuItem(hMenu, CM_MOBJ + i, MF_BYCOMMAND | (mode == i ? MF_CHECKED : MF_UNCHECKED));
     CheckMenuItem(hMenu, CM_WIRE, MF_BYCOMMAND | (wire ? MF_CHECKED : MF_UNCHECKED));
     CheckMenuItem(hMenu, CM_SHADED, MF_BYCOMMAND | (!wire ? MF_CHECKED : MF_UNCHECKED));
@@ -6623,6 +8892,12 @@ static void status_update(void)
     CheckMenuItem(hMenu, CM_XRAY, MF_BYCOMMAND | (xray ? MF_CHECKED : MF_UNCHECKED));
     CheckMenuItem(hMenu, CM_CULL, MF_BYCOMMAND | (cullBack ? MF_CHECKED : MF_UNCHECKED));
     CheckMenuItem(hMenu, CM_ISOLATE, MF_BYCOMMAND | (isolateOn ? MF_CHECKED : MF_UNCHECKED));
+    CheckMenuItem(hMenu, CM_SHOWJOINTS, MF_BYCOMMAND | (showJoints ? MF_CHECKED : MF_UNCHECKED));
+    CheckMenuItem(hMenu, CM_PIVOT, MF_BYCOMMAND | (pivotMode ? MF_CHECKED : MF_UNCHECKED));
+    CheckMenuItem(hMenu, CM_AUTOKEY, MF_BYCOMMAND | (autoKey ? MF_CHECKED : MF_UNCHECKED));
+    CheckMenuItem(hMenu, CM_PLAY, MF_BYCOMMAND | (playing ? MF_CHECKED : MF_UNCHECKED));
+    CheckMenuItem(hMenu, CM_LOOPPLAY, MF_BYCOMMAND | (loopPlay ? MF_CHECKED : MF_UNCHECKED));
+    CheckMenuItem(hMenu, CM_ONION, MF_BYCOMMAND | (onion ? MF_CHECKED : MF_UNCHECKED));
     for (int i = 0; i < 5; i++) CheckMenuItem(hMenu, CM_UIS + i, MF_BYCOMMAND | (uiPct == 100 + 25 * i ? MF_CHECKED : MF_UNCHECKED));
     char u[96], k[48];
     cmd_key(CM_UNDO, k, sizeof k);
@@ -6633,11 +8908,13 @@ static void status_update(void)
     ModifyMenuA(hMenu, CM_REDO, MF_BYCOMMAND | MF_STRING | (nredo ? 0 : MF_GRAYED), CM_REDO, u);
     InvalidateRect(hBar, NULL, FALSE);
     InvalidateRect(hBox, NULL, FALSE);
+    InvalidateRect(hTime, NULL, FALSE);
     CheckMenuRadioItem(hThemeMenu, CM_THEME, CM_THEME + NTHEME - 1, CM_THEME + themeIdx, MF_BYCOMMAND);
 }
 
 static void refresh_all(void)
 {
+    rig_update();
     geo_changed();
     if (hvObj >= nob) hvObj = -1;
     panel_build();
@@ -6780,7 +9057,7 @@ static void draw_hover_comp(const Obj *o, int hvIdx, float a)
         glEnd();
     } else if (!hvKind) {
         glLineWidth(1.5f * ds);
-        draw_all_edges(m);
+        draw_all_edges_p(m, obj_P((int)(o - ob)));
     }
     glDisable(GL_BLEND);
     glLineWidth(1);
@@ -6838,6 +9115,86 @@ static void draw_sym_plane(void)
     glDisable(GL_BLEND);
 }
 
+/* joints and IK handles, on top of everything (2D overlay pass) */
+
+static void draw_joints(void)
+{
+    if (!showJoints) return;
+    Obj *l = lead();
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    for (int i = 0; i < nob; i++) {
+        Obj *o = &ob[i];
+        float x, y;
+        if (o->kind == OK_MESH || o->hidden) continue;
+        M4 W = obj_mat(o);
+        if (!proj(m4_col(W, 3), &x, &y, NULL)) continue;
+        int sel = mode == M_OBJ && o->sel, hov = i == hvObj && !hvKind, paintJ = tool == T_WEIGHT && o->id == wpJoint;
+        float c[3] = { .35f, .72f, 1 };
+        if (o->kind == OK_IK) { c[0] = 1; c[1] = .55f; c[2] = .1f; }
+        if (o->nodeform) { c[0] = .75f; c[1] = .75f; c[2] = .8f; }
+        if (sel) { c[0] = o == l ? .26f : .95f; c[1] = 1; c[2] = o == l ? .64f : .95f; }
+        if (paintJ) { c[0] = 1; c[1] = .9f; c[2] = .1f; }
+        if (hov) { c[0] = 1; c[1] = .3f; c[2] = .3f; }
+        if (o->kind == OK_IK) {
+            float r = 9 * ds;
+            int a = obj_index(o->ikA);
+            float ax, ay;
+            if (a >= 0 && proj(m4_col(obj_mat(&ob[a]), 3), &ax, &ay, NULL)) {
+                glColor4f(c[0], c[1], c[2], .6f);
+                glEnable(GL_LINE_STIPPLE);
+                glLineStipple(1, 0xCCCC);
+                glBegin(GL_LINES);
+                glVertex2f(ax, ay); glVertex2f(x, y);
+                glEnd();
+                glDisable(GL_LINE_STIPPLE);
+            }
+            glLineWidth(2.5f * ds);
+            glColor3fv(c);
+            glBegin(GL_LINES);
+            glVertex2f(x - r, y); glVertex2f(x + r, y);
+            glVertex2f(x, y - r); glVertex2f(x, y + r);
+            glEnd();
+            glBegin(GL_LINE_LOOP);
+            for (int k = 0; k < 16; k++) glVertex2f(x + r * .6f * cosf(2 * PI_F * k / 16), y + r * .6f * sinf(2 * PI_F * k / 16));
+            glEnd();
+            glLineWidth(1);
+            continue;
+        }
+        /* a tapered bone to each child joint */
+        for (int k = 0; k < nob; k++) {
+            float cx, cy;
+            if (ob[k].parent != o->id || ob[k].kind != OK_JOINT || ob[k].hidden) continue;
+            if (!proj(m4_col(obj_mat(&ob[k]), 3), &cx, &cy, NULL)) continue;
+            float dx = cx - x, dy = cy - y, len = hypotf(dx, dy);
+            if (len < 1) continue;
+            float w = fminf(6 * ds, len * .18f), nx = -dy / len * w, ny = dx / len * w, mx_ = x + dx * .15f, my_ = y + dy * .15f;
+            float q[4][2] = { { x, y }, { mx_ + nx, my_ + ny }, { cx, cy }, { mx_ - nx, my_ - ny } };
+            glColor4f(c[0], c[1], c[2], .45f);
+            glBegin(GL_QUADS);
+            for (int j = 0; j < 4; j++) glVertex2fv(q[j]);
+            glEnd();
+            glColor4f(c[0] * .6f, c[1] * .6f, c[2] * .6f, .95f);
+            glLineWidth(1.5f * ds);
+            glBegin(GL_LINE_LOOP);
+            for (int j = 0; j < 4; j++) glVertex2fv(q[j]);
+            glEnd();
+        }
+        float r = (o->nodeform ? 7 : 5) * ds;
+        glColor3fv(c);
+        glBegin(GL_POLYGON);
+        for (int k = 0; k < 16; k++) glVertex2f(x + r * cosf(2 * PI_F * k / 16), y + r * sinf(2 * PI_F * k / 16));
+        glEnd();
+        glColor3f(c[0] * .4f, c[1] * .4f, c[2] * .4f);
+        glLineWidth(1.5f * ds);
+        glBegin(GL_LINE_LOOP);
+        for (int k = 0; k < 16; k++) glVertex2f(x + r * cosf(2 * PI_F * k / 16), y + r * sinf(2 * PI_F * k / 16));
+        glEnd();
+        glLineWidth(1);
+    }
+    glDisable(GL_BLEND);
+}
+
 /* soft selection falloff: yellow at the selection, through orange to red at the edge */
 static void draw_soft(int i)
 {
@@ -6859,6 +9216,7 @@ static void hover_update(int x, int y)
 {
     int o = -1, k = 0, i = 0;
     if (x > -1000 && dk == D_NONE && tool != T_PAINT && tool != T_LOOP && tool != T_CUT && !(manip_vis() && hover)) {
+        if (tool == T_WEIGHT) { int j = pick_joint(x, y); o = j; k = i = 0; goto hv_done; }
         cam_update();
         if (mode != M_OBJ) pick_comp(x, y, &o, &k, &i);
         if (o < 0) {
@@ -6868,6 +9226,7 @@ static void hover_update(int x, int y)
             if (o >= 0 && (mode == M_OBJ ? ob[o].sel : ob[o].hil)) o = -1;
         }
     }
+hv_done:
     if (o != hvObj || k != hvKind || i != hvIdx) {
         hvObj = o;
         hvKind = k;
@@ -7071,7 +9430,7 @@ static HCURSOR view_cursor(void)
     else if (dk == D_PAN) c = IDC_HAND;
     else if (dk == D_DOLLY) c = IDC_SIZENS;
     else if (dk == D_SOFTRAD) c = IDC_SIZEWE;
-    else if (dk == D_MARQ || tool == T_PAINT || tool == T_WELD || tool == T_LOOP || tool == T_CUT) c = IDC_CROSS;
+    else if (dk == D_MARQ || tool == T_PAINT || tool == T_WELD || tool == T_LOOP || tool == T_CUT || tool == T_JOINT || tool == T_WEIGHT) c = IDC_CROSS;
     else if (gizmoHover >= 0) c = IDC_HAND;
     return LoadCursor(NULL, c);
 }
@@ -7169,16 +9528,17 @@ static void render(void)
             Obj *l = lead();
             if (l == o) glColor3f(0.26f, 1, 0.64f);
             else glColor3fv(th.sel2);
-            draw_all_edges(m);
+            draw_all_edges_p(m, obj_P(i));
         } else if (wire || xray) {
             glColor3fv(th.wire);
-            draw_all_edges(m);
+            draw_all_edges_p(m, obj_P(i));
         }
         if (hil) draw_soft(i);
         if (i == hvObj) draw_hover(o);
         glPopMatrix();
     }
 
+    draw_onion();
     draw_sym_plane();
     draw_manip();
 
@@ -7224,10 +9584,11 @@ static void render(void)
         glEnd();
         glDisable(GL_LINE_STIPPLE);
     }
-    if (tool == T_PAINT) {
+    if (tool == T_PAINT || tool == T_WEIGHT) {
         float cx = dk == D_BRUSH ? (float)mx0 : (float)curx, cy = dk == D_BRUSH ? (float)my0 : (float)cury;
         float r = paintRad * ds;
-        glColor3f(paintCol.x, paintCol.y, paintCol.z);
+        if (tool == T_WEIGHT) glColor3f(1, .9f, .2f);
+        else glColor3f(paintCol.x, paintCol.y, paintCol.z);
         glBegin(GL_LINE_LOOP);
         for (int k = 0; k < 48; k++) glVertex2f(cx + r * cosf(2 * PI_F * k / 48), cy + r * sinf(2 * PI_F * k / 48));
         glEnd();
@@ -7259,6 +9620,7 @@ static void render(void)
             glLineWidth(1);
         }
     }
+    draw_joints();
     draw_weld();
     draw_loop_preview();
     draw_cut();
@@ -7412,8 +9774,9 @@ static void end_drag(int cancel)
     dk = D_NONE;
     if (k == D_PEND && !cancel) select_click(mx0, my0, selMod);
     else if (k == D_MARQ && !cancel) select_rect(mx0, my0, curx, cury, selMod);
-    else if (k == D_MANIP) drag_end();
+    else if (k == D_MANIP) { int moved = dg.dirty && mode == M_OBJ; drag_end(); if (moved) autokey(); }
     else if (k == D_PAINT) paint_end();
+    else if (k == D_WPAINT) wp_end();
     else if (k == D_WELD) weld_end(cancel);
     if (k == D_PEND || k == D_MARQ) normalFrame = 0;
     if (GetCapture() == hView) ReleaseCapture();
@@ -7427,9 +9790,9 @@ static void end_drag(int cancel)
 static void cancel_drag(void)
 {
     if (dk == D_SOFTRAD) { softRad = rad0; geo_changed(); }
-    if ((dk == D_MANIP && dg.dirty) || (dk == D_PAINT && ps.dirty)) {
+    if ((dk == D_MANIP && dg.dirty) || (dk == D_PAINT && ps.dirty) || (dk == D_WPAINT && wps.dirty)) {
         snap_restore(&undo_s[--nundo]);
-        dg.dirty = ps.dirty = 0;
+        dg.dirty = ps.dirty = wps.dirty = 0;
     }
     end_drag(1);
     msg("Cancelled");
@@ -7505,6 +9868,13 @@ static int dbl_click(int x, int y)
 static void handle_key(WPARAM wp)
 {
     int ctrl = key(VK_CONTROL), shift = key(VK_SHIFT), id = 0;
+    if (tool == T_JOINT && jt.last && (wp == VK_RETURN || wp == VK_ESCAPE)) {
+        jt.last = 0;
+        msg("Chain finished - click to start a new one");
+        refresh_all();
+        return;
+    }
+    if (pivotMode && wp == VK_ESCAPE) { cmd_pivot_mode(); refresh_all(); return; }
     if (tool == T_CUT && mc.n && (wp == VK_RETURN || wp == VK_ESCAPE || wp == VK_BACK)) {
         if (wp == VK_RETURN) mc_commit();
         else if (wp == VK_ESCAPE) { mc_reset(); msg("Multi-Cut: points dropped"); }
@@ -7541,6 +9911,7 @@ static LRESULT CALLBACK ViewProc(HWND h, UINT m, WPARAM wp, LPARAM lp)
         return 0;
     }
     case WM_TIMER:
+        if (wp == 3) { if (playing) play_tick(); return 0; }
         if (!anim_step()) { KillTimer(h, 1); animOn = 0; }
         redraw();
         return 0;
@@ -7578,6 +9949,28 @@ static LRESULT CALLBACK ViewProc(HWND h, UINT m, WPARAM wp, LPARAM lp)
         tween.on = 0;
         if (key(VK_MENU)) {
             dk = btn == 0 ? D_TUMBLE : btn == 1 ? D_PAN : D_DOLLY;
+        } else if (tool == T_JOINT && btn != 1) {
+            if (btn == 0) joint_click(x, y);
+            else { jt.last = 0; msg("Chain finished - click to start a new one"); }
+            refresh_all();
+            return 0;
+        } else if (tool == T_WEIGHT && btn == 0) {
+            int j = pick_joint(x, y);
+            if (j >= 0 && ob[j].kind == OK_JOINT) {
+                char b[96];
+                wpJoint = ob[j].id;
+                geo_changed();
+                snprintf(b, sizeof b, "Painting %s's weights", ob[j].name);
+                msg(b);
+                refresh_all();
+                return 0;
+            }
+            if (key('B')) { dk = D_BRUSH; rad0 = paintRad; bUsed = 1; }
+            else {
+                wpMode = key(VK_CONTROL) ? 1 : key(VK_SHIFT) ? 2 : wpModeSel;
+                if (!wp_begin(x, y)) { refresh_all(); return 0; }
+                dk = D_WPAINT;
+            }
         } else if (bHeld && key(bHeld) && tool != T_PAINT && btn < 2) {
             /* hold B and drag: soft selection radius (turns soft selection on) */
             dk = D_SOFTRAD;
@@ -7658,6 +10051,7 @@ static LRESULT CALLBACK ViewProc(HWND h, UINT m, WPARAM wp, LPARAM lp)
             break;
         case D_MANIP: drag_move(x, y); panel_sync(); status_text(); break;
         case D_PAINT: paint_dab(x, y); break;
+        case D_WPAINT: wp_dab(x, y); break;
         case D_WELD: {
             int t = weld_pick(x, y, wd.obj);
             wd.tgt = t == wd.v ? -1 : t;
@@ -7761,6 +10155,7 @@ static HMENU build_menu(void)
     AppendMenuA(m, MF_STRING, CM_EXPORT_AS, "Save &As...\tCtrl+Shift+S");
     AppendMenuA(m, MF_STRING, CM_EXPORT_OBJ, "&Export OBJ...");
     AppendMenuA(m, MF_STRING, CM_EXPORT_SEL, "Export Se&lection as OBJ...");
+    AppendMenuA(m, MF_STRING, CM_EXPORTGLB, "Export &glTF (.glb) for game engines...\tCtrl+Shift+E");
     AppendMenuA(m, MF_SEPARATOR, 0, NULL);
     AppendMenuA(m, MF_STRING, CM_EXIT, "E&xit");
     AppendMenuA(bar, MF_POPUP, (UINT_PTR)m, "&File");
@@ -7864,6 +10259,51 @@ static HMENU build_menu(void)
     AppendMenuA(m, MF_STRING, CM_TCUT, "Multi-&Cut Tool");
     AppendMenuA(bar, MF_POPUP, (UINT_PTR)m, "&Tools");
     m = CreatePopupMenu();
+    AppendMenuA(m, MF_STRING, CM_TJOINT, "&Joint Tool");
+    AppendMenuA(m, MF_STRING, CM_RIGBIPED, "&Biped Skeleton");
+    AppendMenuA(m, MF_STRING, CM_RIGQUAD, "&Quadruped Skeleton");
+    AppendMenuA(m, MF_STRING, CM_RIGCHAIN, "Joint &Chain (for props)");
+    AppendMenuA(m, MF_STRING, CM_MIRRORJOINTS, "&Mirror Joints");
+    AppendMenuA(m, MF_SEPARATOR, 0, NULL);
+    AppendMenuA(m, MF_STRING, CM_PARENT, "&Parent\tP");
+    AppendMenuA(m, MF_STRING, CM_UNPARENT, "&Unparent\tShift+P");
+    AppendMenuA(m, MF_STRING, CM_SELHIER, "Select &Hierarchy");
+    AppendMenuA(m, MF_STRING, CM_PIVOT, "Edit Pi&vot\tD");
+    AppendMenuA(m, MF_STRING, CM_PIVOTBASE, "Pivot to &Base");
+    AppendMenuA(m, MF_SEPARATOR, 0, NULL);
+    AppendMenuA(m, MF_STRING, CM_BIND, "Bind &Skin");
+    AppendMenuA(m, MF_STRING, CM_TWEIGHT, "Paint &Weights Tool");
+    AppendMenuA(m, MF_STRING, CM_AUTOWEIGHTS, "&Automatic Weights");
+    AppendMenuA(m, MF_STRING, CM_MIRRORWEIGHTS, "Mi&rror Weights");
+    AppendMenuA(m, MF_STRING, CM_REBIND, "Re&bind (current pose is the rest pose)");
+    AppendMenuA(m, MF_STRING, CM_UNBIND, "U&nbind Skin");
+    AppendMenuA(m, MF_SEPARATOR, 0, NULL);
+    AppendMenuA(m, MF_STRING, CM_ADDIK, "Add &IK Handle");
+    AppendMenuA(m, MF_STRING, CM_RESTPOSE, "Rest P&ose");
+    AppendMenuA(bar, MF_POPUP, (UINT_PTR)m, "&Rig");
+    m = CreatePopupMenu();
+    AppendMenuA(m, MF_STRING, CM_KEY, "Set &Key\tK");
+    AppendMenuA(m, MF_STRING, CM_DELKEY, "&Delete Key\tShift+K");
+    AppendMenuA(m, MF_STRING, CM_AUTOKEY, "&Auto Key");
+    AppendMenuA(m, MF_STRING, CM_COPYKEY, "&Copy Pose");
+    AppendMenuA(m, MF_STRING, CM_PASTEKEY, "&Paste Pose");
+    AppendMenuA(m, MF_SEPARATOR, 0, NULL);
+    AppendMenuA(m, MF_STRING, CM_EASESMOOTH, "Ease: &Smooth");
+    AppendMenuA(m, MF_STRING, CM_EASELINEAR, "Ease: &Linear");
+    AppendMenuA(m, MF_STRING, CM_EASESTEP, "Ease: S&tep");
+    AppendMenuA(m, MF_SEPARATOR, 0, NULL);
+    AppendMenuA(m, MF_STRING, CM_PLAY, "&Play / Stop\tSpace");
+    AppendMenuA(m, MF_STRING, CM_LOOPPLAY, "&Loop Playback");
+    AppendMenuA(m, MF_STRING, CM_ONION, "&Onion Skin");
+    AppendMenuA(m, MF_SEPARATOR, 0, NULL);
+    AppendMenuA(m, MF_STRING, CM_MIRRORPOSE, "&Mirror Pose");
+    AppendMenuA(m, MF_STRING, CM_TURNTABLE, "&Turntable");
+    AppendMenuA(m, MF_SEPARATOR, 0, NULL);
+    AppendMenuA(m, MF_STRING, CM_NEWCLIP, "&New Clip");
+    AppendMenuA(m, MF_STRING, CM_RENAMECLIP, "&Rename Clip (side panel)");
+    AppendMenuA(m, MF_STRING, CM_DELCLIP, "Delete Cl&ip");
+    AppendMenuA(bar, MF_POPUP, (UINT_PTR)m, "&Animate");
+    m = CreatePopupMenu();
     AppendMenuA(m, MF_STRING, CM_SETCOL, "&Set Paint Color...");
     AppendMenuA(m, MF_STRING, CM_APPLYCOL, "&Apply Color to Selection");
     AppendMenuA(bar, MF_POPUP, (UINT_PTR)m, "C&olor");
@@ -7882,6 +10322,7 @@ static HMENU build_menu(void)
     AppendMenuA(m, MF_STRING, CM_XRAY, "&X-Ray");
     AppendMenuA(m, MF_STRING, CM_CULL, "&Backface Culling");
     AppendMenuA(m, MF_STRING, CM_ISOLATE, "&Isolate Select\tCtrl+1");
+    AppendMenuA(m, MF_STRING, CM_SHOWJOINTS, "&Joints");
     AppendMenuA(m, MF_SEPARATOR, 0, NULL);
     AppendMenuA(m, MF_STRING, CM_FRAMESEL, "&Frame Selected\tF");
     AppendMenuA(m, MF_STRING, CM_FRAMEALL, "Frame &All\tA");
@@ -7933,14 +10374,16 @@ static LRESULT CALLBACK MainProc(HWND h, UINT m, WPARAM wp, LPARAM lp)
     case WM_SIZE: {
         if (wp == SIZE_MINIMIZED) return 0;
         int W = LOWORD(lp), H = HIWORD(lp);
-        int sh = (int)(24 * ds), pw = panelOn ? (int)(240 * ds) : 0, bh = bar_layout(&shelf, W);
+        int sh = (int)(24 * ds), pw = panelOn ? (int)(240 * ds) : 0, bh = bar_layout(&shelf, W), tlh = (int)(44 * ds);
         int tw = bar_layout(&box, H - sh - bh);
         if (pw > W / 2) pw = W / 2;
         MoveWindow(hBar, 0, 0, W, bh, TRUE);
         MoveWindow(hBox, 0, bh, tw, H - sh - bh, TRUE);
         InvalidateRect(hBar, NULL, FALSE);   /* the buttons may have moved inside an unchanged area */
         InvalidateRect(hBox, NULL, FALSE);
-        MoveWindow(hView, tw, bh, W - pw - tw, H - sh - bh, TRUE);
+        MoveWindow(hView, tw, bh, W - pw - tw, H - sh - bh - tlh, TRUE);
+        MoveWindow(hTime, tw, H - sh - tlh, W - pw - tw, tlh, TRUE);
+        InvalidateRect(hTime, NULL, FALSE);
         MoveWindow(hPanel, W - pw, bh, pw, H - sh - bh, TRUE);
         ShowWindow(hPanel, panelOn ? SW_SHOW : SW_HIDE);
         MoveWindow(hStatus, 0, H - sh, W, sh, TRUE);
@@ -8058,9 +10501,11 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmd, int show)
     softRad = reg_int("SoftRadius", 100000) / 1e5f;
     if (softRad <= 0) softRad = 1;
     smoothLv = reg_int("PreviewLevel", 2);
+    shelf_tab(reg_int("ShelfTab", 0));
     if (smoothLv < 1 || smoothLv > 3) smoothLv = 2;
     recent_load();
     binds_load();
+    anim_init(&anim);
 
     make_fonts();
 
@@ -8081,6 +10526,9 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmd, int show)
     wc.lpfnWndProc = BarProc;
     wc.lpszClassName = "Tuff3DBar";
     RegisterClassExA(&wc);
+    wc.lpfnWndProc = TimeProc;
+    wc.lpszClassName = "Tuff3DTime";
+    RegisterClassExA(&wc);
     wc.style = CS_OWNDC | CS_DBLCLKS;
     wc.lpfnWndProc = ViewProc;
     wc.hbrBackground = NULL;
@@ -8098,6 +10546,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmd, int show)
                           ww, wh, NULL, hMenu, inst, NULL);
     hBar = CreateWindowA("Tuff3DBar", "", WS_CHILD | WS_VISIBLE, 0, 0, 1, 1, hMain, NULL, inst, NULL);
     hBox = CreateWindowA("Tuff3DBar", "", WS_CHILD | WS_VISIBLE, 0, 0, 1, 1, hMain, NULL, inst, NULL);
+    hTime = CreateWindowA("Tuff3DTime", "", WS_CHILD | WS_VISIBLE, 0, 0, 1, 1, hMain, NULL, inst, NULL);
     shelf.h = hBar;
     box.h = hBox;
     SetWindowLongPtrA(hBar, GWLP_USERDATA, (LONG_PTR)&shelf);
