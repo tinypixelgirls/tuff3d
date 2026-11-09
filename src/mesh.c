@@ -943,24 +943,29 @@ static void pl_split_edge(PL *p, int a, int b, int x)
     }
 }
 
+/* split face f along u-w if it holds both and they are not neighbors; the second half is appended */
+static int pl_cut_face(PL *p, int f, int u, int w)
+{
+    IV *v = &p->f[f];
+    int n = v->n, iu = -1, iw = -1;
+    for (int k = 0; k < n; k++) { if (v->v[k] == u) iu = k; if (v->v[k] == w) iw = k; }
+    if (iu < 0 || iw < 0 || (iu + 1) % n == iw || (iw + 1) % n == iu) return 0;
+    IV a = { 0, 0, NULL }, b = { 0, 0, NULL };
+    for (int k = iu;; k = (k + 1) % n) { iv_push(&a, v->v[k]); if (k == iw) break; }
+    for (int k = iw;; k = (k + 1) % n) { iv_push(&b, v->v[k]); if (k == iu) break; }
+    int sel = p->sel[f];
+    free(v->v);
+    p->f[f] = a;
+    pl_add(p, b.v, b.n, sel);   /* may move p->f: v is not used after this */
+    free(b.v);
+    return 1;
+}
+
 /* split a face holding u and w (not neighbors) along u-w; returns 0 if no face has both */
 static int pl_cut(PL *p, int u, int w)
 {
-    for (int f = 0; f < p->nf; f++) {
-        IV *v = &p->f[f];
-        int n = v->n, iu = -1, iw = -1;
-        for (int k = 0; k < n; k++) { if (v->v[k] == u) iu = k; if (v->v[k] == w) iw = k; }
-        if (iu < 0 || iw < 0 || (iu + 1) % n == iw || (iw + 1) % n == iu) continue;
-        IV a = { 0, 0, NULL }, b = { 0, 0, NULL };
-        for (int k = iu;; k = (k + 1) % n) { iv_push(&a, v->v[k]); if (k == iw) break; }
-        for (int k = iw;; k = (k + 1) % n) { iv_push(&b, v->v[k]); if (k == iu) break; }
-        int sel = p->sel[f];
-        free(v->v);
-        p->f[f] = a;
-        pl_add(p, b.v, b.n, sel);
-        free(b.v);
-        return 1;
-    }
+    for (int f = 0; f < p->nf; f++)
+        if (pl_cut_face(p, f, u, w)) return 1;
     return 0;
 }
 
@@ -1744,6 +1749,9 @@ void prim_defaults(Prim *p, int type)
     p->cr = 1; p->ch = 2; p->csides = 20; p->chseg = 1; p->ccap = 0; p->ctop = p->cbot = 1;
     p->sr = 1; p->scols = 20; p->srows = 20;
     p->pw = p->pd = 1; p->psw = p->psd = 10;
+    p->kr = 1; p->kh = 2; p->ksides = 20; p->khseg = 1; p->kcap = 0;
+    p->tr = 1; p->tsec = 0.5f; p->tsides = 20; p->tsegs = 12;
+    p->ur = 1; p->uh = 2; p->ut = 0.3f; p->usides = 20; p->uhseg = 1;
 }
 
 static float clampf(float v, float lo, float hi) { return v < lo ? lo : v > hi ? hi : v; }
@@ -1760,6 +1768,12 @@ void prim_clamp(Prim *p)
     p->scols = clampi(p->scols, 3, 512); p->srows = clampi(p->srows, 2, 512);
     p->pw = clampf(p->pw, 1e-4f, 1e6f); p->pd = clampf(p->pd, 1e-4f, 1e6f);
     p->psw = clampi(p->psw, 1, 500); p->psd = clampi(p->psd, 1, 500);
+    p->kr = clampf(p->kr, 1e-4f, 1e6f); p->kh = clampf(p->kh, 1e-4f, 1e6f);
+    p->ksides = clampi(p->ksides, 3, 512); p->khseg = clampi(p->khseg, 1, 200); p->kcap = clampi(p->kcap, 0, 100);
+    p->tr = clampf(p->tr, 1e-4f, 1e6f); p->tsec = clampf(p->tsec, 1e-4f, 1e6f);
+    p->tsides = clampi(p->tsides, 3, 512); p->tsegs = clampi(p->tsegs, 3, 256);
+    p->ur = clampf(p->ur, 1e-4f, 1e6f); p->uh = clampf(p->uh, 1e-4f, 1e6f); p->ut = clampf(p->ut, 1e-5f, p->ur * 0.999f);
+    p->usides = clampi(p->usides, 3, 512); p->uhseg = clampi(p->uhseg, 1, 200);
 }
 
 static const V3 WHITE = { 1, 1, 1 };
@@ -1915,6 +1929,99 @@ static Mesh prim_plane(const Prim *p)
     return mb_finish(&b);
 }
 
+/* cone: base ring (and its cap) at the bottom, apex on top */
+static Mesh prim_cone(const Prim *p)
+{
+    MB b;
+    mb_init(&b);
+    int n = p->ksides, hs = p->khseg;
+    int *ring = xrealloc(NULL, hs * n * sizeof(int));
+    for (int j = 0; j < hs; j++) {
+        float y = p->kh * ((float)j / hs - 0.5f), r = p->kr * (1 - (float)j / hs);
+        for (int i = 0; i < n; i++) {
+            float a = 2 * PI_F * i / n;
+            ring[j * n + i] = mb_vert(&b, v3(r * cosf(a), y, -r * sinf(a)), WHITE);
+        }
+    }
+    int apex = mb_vert(&b, v3(0, p->kh * 0.5f, 0), WHITE);
+    for (int i = 0; i < n; i++) {
+        int i2 = (i + 1) % n;
+        float a = 2 * PI_F * (i + 0.5f) / n;
+        V3 out = v3(cosf(a), p->kr / p->kh, -sinf(a));
+        for (int j = 0; j + 1 < hs; j++) {
+            int q[4] = { ring[j * n + i], ring[j * n + i2], ring[(j + 1) * n + i2], ring[(j + 1) * n + i] };
+            mb_face_dir(&b, q, 4, out);
+        }
+        int t[3] = { ring[(hs - 1) * n + i], ring[(hs - 1) * n + i2], apex };
+        mb_face_dir(&b, t, 3, out);
+    }
+    cyl_cap(&b, ring, n, p->kcap, p->kr, -p->kh * 0.5f, v3(0, -1, 0));
+    free(ring);
+    return mb_finish(&b);
+}
+
+/* torus around the Y axis: tr is the ring radius, tsec the radius of the tube */
+static Mesh prim_torus(const Prim *p)
+{
+    MB b;
+    mb_init(&b);
+    int U = p->tsides, V = p->tsegs;
+    int *g = xrealloc(NULL, U * V * sizeof(int));
+    for (int i = 0; i < U; i++) {
+        float a = 2 * PI_F * i / U;
+        for (int j = 0; j < V; j++) {
+            float c = 2 * PI_F * j / V, rr = p->tr + p->tsec * cosf(c);
+            g[i * V + j] = mb_vert(&b, v3(rr * cosf(a), p->tsec * sinf(c), -rr * sinf(a)), WHITE);
+        }
+    }
+    for (int i = 0; i < U; i++)
+        for (int j = 0; j < V; j++) {
+            int i2 = (i + 1) % U, j2 = (j + 1) % V;
+            int q[4] = { g[i * V + j], g[i2 * V + j], g[i2 * V + j2], g[i * V + j2] };
+            float a = 2 * PI_F * (i + 0.5f) / U;
+            V3 mid = v3mul(v3add(v3add(b.m.p[q[0]], b.m.p[q[1]]), v3add(b.m.p[q[2]], b.m.p[q[3]])), 0.25f);
+            mb_face_dir(&b, q, 4, v3sub(mid, v3(p->tr * cosf(a), 0, -p->tr * sinf(a))));
+        }
+    free(g);
+    return mb_finish(&b);
+}
+
+/* pipe: a tube with wall thickness ut, open through the middle */
+static Mesh prim_pipe(const Prim *p)
+{
+    MB b;
+    mb_init(&b);
+    int n = p->usides, hs = p->uhseg;
+    float ri = p->ur - p->ut;
+    int *ro = xrealloc(NULL, (hs + 1) * n * sizeof(int)), *rin = xrealloc(NULL, (hs + 1) * n * sizeof(int));
+    for (int j = 0; j <= hs; j++) {
+        float y = p->uh * ((float)j / hs - 0.5f);
+        for (int i = 0; i < n; i++) {
+            float a = 2 * PI_F * i / n;
+            ro[j * n + i] = mb_vert(&b, v3(p->ur * cosf(a), y, -p->ur * sinf(a)), WHITE);
+            rin[j * n + i] = mb_vert(&b, v3(ri * cosf(a), y, -ri * sinf(a)), WHITE);
+        }
+    }
+    for (int i = 0; i < n; i++) {
+        int i2 = (i + 1) % n;
+        float a = 2 * PI_F * (i + 0.5f) / n;
+        V3 out = v3(cosf(a), 0, -sinf(a));
+        for (int j = 0; j < hs; j++) {
+            int q[4] = { ro[j * n + i], ro[j * n + i2], ro[(j + 1) * n + i2], ro[(j + 1) * n + i] };
+            mb_face_dir(&b, q, 4, out);
+            int r[4] = { rin[j * n + i], rin[j * n + i2], rin[(j + 1) * n + i2], rin[(j + 1) * n + i] };
+            mb_face_dir(&b, r, 4, v3mul(out, -1));
+        }
+        int top[4] = { ro[hs * n + i], ro[hs * n + i2], rin[hs * n + i2], rin[hs * n + i] };
+        mb_face_dir(&b, top, 4, v3(0, 1, 0));
+        int bot[4] = { ro[i], ro[i2], rin[i2], rin[i] };
+        mb_face_dir(&b, bot, 4, v3(0, -1, 0));
+    }
+    free(ro);
+    free(rin);
+    return mb_finish(&b);
+}
+
 Mesh mesh_prim(const Prim *pp)
 {
     Prim p = *pp;
@@ -1923,6 +2030,9 @@ Mesh mesh_prim(const Prim *pp)
     case PRIM_CYL: return prim_cylinder(&p);
     case PRIM_SPHERE: return prim_sphere(&p);
     case PRIM_PLANE: return prim_plane(&p);
+    case PRIM_CONE: return prim_cone(&p);
+    case PRIM_TORUS: return prim_torus(&p);
+    case PRIM_PIPE: return prim_pipe(&p);
     default: return prim_cube(&p);
     }
 }
@@ -2128,4 +2238,417 @@ int obj_load(const char *path, Mesh **ms, char (**names)[32], float **angles)
     if (angles) *angles = r.angles;
     else free(r.angles);
     return r.nm;
+}
+
+/* ---------------------------------------------------------------- symmetry */
+
+typedef struct { float key; int v; } SKey;
+
+static int skey_cmp(const void *a, const void *b)
+{
+    float d = ((const SKey *)a)->key - ((const SKey *)b)->key;
+    return d > 0 ? 1 : d < 0 ? -1 : 0;
+}
+
+int mesh_sym_map(const Mesh *m, const V3 *pts, int axis, float tol, const unsigned char *cls, int *vmir)
+{
+    if (!pts) pts = m->p;
+    int u = (axis + 1) % 3, n = m->nv, miss = 0;
+    SKey *k = xrealloc(NULL, (n + 1) * sizeof *k);
+    for (int v = 0; v < n; v++) {
+        k[v].key = (&pts[v].x)[u];
+        k[v].v = v;
+        vmir[v] = fabsf((&pts[v].x)[axis]) <= tol ? v : -2;   /* -2: not decided yet */
+    }
+    qsort(k, n, sizeof *k, skey_cmp);
+    for (int v = 0; v < n; v++) {
+        if (vmir[v] != -2) continue;
+        V3 q = pts[v];
+        (&q.x)[axis] = -(&q.x)[axis];
+        float qu = (&q.x)[u];
+        int lo = 0, hi = n;
+        while (lo < hi) { int mid = (lo + hi) / 2; if (k[mid].key < qu - tol) lo = mid + 1; else hi = mid; }
+        int best = -1, bestSame = 0;
+        float bd = 0;
+        for (int i = lo; i < n && k[i].key <= qu + tol; i++) {
+            int w = k[i].v;
+            if (w == v || vmir[w] != -2) continue;
+            float d = v3len(v3sub(pts[w], q));
+            if (d > tol) continue;
+            int same = !cls || cls[w] == cls[v];
+            if (best < 0 || same > bestSame || (same == bestSame && d < bd)) { best = w; bestSame = same; bd = d; }
+        }
+        if (best >= 0) { vmir[v] = best; vmir[best] = v; }
+        else { vmir[v] = -1; miss++; }
+    }
+    free(k);
+    return miss;
+}
+
+void mesh_sym_comps(const Mesh *m, const int *vmir, int *emir, int *fmir)
+{
+    if (emir) {
+        HMap h;
+        edge_map(&h, m);
+        for (int e = 0; e < m->ne; e++) {
+            int a = vmir[m->ev[2 * e]], b = vmir[m->ev[2 * e + 1]];
+            emir[e] = a >= 0 && b >= 0 ? edge_at(&h, a, b) : -1;
+        }
+        hm_free(&h);
+    }
+    if (fmir) {
+        /* faces around each vertex (CSR) */
+        int nc = m->fo[m->nf], *off = xcalloc(m->nv + 2, sizeof(int)), *vf = xrealloc(NULL, (nc + 1) * sizeof(int));
+        for (int c = 0; c < nc; c++) off[m->fi[c] + 1]++;
+        for (int v = 0; v < m->nv; v++) off[v + 1] += off[v];
+        int *fill = xrealloc(NULL, (m->nv + 1) * sizeof(int));
+        memcpy(fill, off, (m->nv + 1) * sizeof(int));
+        for (int f = 0; f < m->nf; f++)
+            for (int c = m->fo[f]; c < m->fo[f + 1]; c++) vf[fill[m->fi[c]]++] = f;
+        free(fill);
+        for (int f = 0; f < m->nf; f++) {
+            int s = m->fo[f], n = m->fo[f + 1] - s, a = vmir[m->fi[s]];
+            fmir[f] = -1;
+            if (a < 0) continue;
+            for (int i = off[a]; i < off[a + 1] && fmir[f] < 0; i++) {
+                int g = vf[i], gs = m->fo[g], ok = m->fo[g + 1] - gs == n;
+                for (int k = 0; k < n && ok; k++) {
+                    int w = vmir[m->fi[s + k]], in = 0;
+                    for (int j = 0; j < n && !in && w >= 0; j++) in = m->fi[gs + j] == w;
+                    ok = in;
+                }
+                if (ok) fmir[f] = g;
+            }
+        }
+        free(off);
+        free(vf);
+    }
+}
+
+/* ---------------------------------------------------------------- slice and mirror */
+
+int mesh_slice(Mesh *m, int axis, float tol)
+{
+    PL pl;
+    pl_from(&pl, m);
+    MB b = mb_from_verts(m);
+    signed char *sd = xrealloc(NULL, m->nv + m->ne + 1);
+    for (int v = 0; v < m->nv; v++) {
+        float c = (&m->p[v].x)[axis];
+        sd[v] = c > tol ? 1 : c < -tol ? -1 : 0;
+        if (!sd[v]) (&b.m.p[v].x)[axis] = 0;
+    }
+    int made = 0;
+    for (int e = 0; e < m->ne; e++) {
+        int a = m->ev[2 * e], c = m->ev[2 * e + 1];
+        if (sd[a] * sd[c] >= 0) continue;
+        float ca = (&m->p[a].x)[axis], cc = (&m->p[c].x)[axis], t = ca / (ca - cc);
+        int x = mb_vert(&b, v3lerp(m->p[a], m->p[c], t), v3lerp(m->c[a], m->c[c], t));
+        (&b.m.p[x].x)[axis] = 0;
+        sd[x] = 0;
+        pl_split_edge(&pl, a, c, x);
+        if (m->eh[e]) { mb_hard(&b, a, x, m->eh[e]); mb_hard(&b, x, c, m->eh[e]); }
+        made++;
+    }
+    int nf0 = pl.nf;
+    for (int f = 0; f < nf0; f++) {
+        IV *v = &pl.f[f];
+        int pos = 0, neg = 0, on[2], non = 0;
+        for (int k = 0; k < v->n; k++) {
+            int s = sd[v->v[k]];
+            pos |= s > 0;
+            neg |= s < 0;
+            if (!s) { if (non < 2) on[non] = v->v[k]; non++; }
+        }
+        if (pos && neg && non == 2 && pl_cut_face(&pl, f, on[0], on[1])) made++;
+    }
+    if (made) {
+        pl_to_mb(&pl, &b);
+        mesh_replace(m, &b);
+    } else {
+        for (int v = 0; v < m->nv; v++) m->p[v] = b.m.p[v];   /* only the snapping */
+        free(b.m.p); free(b.m.c); free(b.m.vs); free(b.m.fo); free(b.m.fs); free(b.m.fi); free(b.hp);
+    }
+    pl_free(&pl);
+    free(sd);
+    return made;
+}
+
+int mesh_mirror(Mesh *m, int axis, float tol, int keep)
+{
+    if (keep) {
+        mesh_slice(m, axis, tol);
+        MB k = mb_from_verts(m);
+        int dropped = 0;
+        for (int f = 0; f < m->nf; f++) {
+            int away = 0;
+            for (int c = m->fo[f]; c < m->fo[f + 1] && !away; c++) away = (&m->p[m->fi[c]].x)[axis] * keep < -tol;
+            if (away) dropped++;
+            else mb_face(&k, m->fi + m->fo[f], m->fo[f + 1] - m->fo[f], m->fs[f]);
+        }
+        mesh_replace(m, &k);
+        (void)dropped;
+    }
+    MB b = mb_from_verts(m);
+    int *mv = xrealloc(NULL, (m->nv + 1) * sizeof(int)), *tmp = xrealloc(NULL, (m->fo[m->nf] + 1) * sizeof(int)), added = 0;
+    unsigned char *flat = xcalloc(m->nf + 1, 1);
+    for (int v = 0; v < m->nv; v++) {
+        int on = fabsf((&m->p[v].x)[axis]) <= tol;
+        mv[v] = on ? v : -1;
+        if (on) (&b.m.p[v].x)[axis] = 0;
+    }
+    for (int f = 0; f < m->nf; f++) {
+        int all = 1;
+        for (int c = m->fo[f]; c < m->fo[f + 1] && all; c++) all = mv[m->fi[c]] >= 0;
+        flat[f] = (unsigned char)all;   /* lies on the mirror plane: it would end up inside */
+        if (!all) mb_face(&b, m->fi + m->fo[f], m->fo[f + 1] - m->fo[f], m->fs[f]);
+    }
+    for (int f = 0; f < m->nf; f++) {
+        if (flat[f]) continue;
+        int s = m->fo[f], n = m->fo[f + 1] - s;
+        for (int k = 0; k < n; k++) {
+            int v = m->fi[s + n - 1 - k];   /* reversed: a mirror image flips the winding */
+            if (mv[v] < 0) {
+                V3 p = m->p[v];
+                (&p.x)[axis] = -(&p.x)[axis];
+                mv[v] = mb_vert(&b, p, m->c[v]);
+                b.m.vs[mv[v]] = m->vs[v];
+            }
+            tmp[k] = mv[v];
+        }
+        mb_face(&b, tmp, n, m->fs[f]);
+        added++;
+    }
+    for (int e = 0; e < m->ne; e++) {
+        int a = mv[m->ev[2 * e]], c = mv[m->ev[2 * e + 1]];
+        if (m->eh[e] && a >= 0 && c >= 0) mb_hard(&b, a, c, m->eh[e]);
+    }
+    free(mv); free(tmp); free(flat);
+    mesh_replace(m, &b);
+    return added;
+}
+
+/* ---------------------------------------------------------------- Catmull-Clark smoothing */
+
+static Mesh cc_step(const Mesh *m)
+{
+    int nv = m->nv, ne = m->ne, nf = m->nf;
+    MB b;
+    mb_init(&b);
+    V3 *fp = xrealloc(NULL, (nf + 1) * sizeof(V3)), *fc = xrealloc(NULL, (nf + 1) * sizeof(V3));
+    for (int f = 0; f < nf; f++) {
+        V3 p = v3(0, 0, 0), c = v3(0, 0, 0);
+        int s = m->fo[f], n = m->fo[f + 1] - s;
+        for (int k = 0; k < n; k++) { p = v3add(p, m->p[m->fi[s + k]]); c = v3add(c, m->c[m->fi[s + k]]); }
+        fp[f] = v3mul(p, 1.0f / n);
+        fc[f] = v3mul(c, 1.0f / n);
+    }
+    V3 *sF = xcalloc(nv + 1, sizeof(V3)), *sR = xcalloc(nv + 1, sizeof(V3)), *sS = xcalloc(nv + 1, sizeof(V3));
+    V3 *cF = xcalloc(nv + 1, sizeof(V3)), *cR = xcalloc(nv + 1, sizeof(V3)), *cS = xcalloc(nv + 1, sizeof(V3));
+    int *val = xcalloc(nv + 1, sizeof(int)), *nfv = xcalloc(nv + 1, sizeof(int)), *nsh = xcalloc(nv + 1, sizeof(int));
+    for (int f = 0; f < nf; f++)
+        for (int c = m->fo[f]; c < m->fo[f + 1]; c++) {
+            int v = m->fi[c];
+            sF[v] = v3add(sF[v], fp[f]);
+            cF[v] = v3add(cF[v], fc[f]);
+            nfv[v]++;
+        }
+    unsigned char *sharp = xcalloc(ne + 1, 1);
+    for (int e = 0; e < ne; e++) {
+        int a = m->ev[2 * e], c = m->ev[2 * e + 1];
+        V3 mid = v3mul(v3add(m->p[a], m->p[c]), 0.5f), midc = v3mul(v3add(m->c[a], m->c[c]), 0.5f);
+        sR[a] = v3add(sR[a], mid); sR[c] = v3add(sR[c], mid);
+        cR[a] = v3add(cR[a], midc); cR[c] = v3add(cR[c], midc);
+        val[a]++; val[c]++;
+        sharp[e] = m->ef[2 * e + 1] < 0 || (m->eh && m->eh[e] == EH_HARD);
+        if (sharp[e]) {
+            nsh[a]++; nsh[c]++;
+            sS[a] = v3add(sS[a], m->p[c]); sS[c] = v3add(sS[c], m->p[a]);
+            cS[a] = v3add(cS[a], m->c[c]); cS[c] = v3add(cS[c], m->c[a]);
+        }
+    }
+    int *vid = xrealloc(NULL, (nv + 1) * sizeof(int)), *eid = xrealloc(NULL, (ne + 1) * sizeof(int)), *fid = xrealloc(NULL, (nf + 1) * sizeof(int));
+    for (int v = 0; v < nv; v++) {
+        vid[v] = -1;
+        if (!nfv[v]) continue;
+        V3 P = m->p[v], C = m->c[v], np, nc;
+        if (nsh[v] > 2 || (nsh[v] == 2 && val[v] == 2)) { np = P; nc = C; }   /* corners stay put */
+        else if (nsh[v] == 2) {
+            np = v3mul(v3add(v3mul(P, 6), sS[v]), 0.125f);
+            nc = v3mul(v3add(v3mul(C, 6), cS[v]), 0.125f);
+        } else if (val[v] >= 3) {
+            float n = (float)val[v];
+            V3 Q = v3mul(sF[v], 1.0f / nfv[v]), R = v3mul(sR[v], 1.0f / val[v]);
+            V3 Qc = v3mul(cF[v], 1.0f / nfv[v]), Rc = v3mul(cR[v], 1.0f / val[v]);
+            np = v3mul(v3add(v3add(Q, v3mul(R, 2)), v3mul(P, n - 3)), 1.0f / n);
+            nc = v3mul(v3add(v3add(Qc, v3mul(Rc, 2)), v3mul(C, n - 3)), 1.0f / n);
+        } else { np = P; nc = C; }
+        vid[v] = mb_vert(&b, np, nc);
+        b.m.vs[vid[v]] = m->vs[v];
+    }
+    for (int e = 0; e < ne; e++) {
+        int a = m->ev[2 * e], c = m->ev[2 * e + 1], f0 = m->ef[2 * e], f1 = m->ef[2 * e + 1];
+        V3 p = v3mul(v3add(m->p[a], m->p[c]), 0.5f), col = v3mul(v3add(m->c[a], m->c[c]), 0.5f);
+        if (!sharp[e] && f0 >= 0 && f1 >= 0) {
+            p = v3mul(v3add(v3add(m->p[a], m->p[c]), v3add(fp[f0], fp[f1])), 0.25f);
+            col = v3mul(v3add(v3add(m->c[a], m->c[c]), v3add(fc[f0], fc[f1])), 0.25f);
+        }
+        eid[e] = mb_vert(&b, p, col);
+    }
+    for (int f = 0; f < nf; f++) fid[f] = mb_vert(&b, fp[f], fc[f]);
+    HMap h;
+    edge_map(&h, m);
+    for (int f = 0; f < nf; f++) {
+        int s = m->fo[f], n = m->fo[f + 1] - s;
+        for (int k = 0; k < n; k++) {
+            int v = m->fi[s + k], vn = m->fi[s + (k + 1) % n], vp = m->fi[s + (k + n - 1) % n];
+            int en = edge_at(&h, v, vn), ep = edge_at(&h, vp, v);
+            if (en < 0 || ep < 0 || vid[v] < 0) continue;
+            int q[4] = { vid[v], eid[en], fid[f], eid[ep] };
+            mb_face(&b, q, 4, m->fs[f]);
+        }
+    }
+    for (int e = 0; e < ne; e++)
+        if (m->eh && m->eh[e]) {
+            mb_hard(&b, vid[m->ev[2 * e]], eid[e], m->eh[e]);
+            mb_hard(&b, eid[e], vid[m->ev[2 * e + 1]], m->eh[e]);
+        }
+    hm_free(&h);
+    free(fp); free(fc); free(sF); free(sR); free(sS); free(cF); free(cR); free(cS);
+    free(val); free(nfv); free(nsh); free(sharp); free(vid); free(eid); free(fid);
+    return mb_finish(&b);
+}
+
+Mesh mesh_smooth(const Mesh *m, int levels)
+{
+    Mesh cur = mesh_copy(m);
+    for (int l = 0; l < levels; l++) {
+        Mesh n = cc_step(&cur);
+        mesh_free(&cur);
+        cur = n;
+    }
+    return cur;
+}
+
+/* ---------------------------------------------------------------- loops, rings, extrude offset */
+
+/* the edge across quad f from edge e (as vertex pair), or -1 */
+static int quad_opp(const Mesh *m, HMap *h, int f, int e)
+{
+    if (f < 0 || m->fo[f + 1] - m->fo[f] != 4) return -1;
+    const int *q = m->fi + m->fo[f];
+    int a = m->ev[2 * e], b = m->ev[2 * e + 1];
+    for (int i = 0; i < 4; i++) {
+        int x = q[i], y = q[(i + 1) % 4];
+        if ((x == a && y == b) || (x == b && y == a)) return edge_at(h, q[(i + 2) % 4], q[(i + 3) % 4]);
+    }
+    return -1;
+}
+
+int mesh_face_loop(Mesh *m, int f, int e)
+{
+    if (f < 0 || f >= m->nf || e < 0 || e >= m->ne) return 0;
+    HMap h;
+    edge_map(&h, m);
+    unsigned char *seen = xcalloc(m->nf + 1, 1);
+    int n = 1;
+    seen[f] = 1;
+    for (int side = 0; side < 2; side++) {
+        int x = side ? quad_opp(m, &h, f, e) : e, g = f;
+        while (x >= 0) {
+            int nx = m->ef[2 * x] == g ? m->ef[2 * x + 1] : m->ef[2 * x];
+            if (nx < 0 || seen[nx] || m->fo[nx + 1] - m->fo[nx] != 4) break;
+            seen[nx] = 1;
+            n++;
+            x = quad_opp(m, &h, nx, x);
+            g = nx;
+        }
+    }
+    for (int i = 0; i < m->nf; i++) if (seen[i]) m->fs[i] = 1;
+    hm_free(&h);
+    free(seen);
+    return n;
+}
+
+int mesh_ring_select(Mesh *m, int e)
+{
+    if (e < 0 || e >= m->ne) return 0;
+    int *ra = xrealloc(NULL, (m->ne + 1) * sizeof(int)), *rb = xrealloc(NULL, (m->ne + 1) * sizeof(int)), closed;
+    int n = mesh_edge_ring(m, e, ra, rb, &closed);
+    HMap h;
+    edge_map(&h, m);
+    for (int i = 0; i < n; i++) {
+        int x = edge_at(&h, ra[i], rb[i]);
+        if (x >= 0) m->es[x] = 1;
+    }
+    hm_free(&h);
+    free(ra); free(rb);
+    return n;
+}
+
+void mesh_offset_faces(Mesh *m, float thick, float offset)
+{
+    int nv = m->nv;
+    V3 *fn = xrealloc(NULL, (m->nf + 1) * sizeof(V3));
+    for (int f = 0; f < m->nf; f++) fn[f] = mesh_fnormal(m, f);
+    if (offset != 0) {
+        HMap h;
+        edge_map(&h, m);
+        V3 *n1 = xcalloc(nv + 1, sizeof(V3)), *n2 = xcalloc(nv + 1, sizeof(V3)), *sum = xcalloc(nv + 1, sizeof(V3));
+        int *cnt = xcalloc(nv + 1, sizeof(int));
+        for (int g = 0; g < m->nf; g++) {
+            if (!m->fs[g]) continue;
+            int s = m->fo[g], n = m->fo[g + 1] - s;
+            for (int k = 0; k < n; k++) {
+                int u = m->fi[s + k], w = m->fi[s + (k + 1) % n], e = edge_at(&h, u, w);
+                if (e < 0) continue;
+                int o = m->ef[2 * e] == g ? m->ef[2 * e + 1] : m->ef[2 * e];
+                if (o >= 0 && m->fs[o]) continue;   /* inside the selected region */
+                V3 d = v3norm(v3cross(fn[g], v3sub(m->p[w], m->p[u])));   /* points into the face */
+                int vv[2] = { u, w };
+                for (int j = 0; j < 2; j++) {
+                    int v = vv[j];
+                    if (cnt[v] == 0) n1[v] = d; else if (cnt[v] == 1) n2[v] = d;
+                    sum[v] = v3add(sum[v], d);
+                    cnt[v]++;
+                }
+            }
+        }
+        V3 *disp = xcalloc(nv + 1, sizeof(V3));
+        for (int v = 0; v < nv; v++) {
+            if (!cnt[v]) continue;
+            if (cnt[v] == 2) {
+                float den = 1 + v3dot(n1[v], n2[v]);
+                if (den < 0.15f) den = 0.15f;
+                disp[v] = v3mul(v3add(n1[v], n2[v]), offset / den);
+            } else {
+                disp[v] = v3mul(v3norm(sum[v]), offset);
+            }
+        }
+        for (int v = 0; v < nv; v++) m->p[v] = v3add(m->p[v], disp[v]);
+        hm_free(&h);
+        free(n1); free(n2); free(sum); free(cnt); free(disp);
+    }
+    if (thick != 0) {
+        V3 *acc = xcalloc(nv + 1, sizeof(V3));
+        float *mind = xrealloc(NULL, (nv + 1) * sizeof(float));
+        for (int v = 0; v < nv; v++) mind[v] = 2;
+        for (int g = 0; g < m->nf; g++)
+            if (m->fs[g])
+                for (int c = m->fo[g]; c < m->fo[g + 1]; c++) acc[m->fi[c]] = v3add(acc[m->fi[c]], fn[g]);
+        for (int g = 0; g < m->nf; g++)
+            if (m->fs[g])
+                for (int c = m->fo[g]; c < m->fo[g + 1]; c++) {
+                    int v = m->fi[c];
+                    float d = v3dot(v3norm(acc[v]), fn[g]);
+                    if (d < mind[v]) mind[v] = d;
+                }
+        for (int v = 0; v < nv; v++) {
+            if (mind[v] > 1.5f) continue;
+            float s = mind[v] < 0.3f ? 0.3f : mind[v];
+            m->p[v] = v3add(m->p[v], v3mul(v3norm(acc[v]), thick / s));
+        }
+        free(acc); free(mind);
+    }
+    free(fn);
 }

@@ -257,8 +257,182 @@ static void test_ops(void)
     mesh_free(&c);
 }
 
+static Prim prim(int type)
+{
+    Prim p;
+    prim_defaults(&p, type);
+    return p;
+}
+
+/* symmetry pairing, mirror, slice, smoothing, loops, extrude offset and the new primitives */
+static void test_upgrade(void)
+{
+    /* every vertex of a cube pairs with its X mirror image; nothing sits on the plane */
+    Mesh m = cube();
+    int vm[64], em[64], fm[64];
+    CHECK(mesh_sym_map(&m, NULL, 0, 1e-4f, NULL, vm) == 0);
+    for (int v = 0; v < m.nv; v++) {
+        CHECK(vm[v] >= 0 && vm[v] != v && vm[vm[v]] == v);
+        CHECK(fabsf(m.p[vm[v]].x + m.p[v].x) < 1e-5f && fabsf(m.p[vm[v]].y - m.p[v].y) < 1e-5f);
+    }
+    mesh_sym_comps(&m, vm, em, fm);
+    for (int f = 0; f < m.nf; f++) {
+        V3 n = mesh_fnormal(&m, f), mn = mesh_fnormal(&m, fm[f]);
+        CHECK(fm[f] >= 0 && fabsf(n.x + mn.x) < 1e-4f && fabsf(n.y - mn.y) < 1e-4f);
+        if (fabsf(n.x) < 0.5f) CHECK(fm[f] == f);   /* top, bottom, front, back mirror onto themselves */
+    }
+    for (int e = 0; e < m.ne; e++) CHECK(em[e] >= 0 && em[em[e]] == e);
+    mesh_free(&m);
+
+    /* center vertices map to themselves */
+    m = plane(2);
+    CHECK(mesh_sym_map(&m, NULL, 0, 1e-4f, NULL, vm) == 0);
+    int self = 0;
+    for (int v = 0; v < m.nv; v++) self += vm[v] == v;
+    CHECK(self == 3);
+    mesh_free(&m);
+
+    /* right after an extrusion copies sit on the originals: classes keep the pairs straight */
+    {
+        Prim p = prim(PRIM_CUBE);
+        p.sw = 2;
+        m = mesh_prim(&p);
+        for (int f = 0; f < m.nf; f++) if (mesh_fnormal(&m, f).y > 0.9f) m.fs[f] = 1;
+        CHECK(mesh_extrude_faces(&m));
+        unsigned char cls[64];
+        mesh_vmask(&m, COMP_FACE, cls);
+        mesh_sym_map(&m, NULL, 0, 1e-4f, cls, vm);
+        for (int v = 0; v < m.nv; v++) CHECK(vm[v] >= 0 && cls[vm[v]] == cls[v]);
+        mesh_free(&m);
+    }
+
+    /* mirror half a box (its open side on the plane) into a whole closed box */
+    m = cube();
+    for (int v = 0; v < m.nv; v++) m.p[v].x += 0.5f;
+    for (int f = 0; f < m.nf; f++) m.fs[f] = mesh_fnormal(&m, f).x < -0.9f;
+    mesh_delete_faces(&m);
+    CHECK(mesh_mirror(&m, 0, 1e-3f, 0) == 5);
+    CHECK(m.nv == 12 && m.nf == 10 && closed_oriented(&m));
+    CHECK(fabsf(volume(&m) - 2) < 1e-4f);
+    mesh_free(&m);
+
+    /* the face on the plane is dropped instead of ending up inside */
+    m = cube();
+    for (int v = 0; v < m.nv; v++) m.p[v].x += 0.5f;
+    mesh_mirror(&m, 0, 1e-3f, 0);
+    CHECK(m.nf == 10 && closed_oriented(&m) && fabsf(volume(&m) - 2) < 1e-4f);
+    mesh_free(&m);
+
+    /* a whole cube straddling the plane: slice, keep +X, mirror: closed again, same volume */
+    m = cube();
+    m.p[0].x -= 0.3f;   /* lopsided, so the result really comes from the + side */
+    CHECK(mesh_slice(&m, 0, 1e-4f) > 0);
+    mesh_free(&m);
+    m = cube();
+    for (int v = 0; v < m.nv; v++) if (m.p[v].x < 0) m.p[v].x -= 0.4f;
+    mesh_mirror(&m, 0, 1e-4f, 1);
+    CHECK(closed_oriented(&m) && fabsf(volume(&m) - 1) < 1e-4f && m.nf == 10);
+    {
+        V3 lo = m.p[0], hi = m.p[0];
+        for (int v = 0; v < m.nv; v++) { lo.x = fminf(lo.x, m.p[v].x); hi.x = fmaxf(hi.x, m.p[v].x); }
+        CHECK(fabsf(lo.x + 0.5f) < 1e-5f && fabsf(hi.x - 0.5f) < 1e-5f);
+    }
+    mesh_free(&m);
+
+    /* Catmull-Clark */
+    m = cube();
+    Mesh s1 = mesh_smooth(&m, 1), s2 = mesh_smooth(&m, 2);
+    CHECK(s1.nf == 24 && s1.nv == 26 && closed_oriented(&s1));
+    CHECK(s2.nf == 96 && closed_oriented(&s2));
+    CHECK(volume(&s1) < 1 && volume(&s1) > 0.4f && volume(&s2) < volume(&s1));
+    mesh_free(&s1); mesh_free(&s2);
+    /* a hard edge loop keeps its corners sharp-ish: more volume than fully smooth */
+    for (int e = 0; e < m.ne; e++) m.eh[e] = EH_HARD;
+    s1 = mesh_smooth(&m, 1);
+    CHECK(fabsf(volume(&s1) - 1) < 1e-4f);   /* every edge creased: the cube stays a cube */
+    mesh_free(&s1);
+    mesh_free(&m);
+    /* an open plane keeps its border corners */
+    m = plane(1);
+    s1 = mesh_smooth(&m, 1);
+    CHECK(s1.nf == 4 && s1.nv == 9);
+    {
+        int corners = 0;
+        for (int v = 0; v < s1.nv; v++) corners += fabsf(fabsf(s1.p[v].x) - 0.5f) < 1e-5f && fabsf(fabsf(s1.p[v].z) - 0.5f) < 1e-5f;
+        CHECK(corners == 4);
+    }
+    mesh_free(&s1);
+    mesh_free(&m);
+
+    /* face loop around a 3x3x3 cube, edge ring across a plane */
+    {
+        Prim p = prim(PRIM_CUBE);
+        p.sw = p.sh = p.sd = 3;
+        m = mesh_prim(&p);
+        int f0 = -1, e0 = -1;
+        for (int f = 0; f < m.nf && f0 < 0; f++) {
+            V3 c = mesh_fcenter(&m, f);
+            if (mesh_fnormal(&m, f).z > 0.9f && fabsf(c.x) < 0.01f && fabsf(c.y) < 0.01f) f0 = f;
+        }
+        CHECK(f0 >= 0);
+        for (int c = m.fo[f0]; c < m.fo[f0 + 1] && e0 < 0; c++) {
+            int a = m.fi[c], b = m.fi[m.fo[f0] + (c - m.fo[f0] + 1) % 4];
+            if (fabsf(m.p[a].y - m.p[b].y) < 1e-5f) e0 = mesh_edge_find(&m, a, b);   /* a horizontal edge */
+        }
+        CHECK(e0 >= 0 && mesh_face_loop(&m, f0, e0) == 12 && count(m.fs, m.nf) == 12);
+        mesh_free(&m);
+    }
+    m = plane(4);
+    CHECK(mesh_ring_select(&m, 0) == 5 && count(m.es, m.ne) == 5);   /* across 4 quads */
+    mesh_free(&m);
+
+    /* extrude thickness and offset */
+    m = cube();
+    for (int f = 0; f < m.nf; f++) m.fs[f] = mesh_fnormal(&m, f).y > 0.9f;
+    mesh_extrude_faces(&m);
+    mesh_offset_faces(&m, 0.5f, 0);
+    CHECK(closed_oriented(&m) && fabsf(volume(&m) - 1.5f) < 1e-4f);
+    mesh_free(&m);
+    m = cube();
+    for (int f = 0; f < m.nf; f++) m.fs[f] = mesh_fnormal(&m, f).y > 0.9f;
+    mesh_extrude_faces(&m);
+    mesh_offset_faces(&m, 0, 0.1f);
+    {
+        unsigned char sel[64];
+        mesh_vmask(&m, COMP_FACE, sel);
+        for (int v = 0; v < m.nv; v++)
+            if (sel[v]) CHECK(fabsf(fabsf(m.p[v].x) - 0.4f) < 1e-5f && fabsf(fabsf(m.p[v].z) - 0.4f) < 1e-5f);
+    }
+    mesh_free(&m);
+    /* thickness on a whole cube's faces keeps them parallel: a bigger cube */
+    m = cube();
+    memset(m.fs, 1, m.nf);
+    mesh_offset_faces(&m, 0.25f, 0);
+    CHECK(fabsf(volume(&m) - 3.375f) < 1e-3f);   /* every face 0.25 out: a 1.5 cube */
+    mesh_free(&m);
+
+    /* new primitives: closed and outward */
+    Prim p = prim(PRIM_CONE);
+    m = mesh_prim(&p);
+    CHECK(closed_oriented(&m) && volume(&m) > 1.9f && volume(&m) < 2.1f && m.nf == 21);
+    mesh_free(&m);
+    p.khseg = 3; p.kcap = 2;
+    m = mesh_prim(&p);
+    CHECK(closed_oriented(&m) && volume(&m) > 0);
+    mesh_free(&m);
+    p = prim(PRIM_TORUS);
+    m = mesh_prim(&p);
+    CHECK(closed_oriented(&m) && m.nf == 20 * 12 && volume(&m) > 4.5f && volume(&m) < 5.0f);   /* 2 pi^2 R r^2 = 4.93 */
+    mesh_free(&m);
+    p = prim(PRIM_PIPE);
+    m = mesh_prim(&p);
+    CHECK(closed_oriented(&m) && m.nf == 20 * 4 && volume(&m) > 0);
+    mesh_free(&m);
+}
+
 int main(void)
 {
+    test_upgrade();
     Prim p;
     prim_defaults(&p, PRIM_CUBE);
     Mesh m = mesh_prim(&p);

@@ -45,7 +45,7 @@ typedef struct Mesh {
 enum { EH_AUTO, EH_HARD, EH_SOFT };
 
 enum { COMP_VERT = 1, COMP_EDGE = 2, COMP_FACE = 3, COMP_MULTI = 4 };   /* MULTI: union of all three */
-enum { PRIM_NONE, PRIM_CUBE, PRIM_CYL, PRIM_SPHERE, PRIM_PLANE, PRIM_COUNT };
+enum { PRIM_NONE, PRIM_CUBE, PRIM_CYL, PRIM_SPHERE, PRIM_PLANE, PRIM_CONE, PRIM_TORUS, PRIM_PIPE, PRIM_COUNT };
 
 typedef struct Prim {
     int type;
@@ -53,6 +53,9 @@ typedef struct Prim {
     float cr, ch; int csides, chseg, ccap, ctop, cbot;      /* cylinder (ccap: cap rings, 0 = n-gon) */
     float sr; int scols, srows;                             /* sphere */
     float pw, pd; int psw, psd;                             /* plane (XZ, facing +Y) */
+    float kr, kh; int ksides, khseg, kcap;                  /* cone (apex up) */
+    float tr, tsec; int tsides, tsegs;                      /* torus: ring radius, tube radius */
+    float ur, uh, ut; int usides, uhseg;                    /* pipe: outer radius, height, wall thickness */
 } Prim;
 
 void prim_defaults(Prim *p, int type);
@@ -108,6 +111,30 @@ int mesh_bevel(Mesh *m, const unsigned char *emask, float width);    /* new face
 /* Bridge two open borders (selected border edges in two runs of the same length); divs rows of
    faces in between. Returns faces made, -1 if the selection is not two runs, -2 if they differ. */
 int mesh_bridge(Mesh *m, const unsigned char *emask, int divs);
+
+/* ---- symmetry. vmir[v]: the vertex at v's mirror image across the plane where coordinate 'axis'
+   of pts is 0 (pts: positions in the symmetry frame, NULL = m->p); v itself on the plane, -1 when
+   nothing is within tol. cls (optional) breaks ties between coincident vertices: a partner of the
+   same class wins (keeps a fresh extrusion paired with the right copy). Returns the unmatched count. */
+int mesh_sym_map(const Mesh *m, const V3 *pts, int axis, float tol, const unsigned char *cls, int *vmir);
+/* mirror partners of edges and faces from vmir (-1: none); either output may be NULL */
+void mesh_sym_comps(const Mesh *m, const int *vmir, int *emir, int *fmir);
+/* cut every face crossing the plane coordinate[axis] = 0 (vertices within tol snap onto it) */
+int mesh_slice(Mesh *m, int axis, float tol);
+/* Mirror across coordinate[axis] = 0: adds a mirrored copy, welds vertices within tol of the plane
+   to their images and drops faces lying on it. keep = +1 / -1 first slices the mesh there and
+   throws away the other side (0: keep everything). Returns the faces added. */
+int mesh_mirror(Mesh *m, int axis, float tol, int keep);
+/* Catmull-Clark subdivision; open borders and hard edges stay creased; colors and face selection
+   carry over */
+Mesh mesh_smooth(const Mesh *m, int levels);
+/* the face loop through face f that crosses its edge e (quads); selects it, returns its length */
+int mesh_face_loop(Mesh *m, int f, int e);
+/* selects the edge ring through e, returns its length */
+int mesh_ring_select(Mesh *m, int e);
+/* on the selected faces (e.g. just extruded): inset their outer border by offset in its plane,
+   then push them along their normals by thick (corners go far enough to keep the faces parallel) */
+void mesh_offset_faces(Mesh *m, float thick, float offset);
 
 /* angles: per mesh normal angle (writes vn + s), or NULL for positions only */
 int obj_save(const char *path, int n, const Mesh *const *ms, const M4 *mats, const char *const *names, const float *angles);
