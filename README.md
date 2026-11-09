@@ -1,7 +1,7 @@
 # tuff3d
 
 A small, minimalist polygon modeler for Windows with Autodesk Maya's navigation and hotkeys.
-It is one ~500 KB exe with no installer, and it only uses DLLs that ship with Windows
+It is one ~640 KB exe with no installer, and it only uses DLLs that ship with Windows
 (OpenGL 1.1, GDI, GDI+ for reference images, common dialogs, shell drag and drop). It redraws only when something changes, so
 it sits at 0% CPU when idle. Meshes are drawn from cached vertex arrays that are only rebuilt after
 an edit, so tumbling and hovering stay fast on dense meshes.
@@ -9,6 +9,33 @@ an edit, so tumbling and hovering stay fast on dense meshes.
 **Download:** [`bin/tuff3d.exe`](bin/tuff3d.exe)
 
 ## Features
+
+Rigging and animation for game engines (shelf tabs **Rig** and **Animate**)
+- Hierarchies: P parents the selection to the last selected object, Shift+P unparents; the Outliner
+  (side panel tab) shows the tree, and dragging an item onto another parents it
+- Edit Pivot (D): move an object's pivot without moving it, or a joint without its children; hold V
+  to snap it to a vertex. Pivot to Base puts it at the bottom center, so a model stands on the floor
+- Joints: the Joint tool places a chain with each click (clicked on a mesh, the joint sits halfway
+  through it); or one-click skeletons sized to the selected mesh: Biped (Roblox R15 body part names),
+  Quadruped, or a Chain of four joints for bending props. Mirror Joints copies a chain to the other
+  side; with Symmetry on, moving a Left joint moves its Right partner
+- Bind Skin: select the mesh(es) and a joint; automatic weights (each vertex follows the bones it
+  sits beside, blended at the joints). The Weights tool paints them with a heat map (click a joint,
+  drag to add, Ctrl removes, Shift smooths; Symmetry paints both sides). Mirror Weights, Automatic
+  Weights, Rebind and Rest Pose too. Weights follow every later mesh edit (extrude, cut, smooth...)
+- IK: select a hand or foot joint and Add IK; drag the handle and the limb bends to reach it
+  (the Pole in the side panel sets which way the knee or elbow points)
+- Keyframes: K keys the selected objects or joints on this frame; Auto Key (on by default) re-keys
+  anything already animated whenever you move it. Ease Smooth, Linear or Step per key
+- Timeline under the viewport: play (Space), scrub, step with Left / Right (Shift: between keys),
+  drag a key diamond to retime it, right-click for keys, easing and copy / paste pose
+- Clips: Idle, Walk, Run... each its own animation (New Clip, rename in the side panel); Turntable
+  makes a spin clip in one click. Onion skin shows ghosts a few frames back and ahead; Mirror Pose
+  copies a pose from left to right
+- File > Export glTF (.glb), Ctrl+Shift+E: meshes with vertex colors and shading, the hierarchy,
+  bones and weights, and every clip (baked frame by frame, IK included). Godot and Roblox Studio
+  import it directly; Blender, three.js and most other tools read it too. The files pass the Khronos
+  glTF validator with no issues
 
 Symmetry and soft selection
 - Symmetry (S, or the butterfly button; right-click it for X / Y / Z and world space): select on one
@@ -153,6 +180,12 @@ See [FEATURES.md](FEATURES.md) for a checklist of what's in and ideas for what c
 | 3 / 1 | Smooth preview on / off |
 | Ctrl+1 | Isolate select |
 | Ctrl+Plus / Ctrl+Minus | Bigger / smaller UI |
+| P / Shift+P | Parent / unparent |
+| D | Edit pivot |
+| K / Shift+K | Set key / delete key |
+| Space | Play / stop |
+| Left / Right, Shift+Left / Right | Previous / next frame, previous / next key |
+| Ctrl+Shift+E | Export glTF (.glb) |
 | B + LMB drag | Brush radius (paint tool) |
 | Ctrl+N / Ctrl+O / Ctrl+S | New / open / save (.tuff scene, or back to the open OBJ) |
 | Ctrl+Shift+O / Ctrl+Shift+S | Import into the scene / save as |
@@ -226,6 +259,11 @@ The icon is `res/tuff3d.ico` (16 to 256 px), built from `res/tuff3d.png` with `p
 
 Geometry tests (any C compiler): `cc -Isrc tests/test_mesh.c src/mesh.c -lm && ./a.out`
 
+Animation, skinning, IK and glTF tests: `cc -Isrc tests/test_anim.c src/anim.c src/gltf.c src/mesh.c -lm && ./a.out out.glb`
+(also writes a rigged, animated test file you can check with the Khronos glTF validator)
+
 `src/mesh.c` is the platform-independent geometry core (primitives, extrude, merge, edge loops,
 selection grow/shrink/convert, symmetry pairing, mirror, Catmull-Clark smoothing, OBJ).
+`src/anim.c` holds keyframes and easing, automatic weights, skinning and two bone IK;
+`src/gltf.c` writes `.glb` files.
 `src/main.c` is the Win32/OpenGL UI.

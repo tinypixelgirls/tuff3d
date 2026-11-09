@@ -6239,6 +6239,14 @@ static const char *HELP_TEXT =
     "  Ctrl+Shift+O / Ctrl+Shift+S\tImport into the scene / save as\n"
     "  Ctrl+A\tToggle side panel\n"
     "  Ctrl+T\tTheme picker (hover to preview, click to keep)\n\n"
+    "Rig and animate (shelf tabs Rig / Animate)\n"
+    "  P / Shift+P\tParent to the last selected / unparent\n"
+    "  D\tEdit pivot (a joint moves alone)\n"
+    "  K / Shift+K\tSet key / delete key\n"
+    "  Space\tPlay / stop\n"
+    "  Left / Right\tPrevious / next frame\n"
+    "  Shift+Left / Right, Ctrl+Left / Right\tPrevious / next key, first / last frame\n"
+    "  Ctrl+Shift+E\tExport glTF (.glb) for Godot, Roblox Studio...\n\n"
     "Side panel: drag a label left/right to scrub its value (Shift fast, Ctrl fine).\n"
     "Drop .tuff, .obj or Maya LT .mlt files on the window to open them (Shift adds them).";
 

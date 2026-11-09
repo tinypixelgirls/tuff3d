@@ -32,6 +32,14 @@ Display
 - [x] Heads-up poly counts, corner axis gizmo, front / side / top / home views
 - [x] 48 themes with a live-preview picker
 
+Rigging and animation
+- [x] Parenting, Outliner, Edit Pivot, Pivot to Base
+- [x] Joint tool, Biped / Quadruped / Chain skeletons, Mirror Joints
+- [x] Bind Skin with automatic weights, Weights paint tool with a heat map, Mirror Weights, Rebind, Rest Pose
+- [x] Two bone IK handles
+- [x] Keyframes with Smooth / Linear / Step easing, Auto Key, timeline, clips, onion skin, turntable, mirror pose
+- [x] glTF (.glb) export with bones, weights and every clip, for Godot and Roblox Studio
+
 Files and comfort
 - [x] Open / import / export OBJ with vertex colors and shading normals
 - [x] Shading survives an OBJ round trip; other apps' smoothing groups are read
@@ -60,6 +68,11 @@ Modeling tools (the big gaps compared to Maya)
 - [x] Harden / Soften selected edges, on top of the Normal Angle
 - [x] Triangulate / Quadrangulate
 
+Animation, next
+- [ ] Blend shapes (morph targets) for faces
+- [ ] Per channel curves in a graph editor
+- [ ] FBX export
+
 Modeling tools, next
 - [ ] Topological symmetry (pair vertices by connectivity, for models that drifted)
 - [ ] Bevel segments (rounded bevels)
@@ -70,8 +83,8 @@ Quality of life
 - [x] Orthographic front / side / top cameras
 - [x] X-ray and backface culling toggles
 - [x] Isolate Select (show only the selection)
-- [ ] Outliner: a list of objects to select, rename, hide and reorder
-- [ ] Edit the pivot (D / Insert) and snap it to components
+- [x] Outliner: a list of objects to select, rename, hide and parent
+- [x] Edit the pivot (D) and snap it to components
 - [x] Type exact move / scale amounts for components (selection center and size)
 - [x] Selection size readout (bounding box in units)
 - [ ] Color swatches and an eyedropper for vertex paint
@@ -81,6 +94,6 @@ Quality of life
 - [x] Hotkey editor
 
 Files
-- [ ] glTF (.glb) export with vertex colors, for game engines and the web
+- [x] glTF (.glb) export with vertex colors, bones and animation, for game engines and the web
 - [ ] Export each object to its own OBJ
 - [x] A native scene file (.tuff) that keeps everything: hidden objects, primitive settings, camera, image planes
