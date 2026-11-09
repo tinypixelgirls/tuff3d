@@ -25,6 +25,8 @@ typedef struct {
     unsigned order;      /* selection stamp, highest is the lead object */
     Prim prim;           /* construction history, PRIM_NONE once components are edited */
     float nangle;        /* normal angle: 0 = hard shade, 180 = smooth, between = hard over that angle */
+    int smooth;          /* smooth mesh preview (3 on, 1 off): drawn subdivided, edited as the cage */
+    int isoHid;          /* hidden by Isolate Select, shown again when it ends */
 } Obj;
 
 enum { M_OBJ, M_VERT, M_EDGE, M_FACE, M_MULTI };   /* component modes match COMP_* */
@@ -44,6 +46,13 @@ static float mergeDist = 0.01f;     /* Mesh > Merge Vertices */
 static float bevelW = 0.1f;         /* Edit Mesh > Bevel */
 static int bridgeDivs;              /* Edit Mesh > Bridge */
 static int liveCmd;                 /* the last step was this op: its settings redo it live */
+static int symAxis, symLast = 1, symWorld, symSide = 1;   /* symmetry: 0 off, 1..3 X/Y/Z; symSide: the side being edited */
+static float symTol = 0.001f;       /* how close a vertex must be to its mirror image to count as its partner */
+static int softOn;                  /* soft selection (B) */
+static float softRad = 1;           /* its falloff radius, world units */
+static int xray, cullBack, isolateOn;
+static int smoothLv = 2;            /* smooth mesh preview subdivision level */
+static float exThick, exOff;        /* Extrude Thickness / Offset (redo the last extrude live) */
 static V3 paintCol = { 1, 0, 0 };
 static float paintOpa = 1, paintRad = 40;
 static char g_path[MAX_PATH];
@@ -53,15 +62,18 @@ static unsigned editStamp;
 static int hvObj = -1, hvKind, hvIdx, tracking, hudOn = 1;
 static int dk, dkBtn, mx0, my0, curx = -1000, cury = -1000, selMod;
 static float rad0;
-enum { D_NONE, D_PEND, D_MARQ, D_MANIP, D_TUMBLE, D_PAN, D_DOLLY, D_PAINT, D_BRUSH, D_WELD };   /* preselection highlight (hvKind 0 = whole object) */
+enum { D_NONE, D_PEND, D_MARQ, D_MANIP, D_TUMBLE, D_PAN, D_DOLLY, D_PAINT, D_BRUSH, D_WELD, D_SOFTRAD };
+static int bHeld, bUsed;   /* the soft selection key is down / was used for a radius drag meanwhile */   /* preselection highlight (hvKind 0 = whole object) */
 
-static HWND hMain, hView, hPanel, hStatus, hBar;
+static HWND hMain, hView, hPanel, hStatus, hBar, hBox;
 static HDC hdc;
 static HMENU hMenu, hThemeMenu;
 static HFONT hFont, hBold, hSmall, hHud;
 static HBRUSH swatchBrush;
 static int vw = 1, vh = 1, panelOn = 1;
-static float ds = 1;
+static float ds = 1;             /* pixels per design pixel: the screen's DPI times the UI size */
+static float dpiScale = 1;
+static int uiPct = 125;          /* Display > UI Size */
 
 static void refresh_all(void);
 static void status_text(void);
@@ -72,6 +84,8 @@ static void draw_weld(void);
 static void redraw(void) { InvalidateRect(hView, NULL, FALSE); }
 static int key(int vk) { return GetKeyState(vk) < 0; }
 static void toast(const char *s);
+static void ui_size(int pct);
+static void ui_step(int up);
 static DWORD msgT;
 static void msg(const char *s) { snprintf(g_msg, sizeof g_msg, "%s", s); msgT = GetTickCount(); toast(s); }
 
@@ -686,7 +700,7 @@ static void draw_edges(const Mesh *m, int selOnly)
    and drawn with one glDrawArrays call. The arrays are rebuilt only when geoGen changes, which
    happens on every edit or selection change, so tumbling, hovering and idle redraws are cheap. */
 
-typedef struct { const V3 *key; int nv, nf, ntri; unsigned gen; float *v; V3 lo, hi; } DrawCache;
+typedef struct { const V3 *key; int nv, nf, ntri; unsigned gen; float *v; V3 lo, hi; } DrawCache;   /* v: rgba, normal, position */
 static DrawCache *dcache;
 static int ndcache;
 static unsigned geoGen = 1;
@@ -704,9 +718,13 @@ static DrawCache *cache_get(int i)
     const Obj *o = &ob[i];
     const Mesh *m = &o->m;
     if (c->gen == geoGen && c->key == m->p && c->nv == m->nv && c->nf == m->nf) return c;
+    const Mesh *cage = m;
+    Mesh sm;
+    if (o->smooth && m->nf) { sm = mesh_smooth(m, smoothLv); m = &sm; }   /* smooth preview: draw the subdivided surface */
     int tint = o->hil && shows(M_FACE), nt = 0;
+    float alpha = xray ? 0.42f : 1;
     for (int f = 0; f < m->nf; f++) nt += m->fo[f + 1] - m->fo[f] - 2;
-    c->v = realloc(c->v, (size_t)(nt > 0 ? nt : 1) * 27 * sizeof(float));
+    c->v = realloc(c->v, (size_t)(nt > 0 ? nt : 1) * 30 * sizeof(float));
     V3 *cn = malloc((m->fo[m->nf] + 1) * sizeof(V3));
     mesh_cnormals(m, o->nangle, cn);
     float *w = c->v;
@@ -717,13 +735,15 @@ static DrawCache *cache_get(int i)
             for (int j = 0; j < 3; j++) {
                 V3 col = m->c[m->fi[cs[j]]], p = m->p[m->fi[cs[j]]], nn = cn[cs[j]];
                 if (tint && m->fs[f]) col = v3lerp(col, v3(1, 0.45f, 0.1f), 0.65f);
-                *w++ = col.x; *w++ = col.y; *w++ = col.z;
+                *w++ = col.x; *w++ = col.y; *w++ = col.z; *w++ = alpha;
                 *w++ = nn.x; *w++ = nn.y; *w++ = nn.z;
                 *w++ = p.x; *w++ = p.y; *w++ = p.z;
             }
         }
     }
     free(cn);
+    if (m != cage) mesh_free(&sm);
+    m = cage;
     c->lo = v3(1e30f, 1e30f, 1e30f);
     c->hi = v3(-1e30f, -1e30f, -1e30f);
     for (int v = 0; v < m->nv; v++) {
@@ -739,18 +759,33 @@ static DrawCache *cache_get(int i)
     return c;
 }
 
+/* backface culling: front faces wind the other way on objects with a mirroring scale */
+static void cull_begin(const Obj *o)
+{
+    if (!cullBack) return;
+    glEnable(GL_CULL_FACE);
+    glCullFace(GL_BACK);
+    glFrontFace(o->s.x * o->s.y * o->s.z < 0 ? GL_CW : GL_CCW);
+}
+
+static void cull_end(void)
+{
+    glDisable(GL_CULL_FACE);
+    glFrontFace(GL_CCW);
+}
+
 /* shade: colors and normals for lighting; otherwise positions only (depth pass) */
 static void draw_cached(int i, int shade)
 {
     DrawCache *c = cache_get(i);
     if (!c->ntri) return;
     glEnableClientState(GL_VERTEX_ARRAY);
-    glVertexPointer(3, GL_FLOAT, 9 * sizeof(float), c->v + 6);
+    glVertexPointer(3, GL_FLOAT, 10 * sizeof(float), c->v + 7);
     if (shade) {
         glEnableClientState(GL_COLOR_ARRAY);
         glEnableClientState(GL_NORMAL_ARRAY);
-        glColorPointer(3, GL_FLOAT, 9 * sizeof(float), c->v);
-        glNormalPointer(GL_FLOAT, 9 * sizeof(float), c->v + 3);
+        glColorPointer(4, GL_FLOAT, 10 * sizeof(float), c->v);
+        glNormalPointer(GL_FLOAT, 10 * sizeof(float), c->v + 4);
     }
     glDrawArrays(GL_TRIANGLES, 0, c->ntri * 3);
     glDisableClientState(GL_COLOR_ARRAY);
@@ -794,6 +829,245 @@ static int obj_raycast(int i, V3 o, V3 d, float *t)
     return mesh_raycast(&ob[i].m, lo, ld, t);
 }
 
+/* ================================================================ symmetry and soft selection
+
+   Symmetry mirrors component edits across a plane: X, Y or Z = 0 in the object's own space, or in
+   the world. Each vertex is paired with the vertex at its mirror image (found by position, see
+   mesh_sym_map); vertices on the plane are their own partners and stay on it. Selecting picks the
+   partner too, and a transform moves the side you picked (symSide) while the other side follows as
+   its mirror image. Soft selection moves the vertices around the selection too, less with distance. */
+
+static const char *SYM_NAME[4] = { "Off", "X", "Y", "Z" };
+static const float AXIS_COL[3][3] = { { .95f, .3f, .3f }, { .35f, .9f, .35f }, { .35f, .55f, 1 } };
+
+static V3 sym_pt(const Obj *o, V3 p) { return symWorld ? m4_pt(obj_mat(o), p) : p; }
+static float sym_coord(const Obj *o, V3 p) { V3 q = sym_pt(o, p); return (&q.x)[symAxis - 1]; }
+
+/* local point p of o -> its mirror image (flip 1) or its foot on the plane (flip 0), local again */
+static V3 sym_move(const Obj *o, const M4 *M, const M4 *iM, V3 p, int flip)
+{
+    int a = symAxis - 1;
+    if (!symWorld) { (&p.x)[a] = flip ? -(&p.x)[a] : 0; return p; }
+    V3 w = m4_pt(*M, p);
+    (&w.x)[a] = flip ? -(&w.x)[a] : 0;
+    (void)o;
+    return m4_pt(*iM, w);
+}
+
+typedef struct { const V3 *key; int nv, nf, ne, axis, world, mode; unsigned gen; float tol; int *vm, *em, *fm; } SymMap;
+static SymMap *smap;
+static int nsmap;
+
+/* mirror partners of object i's vertices, edges and faces (cached until the next change), or NULL
+   when symmetry is off */
+static SymMap *sym_get(int i)
+{
+    if (!symAxis || i < 0 || i >= nob) return NULL;
+    if (i >= nsmap) {
+        smap = realloc(smap, (i + 1) * sizeof *smap);
+        memset(smap + nsmap, 0, (i + 1 - nsmap) * sizeof *smap);
+        nsmap = i + 1;
+    }
+    SymMap *c = &smap[i];
+    Obj *o = &ob[i];
+    Mesh *m = &o->m;
+    if (c->vm && c->gen == geoGen && c->key == m->p && c->nv == m->nv && c->nf == m->nf && c->ne == m->ne &&
+        c->axis == symAxis && c->world == symWorld && c->tol == symTol && c->mode == mode) return c;
+    c->vm = realloc(c->vm, (m->nv + 1) * sizeof(int));
+    c->em = realloc(c->em, (m->ne + 1) * sizeof(int));
+    c->fm = realloc(c->fm, (m->nf + 1) * sizeof(int));
+    V3 *pts = NULL;
+    if (symWorld) {
+        M4 M = obj_mat(o);
+        pts = malloc((m->nv + 1) * sizeof(V3));
+        for (int v = 0; v < m->nv; v++) pts[v] = m4_pt(M, m->p[v]);
+    }
+    unsigned char *cls = malloc(m->nv + 1);
+    mesh_vmask(m, mode == M_OBJ ? COMP_MULTI : mode, cls);   /* selected or not: keeps fresh extrusions paired */
+    mesh_sym_map(m, pts, symAxis - 1, symTol, cls, c->vm);
+    mesh_sym_comps(m, c->vm, c->em, c->fm);
+    free(cls);
+    free(pts);
+    c->key = m->p; c->nv = m->nv; c->nf = m->nf; c->ne = m->ne;
+    c->axis = symAxis; c->world = symWorld; c->tol = symTol; c->mode = mode; c->gen = geoGen;
+    return c;
+}
+
+/* the mirror partner of component idx (kind M_VERT/EDGE/FACE) of object i, or -1 */
+static int sym_partner(int i, int kind, int idx)
+{
+    SymMap *c = mode == M_OBJ ? NULL : sym_get(i);
+    if (!c || idx < 0) return -1;
+    return kind == M_VERT ? c->vm[idx] : kind == M_EDGE ? c->em[idx] : c->fm[idx];
+}
+
+static V3 comp_center(const Mesh *m, int kind, int idx)
+{
+    if (kind == M_VERT) return m->p[idx];
+    if (kind == M_EDGE) return v3mul(v3add(m->p[m->ev[2 * idx]], m->p[m->ev[2 * idx + 1]]), 0.5f);
+    return mesh_fcenter(m, idx);
+}
+
+/* remember which side of the plane the user is working on */
+static void sym_note_side(int i, V3 localPt)
+{
+    if (!symAxis) return;
+    float c = sym_coord(&ob[i], localPt);
+    if (fabsf(c) > symTol) symSide = c > 0 ? 1 : -1;
+}
+
+/* also select the mirror image of every selected component of this kind */
+static void sym_select_partners(int i, int kind)
+{
+    int n;
+    unsigned char *f = comp_flags(&ob[i], kind, &n);
+    if (!sym_get(i)) return;
+    unsigned char *was = malloc(n + 1);
+    memcpy(was, f, n);
+    for (int j = 0; j < n; j++) {
+        int q = sym_partner(i, kind, j);
+        if (was[j] && q >= 0) f[q] = 1;
+    }
+    free(was);
+}
+
+/* soft selection falloff for object i around the vertices in mask (world distance), or NULL */
+static int cmp_float(const void *a, const void *b) { float d = *(const float *)a - *(const float *)b; return d > 0 ? 1 : d < 0 ? -1 : 0; }
+
+static float *soft_weights(int i, const unsigned char *mask)
+{
+    if (!softOn || mode == M_OBJ || softRad <= 0) return NULL;
+    Obj *o = &ob[i];
+    Mesh *m = &o->m;
+    M4 M = obj_mat(o);
+    V3 *w = malloc((m->nv + 1) * sizeof(V3));
+    float *wt = calloc(m->nv + 1, sizeof(float)), r = softRad;
+    int ns = 0;
+    for (int v = 0; v < m->nv; v++) { w[v] = m4_pt(M, m->p[v]); ns += mask[v] != 0; }
+    /* selected points sorted by x (x, y, z, packed) so each vertex only checks a slab */
+    float *sp = malloc((ns + 1) * 3 * sizeof(float));
+    int k = 0;
+    for (int v = 0; v < m->nv; v++) if (mask[v]) { sp[3 * k] = w[v].x; sp[3 * k + 1] = w[v].y; sp[3 * k + 2] = w[v].z; k++; }
+    qsort(sp, ns, 3 * sizeof(float), cmp_float);
+    for (int v = 0; v < m->nv; v++) {
+        if (mask[v]) { wt[v] = 1; continue; }
+        int lo = 0, hi = ns;
+        while (lo < hi) { int mid = (lo + hi) / 2; if (sp[3 * mid] < w[v].x - r) lo = mid + 1; else hi = mid; }
+        float best = r * r;
+        for (int j = lo; j < ns && sp[3 * j] <= w[v].x + r; j++) {
+            float dx = sp[3 * j] - w[v].x, dy = sp[3 * j + 1] - w[v].y, dz = sp[3 * j + 2] - w[v].z, d = dx * dx + dy * dy + dz * dz;
+            if (d < best) best = d;
+        }
+        float t = sqrtf(best) / r;
+        if (t < 1) { float f = 1 - t; wt[v] = f * f * (3 - 2 * f); }
+    }
+    free(w);
+    free(sp);
+    return wt;
+}
+
+/* soft selection weights of hilited object i for drawing (cached until the next change) */
+typedef struct { unsigned gen; const V3 *key; int nv; float rad; float *wt; } SoftCache;
+static SoftCache *scache;
+static int nscache;
+
+static const float *soft_get(int i)
+{
+    if (!softOn || mode == M_OBJ || !ob[i].hil) return NULL;
+    if (i >= nscache) {
+        scache = realloc(scache, (i + 1) * sizeof *scache);
+        memset(scache + nscache, 0, (i + 1 - nscache) * sizeof *scache);
+        nscache = i + 1;
+    }
+    SoftCache *c = &scache[i];
+    Mesh *m = &ob[i].m;
+    if (c->wt && c->key == m->p && c->nv == m->nv && c->rad == softRad && (c->gen == geoGen || dk == D_MANIP)) return c->wt;
+    free(c->wt);
+    unsigned char *mask = malloc(m->nv + 1);
+    mesh_vmask(m, mode, mask);
+    c->wt = soft_weights(i, mask);
+    free(mask);
+    c->gen = geoGen; c->key = m->p; c->nv = m->nv; c->rad = softRad;
+    return c->wt;
+}
+
+/* ---- edit sets: the vertices a component transform moves. Masters move by the transform
+   (weight 1 for the selection, less for the soft falloff); with symmetry each master's partner
+   follows as its mirror image, and vertices on the plane stay on it. */
+
+typedef struct { int obj, n, nm; int *vi, *mst; V3 *p0; float *w; unsigned char *ctr; V3 t0, r0, s0; } DEnt;
+
+static int edit_build(int i, DEnt *e)
+{
+    Obj *o = &ob[i];
+    Mesh *m = &o->m;
+    memset(e, 0, sizeof *e);
+    e->obj = i;
+    e->t0 = o->t; e->r0 = o->r; e->s0 = o->s;
+    if (mode == M_OBJ) return 1;
+    unsigned char *mask = malloc(m->nv + 1);
+    if (!mesh_vmask(m, mode, mask)) { free(mask); return 0; }
+    float *wt = soft_weights(i, mask);
+    SymMap *sm = sym_get(i);
+    signed char *role = calloc(m->nv + 1, 1);   /* 1 master, 2 follower, 3 master on the plane */
+    for (int v = 0; v < m->nv; v++) {
+        float w = mask[v] ? 1 : wt ? wt[v] : 0;
+        if (w <= 0) continue;
+        int u = sm ? sm->vm[v] : -1;
+        if (u < 0) { if (!role[v]) role[v] = 1; continue; }
+        if (u == v) { role[v] = 3; continue; }
+        float wu = mask[u] ? 1 : wt ? wt[u] : 0;
+        if (sym_coord(o, m->p[v]) * symSide > 0 || wu <= 0) { role[v] = 1; role[u] = 2; }
+        else role[v] = 2;
+    }
+    int n = 0, nm = 0;
+    for (int v = 0; v < m->nv; v++) { n += role[v] != 0; nm += role[v] == 1 || role[v] == 3; }
+    e->vi = malloc((n + 1) * sizeof(int));
+    e->mst = malloc((n + 1) * sizeof(int));
+    e->p0 = malloc((n + 1) * sizeof(V3));
+    e->w = malloc((n + 1) * sizeof(float));
+    e->ctr = calloc(n + 1, 1);
+    int *at = malloc((m->nv + 1) * sizeof(int)), j = 0;
+    for (int v = 0; v < m->nv; v++) {
+        if (role[v] != 1 && role[v] != 3) continue;
+        at[v] = j;
+        e->vi[j] = v; e->p0[j] = m->p[v]; e->mst[j] = -1; e->ctr[j] = role[v] == 3;
+        e->w[j] = mask[v] ? 1 : wt ? wt[v] : 0;
+        j++;
+    }
+    for (int v = 0; v < m->nv; v++) {
+        if (role[v] != 2) continue;
+        e->vi[j] = v; e->p0[j] = m->p[v]; e->mst[j] = at[sm->vm[v]]; e->w[j] = 0;
+        j++;
+    }
+    e->n = n;
+    e->nm = nm;
+    free(at); free(role); free(mask); free(wt);
+    return 1;
+}
+
+static void edit_free(DEnt *e)
+{
+    free(e->vi); free(e->mst); free(e->p0); free(e->w); free(e->ctr);
+    memset(e, 0, sizeof *e);
+}
+
+/* move the masters through fn (world point, weight) and let the followers mirror them */
+typedef V3 (*EditFn)(V3 w, float wt, const void *ctx);
+
+static void edit_apply(DEnt *e, EditFn fn, const void *ctx)
+{
+    Obj *o = &ob[e->obj];
+    Mesh *m = &o->m;
+    M4 M = obj_mat(o), iM = m4_inv(M);
+    for (int j = 0; j < e->nm; j++) {
+        V3 p = e->w[j] > 0 ? m4_pt(iM, fn(m4_pt(M, e->p0[j]), e->w[j], ctx)) : e->p0[j];
+        if (e->ctr[j] && symAxis) p = sym_move(o, &M, &iM, p, 0);
+        m->p[e->vi[j]] = p;
+    }
+    for (int j = e->nm; j < e->n; j++) m->p[e->vi[j]] = sym_move(o, &M, &iM, m->p[e->vi[e->mst[j]]], 1);
+}
+
 /* ================================================================ depth readback for occlusion-aware picking */
 
 static float *dbuf;
@@ -802,7 +1076,7 @@ static int dx0, dy0, dw, dh, dvalid;
 static void depth_capture(int x0, int y0, int x1, int y1)
 {
     dvalid = 0;
-    if (wire) return;
+    if (wire || xray) return;
     if (x0 < 0) x0 = 0;
     if (y0 < 0) y0 = 0;
     if (x1 > vw - 1) x1 = vw - 1;
@@ -822,7 +1096,9 @@ static void depth_capture(int x0, int y0, int x1, int y1)
         if (ob[i].hidden) continue;
         glPushMatrix();
         glMultMatrixf(M.m);
+        cull_begin(&ob[i]);
         draw_cached(i, 0);
+        cull_end();
         glPopMatrix();
     }
     glDisable(GL_POLYGON_OFFSET_FILL);
@@ -839,7 +1115,7 @@ static void depth_capture(int x0, int y0, int x1, int y1)
 
 static int visible(float x, float y, float z)
 {
-    if (wire || !dvalid) return 1;
+    if (wire || xray || !dvalid) return 1;
     int ix = (int)x, iy = (int)y;
     if (ix < dx0 || iy < dy0 || ix >= dx0 + dw || iy >= dy0 + dh) return 0;
     return z <= dbuf[(dh - 1 - (iy - dy0)) * dw + (ix - dx0)] + 2e-5f;
@@ -939,6 +1215,9 @@ static void select_click(int mx, int my, int mod)
         int n;
         unsigned char *f = comp_flags(&ob[bo], kind, &n);
         set_flag(&f[bi], mod);
+        int q = sym_partner(bo, kind, bi);   /* symmetry: its mirror image goes the same way */
+        if (q >= 0) f[q] = f[bi];
+        sym_note_side(bo, comp_center(&ob[bo].m, kind, bi));
         return;
     }
     /* clicked another object: hilite it for component editing */
@@ -971,20 +1250,27 @@ static void select_rect(int x0, int y0, int x1, int y1, int mod)
             continue;
         }
         if (!o->hil) continue;
-        if (shows(M_VERT)) {
-            for (int v = 0; v < m->nv; v++)
-                if (proj(m4_pt(M, m->p[v]), &x, &y, &z) && INSIDE(x, y) && visible(x, y, z)) set_flag(&m->vs[v], mod);
-        }
-        if (shows(M_EDGE)) {
-            for (int e = 0; e < m->ne; e++) {
-                V3 c = v3mul(v3add(m->p[m->ev[2 * e]], m->p[m->ev[2 * e + 1]]), 0.5f);
-                if (proj(m4_pt(M, c), &x, &y, &z) && INSIDE(x, y) && visible(x, y, z)) set_flag(&m->es[e], mod);
+        /* gather what is inside first, add the mirror images, then flip each flag once */
+        float side = 0;
+        for (int k = M_VERT; k <= M_FACE; k++) {
+            if (!shows(k)) continue;
+            int n;
+            unsigned char *flags = comp_flags(o, k, &n), *hit = calloc(n + 1, 1);
+            for (int j = 0; j < n; j++) {
+                V3 c = comp_center(m, k, j);
+                if (proj(m4_pt(M, c), &x, &y, &z) && INSIDE(x, y) && visible(x, y, z)) {
+                    hit[j] = 1;
+                    if (symAxis) side += sym_coord(o, c);
+                }
             }
+            for (int j = 0; j < n; j++) {
+                int q = hit[j] == 1 ? sym_partner(i, k, j) : -1;
+                if (q >= 0) hit[q] |= 2;
+            }
+            for (int j = 0; j < n; j++) if (hit[j]) set_flag(&flags[j], mod);
+            free(hit);
         }
-        if (shows(M_FACE)) {
-            for (int f = 0; f < m->nf; f++)
-                if (proj(m4_pt(M, mesh_fcenter(m, f)), &x, &y, &z) && INSIDE(x, y) && visible(x, y, z)) set_flag(&m->fs[f], mod);
-        }
+        if (symAxis && fabsf(side) > symTol) symSide = side > 0 ? 1 : -1;
     }
 #undef INSIDE
 }
@@ -1277,8 +1563,10 @@ static int sel_bbox(V3 *mn, V3 *mx, int all)
             }
         }
         M4 M = obj_mat(o);
+        SymMap *sm = mask ? sym_get(i) : NULL;
         for (int v = 0; v < m->nv; v++) {
             if (mask && !mask[v]) continue;
+            if (sm && sm->vm[v] >= 0 && sm->vm[v] != v && mask[sm->vm[v]] && sym_coord(o, m->p[v]) * symSide < 0) continue;
             V3 p = m4_pt(M, m->p[v]);
             mn->x = fminf(mn->x, p.x); mn->y = fminf(mn->y, p.y); mn->z = fminf(mn->z, p.z);
             mx->x = fmaxf(mx->x, p.x); mx->y = fmaxf(mx->y, p.y); mx->z = fmaxf(mx->z, p.z);
@@ -1435,13 +1723,15 @@ static M4 manip_frame(void)
     return m4_id();
 }
 
-typedef struct { int obj, n; int *vi; V3 *p0; V3 t0, r0, s0; } DEnt;
 static struct {
     int on, handle, mx0, my0, dirty, planeMode;
     V3 piv, cur, ax[3], axis, pn, hit0, prevv;
     float L, Lpx, t0, ang, tdx, tdy, sdx, sdy;
     DEnt *e;
     int ne;
+    V3 delta, sv;      /* this step's move and scale */
+    M4 R;              /* and rotation (full weight) */
+    float a;           /* rotation angle */
 } dg;
 
 static MG mg_get(void)
@@ -1592,30 +1882,26 @@ static void drag_begin(int h, int mx, int my)
 
     /* remember the original state; every drag step is applied from it */
     dg.e = calloc(nob + 1, sizeof(DEnt));
-    for (int i = 0; i < nob; i++) {
-        Obj *ob_ = &ob[i];
-        if (!active(ob_)) continue;
-        DEnt *e = &dg.e[dg.ne];
-        e->obj = i;
-        e->t0 = ob_->t;
-        e->r0 = ob_->r;
-        e->s0 = ob_->s;
-        if (mode != M_OBJ) {
-            unsigned char *mask = malloc(ob_->m.nv + 1);
-            int n = mesh_vmask(&ob_->m, mode, mask);
-            if (!n) { free(mask); continue; }
-            e->vi = malloc(n * sizeof(int));
-            e->p0 = malloc(n * sizeof(V3));
-            for (int v = 0; v < ob_->m.nv; v++)
-                if (mask[v]) { e->vi[e->n] = v; e->p0[e->n] = ob_->m.p[v]; e->n++; }
-            free(mask);
-        }
-        dg.ne++;
-    }
+    for (int i = 0; i < nob; i++)
+        if (active(&ob[i]) && edit_build(i, &dg.e[dg.ne])) dg.ne++;
     dg.on = 1;
 }
 
 static float nz(float v) { return fabsf(v) < 5e-4f ? 0 : v; }   /* no "-0.000" in readouts */
+
+/* one drag step for a world point at soft selection weight wt */
+static V3 drag_xf(V3 w, float wt, const void *ctx)
+{
+    (void)ctx;
+    if (tool == T_MOVE) return v3add(w, v3mul(dg.delta, wt));
+    if (tool == T_ROTATE) {
+        M4 R = wt >= 1 ? dg.R : m4_axis_angle(dg.axis, dg.a * wt);
+        return v3add(dg.piv, m4_dir(R, v3sub(w, dg.piv)));
+    }
+    V3 dd = v3sub(w, dg.piv), n = dg.piv;
+    for (int c = 0; c < 3; c++) n = v3add(n, v3mul(dg.ax[c], v3dot(dd, dg.ax[c]) * (1 + ((&dg.sv.x)[c] - 1) * wt)));
+    return n;
+}
 
 static int snapOn;      /* point snap found a target this drag step */
 static V3 snapAt;
@@ -1700,6 +1986,7 @@ static void drag_move(int mx, int my)
         float a = dg.ang;
         if (key('J')) a = roundf(a / (PI_F / 12)) * (PI_F / 12);   /* hold J: 15 degree steps */
         R = m4_axis_angle(dg.axis, a);
+        dg.a = a;
         snprintf(g_msg, sizeof g_msg, "Rotate %.1f deg%s", nz(a * 180 / PI_F), key('J') ? "  (15 deg steps)" : "");
     } else {
         float f = 1 + ((mx - dg.mx0) * dg.sdx + (my - dg.my0) * dg.sdy) / dg.Lpx;
@@ -1717,6 +2004,9 @@ static void drag_move(int mx, int my)
         undo_push(tool == T_MOVE ? "Move" : tool == T_ROTATE ? "Rotate" : "Scale");
         dg.dirty = 1;
     }
+    dg.delta = delta;
+    dg.R = R;
+    dg.sv = sv;
     for (int k = 0; k < dg.ne; k++) {
         DEnt *e = &dg.e[k];
         Obj *ob_ = &ob[e->obj];
@@ -1726,20 +2016,7 @@ static void drag_move(int mx, int my)
             else ob_->s = v3(e->s0.x * sv.x, e->s0.y * sv.y, e->s0.z * sv.z);
             continue;
         }
-        M4 M = obj_mat(ob_), iM = m4_inv(M);
-        for (int j = 0; j < e->n; j++) {
-            V3 w = m4_pt(M, e->p0[j]);
-            if (tool == T_MOVE) {
-                w = v3add(w, delta);
-            } else if (tool == T_ROTATE) {
-                w = v3add(dg.piv, m4_dir(R, v3sub(w, dg.piv)));
-            } else {
-                V3 dd = v3sub(w, dg.piv), n = dg.piv;
-                for (int c = 0; c < 3; c++) n = v3add(n, v3mul(dg.ax[c], v3dot(dd, dg.ax[c]) * (&sv.x)[c]));
-                w = n;
-            }
-            ob_->m.p[e->vi[j]] = m4_pt(iM, w);
-        }
+        edit_apply(e, drag_xf, NULL);
     }
     dg.cur = v3add(dg.piv, delta);
     geo_changed();
@@ -1749,8 +2026,7 @@ static void drag_end(void)
 {
     for (int k = 0; k < dg.ne; k++) {
         if (dg.dirty && mode != M_OBJ) ob[dg.e[k].obj].prim.type = PRIM_NONE;
-        free(dg.e[k].vi);
-        free(dg.e[k].p0);
+        edit_free(&dg.e[k]);
     }
     free(dg.e);
     dg.e = NULL;
@@ -1851,7 +2127,7 @@ static void draw_manip(void)
 
 /* ================================================================ vertex paint */
 
-static struct { int on, dirty, n; int *obj; V3 **orig; float **wt; } ps;
+static struct { int on, dirty, n; int *obj; V3 **orig; float **wt; int **vm; } ps;   /* vm: symmetry partners */
 
 static void paint_dab(int mx, int my)
 {
@@ -1872,6 +2148,8 @@ static void paint_dab(int mx, int my)
             if (!ps.dirty) { undo_push("Paint Vertex Color"); ps.dirty = 1; }
             ps.wt[k][v] = w;
             m->c[v] = v3lerp(ps.orig[k][v], paintCol, w);
+            int q = ps.vm[k] ? ps.vm[k][v] : -1;   /* symmetry paints the mirror image too */
+            if (q >= 0 && w > ps.wt[k][q]) { ps.wt[k][q] = w; m->c[q] = v3lerp(ps.orig[k][q], paintCol, w); }
         }
     }
     geo_changed();
@@ -1887,9 +2165,12 @@ static void paint_begin(int mx, int my)
     ps.obj = malloc((nob + 1) * sizeof(int));
     ps.orig = malloc((nob + 1) * sizeof(V3 *));
     ps.wt = malloc((nob + 1) * sizeof(float *));
+    ps.vm = calloc(nob + 1, sizeof(int *));
     for (int i = 0; i < nob; i++) {
         if (any && !active(&ob[i])) continue;
         Mesh *m = &ob[i].m;
+        SymMap *sm = sym_get(i);
+        if (sm) { ps.vm[ps.n] = malloc((m->nv + 1) * sizeof(int)); memcpy(ps.vm[ps.n], sm->vm, m->nv * sizeof(int)); }
         ps.obj[ps.n] = i;
         ps.orig[ps.n] = malloc((m->nv + 1) * sizeof(V3));
         memcpy(ps.orig[ps.n], m->c, m->nv * sizeof(V3));
@@ -1902,8 +2183,8 @@ static void paint_begin(int mx, int my)
 
 static void paint_end(void)
 {
-    for (int k = 0; k < ps.n; k++) { free(ps.orig[k]); free(ps.wt[k]); }
-    free(ps.obj); free(ps.orig); free(ps.wt);
+    for (int k = 0; k < ps.n; k++) { free(ps.orig[k]); free(ps.wt[k]); free(ps.vm[k]); }
+    free(ps.obj); free(ps.orig); free(ps.wt); free(ps.vm);
     memset(&ps, 0, sizeof ps);
 }
 
@@ -2124,9 +2405,15 @@ enum {
     CM_BEVEL, CM_BRIDGE, CM_HARDEN, CM_SOFTEN,
     CM_ORTHO, CM_IMGFRONT, CM_IMGSIDE, CM_IMGTOP, CM_IMGCLEAR, CM_EXPORT_OBJ,
     CM_MANIPUP, CM_MANIPDOWN, CM_COMPTOG, CM_HOTKEYS,
-    CM_RECENT = 300,             /* + recent file index */
-    CM_THEME = 200               /* + theme index */
+    CM_SYMTOG, CM_SYMOFF, CM_SYMX, CM_SYMY, CM_SYMZ, CM_SYMWORLD, CM_SOFTTOG,
+    CM_MIRROR, CM_MIRRORX, CM_MIRRORY, CM_MIRRORZ, CM_SMOOTHMESH, CM_PREVON, CM_PREVOFF, CM_PREVTOG,
+    CM_XRAY, CM_CULL, CM_ISOLATE, CM_RING, CM_CONE, CM_TORUS, CM_PIPE, CM_UIBIGGER, CM_UISMALLER,
+    CM_LAST,
+    CM_THEME = 500,              /* + theme index */
+    CM_RECENT = 600,             /* + recent file index */
+    CM_UIS = 700                 /* + UI size choice */
 };
+typedef char cm_ids_fit[CM_LAST <= CM_THEME ? 1 : -1];
 
 /* ---- hotkeys: each command can have two keys. The defaults are Maya's; Help > Hotkey Editor
    changes them, and the menus and toolbar show whatever is set. A key is its virtual key code plus
@@ -2147,6 +2434,12 @@ static Bind binds[] = {
     { CM_TCUT, "Tools", "Multi-Cut Tool", { 0 }, { 0 } },
     { CM_MANIPUP, "Tools", "Bigger Manipulator", { VK_OEM_PLUS, VK_ADD }, { 0 } },
     { CM_MANIPDOWN, "Tools", "Smaller Manipulator", { VK_OEM_MINUS, VK_SUBTRACT }, { 0 } },
+    { CM_SYMTOG, "Tools", "Symmetry On/Off", { 'S' }, { 0 } },
+    { CM_SYMX, "Tools", "Symmetry X", { 0 }, { 0 } },
+    { CM_SYMY, "Tools", "Symmetry Y", { 0 }, { 0 } },
+    { CM_SYMZ, "Tools", "Symmetry Z", { 0 }, { 0 } },
+    { CM_SYMWORLD, "Tools", "Symmetry Object/World", { 0 }, { 0 } },
+    { CM_SOFTTOG, "Tools", "Soft Selection On/Off", { 'B' }, { 0 } },
     { CM_COMPTOG, "Selection", "Object / Component Mode", { VK_F8 }, { 0 } },
     { CM_MVERT, "Selection", "Vertex Mode", { VK_F9 }, { 0 } },
     { CM_MEDGE, "Selection", "Edge Mode", { VK_F10 }, { 0 } },
@@ -2160,6 +2453,7 @@ static Bind binds[] = {
     { CM_GROW, "Selection", "Grow Selection", { VK_OEM_PERIOD }, { 0 } },
     { CM_SHRINK, "Selection", "Shrink Selection", { VK_OEM_COMMA }, { 0 } },
     { CM_LOOP, "Selection", "Select Edge Loop", { 0 }, { 0 } },
+    { CM_RING, "Selection", "Select Edge Ring", { 0 }, { 0 } },
     { CM_UNDO, "Edit", "Undo", { 'Z', KC_CTRL | 'Z' }, { 0 } },
     { CM_REDO, "Edit", "Redo", { KC_SHIFT | 'Z', KC_CTRL | 'Y' }, { 0 } },
     { CM_REPEAT, "Edit", "Repeat Last", { 'G' }, { 0 } },
@@ -2179,6 +2473,8 @@ static Bind binds[] = {
     { CM_TRIANG, "Mesh", "Triangulate", { 0 }, { 0 } },
     { CM_QUAD, "Mesh", "Quadrangulate", { 0 }, { 0 } },
     { CM_REVERSE, "Mesh", "Reverse Normals", { 0 }, { 0 } },
+    { CM_MIRROR, "Mesh", "Mirror", { 0 }, { 0 } },
+    { CM_SMOOTHMESH, "Mesh", "Smooth (Subdivide)", { 0 }, { 0 } },
     { CM_FREEZE, "Modify", "Freeze Transformations", { 0 }, { 0 } },
     { CM_CENTERPIV, "Modify", "Center Pivot", { 0 }, { 0 } },
     { CM_RESETXF, "Modify", "Reset Transformations", { 0 }, { 0 } },
@@ -2191,6 +2487,13 @@ static Bind binds[] = {
     { CM_AUTOSMOOTH, "Display", "Auto Smooth", { 0 }, { 0 } },
     { CM_HARDEN, "Display", "Harden Edge", { 0 }, { 0 } },
     { CM_SOFTEN, "Display", "Soften Edge", { 0 }, { 0 } },
+    { CM_PREVON, "Display", "Smooth Preview On", { '3' }, { 0 } },
+    { CM_PREVOFF, "Display", "Smooth Preview Off", { '1' }, { 0 } },
+    { CM_XRAY, "Display", "X-Ray", { 0 }, { 0 } },
+    { CM_CULL, "Display", "Backface Culling", { 0 }, { 0 } },
+    { CM_ISOLATE, "Display", "Isolate Select", { KC_CTRL | '1' }, { 0 } },
+    { CM_UIBIGGER, "Display", "Bigger UI", { KC_CTRL | VK_OEM_PLUS }, { 0 } },
+    { CM_UISMALLER, "Display", "Smaller UI", { KC_CTRL | VK_OEM_MINUS }, { 0 } },
     { CM_FRAMESEL, "Display", "Frame Selected", { 'F' }, { 0 } },
     { CM_FRAMEALL, "Display", "Frame All", { 'A' }, { 0 } },
     { CM_VHOME, "Display", "Home View", { VK_HOME }, { 0 } },
@@ -2289,8 +2592,10 @@ static void menu_keys(void)
 
 static void cmd_create(int type)
 {
-    static const char *names[] = { "", "pCube", "pCylinder", "pSphere", "pPlane" };
-    static const char *what[] = { "", "Create Cube", "Create Cylinder", "Create Sphere", "Create Plane" };
+    static const char *names[] = { "", "pCube", "pCylinder", "pSphere", "pPlane", "pCone", "pTorus", "pPipe" };
+    static const char *what[] = { "", "Create Cube", "Create Cylinder", "Create Sphere", "Create Plane", "Create Cone", "Create Torus", "Create Pipe" };
+    static const char *tip[] = { "", "size and divisions", "sides, radius and height", "sides, rings and radius", "size and divisions",
+                                 "sides, radius and height", "sides, rings and both radii", "sides, thickness and height" };
     undo_push(what[type]);
     set_mode(M_OBJ);
     clear_sel();
@@ -2300,8 +2605,8 @@ static void cmd_create(int type)
     o->m = mesh_prim(&o->prim);
     o->sel = 1;
     o->order = ++stamp;
-    char b[64];
-    snprintf(b, sizeof b, "Created %s", o->name);
+    char b[128];
+    snprintf(b, sizeof b, "Created %s - its %s are in the side panel (drag a label or use - / +)", o->name, tip[type]);
     msg(b);
 }
 
@@ -2327,6 +2632,7 @@ static void cmd_select_all(int invert)
 
 static void cmd_extrude(void)
 {
+    if (mode == M_VERT) { msg("Extrude: select faces or edges (F10 / F11), or press Ctrl+F11 to turn these vertices into faces"); return; }
     if (mode != M_FACE && mode != M_EDGE && mode != M_MULTI) { msg("Extrude: select faces or edges"); return; }
     if (!has_sel()) { msg("Extrude: nothing selected"); return; }
     /* multi: extrude the faces if any are selected, else the edges */
@@ -2341,10 +2647,14 @@ static void cmd_extrude(void)
         int ok = faces ? mesh_extrude_faces(&o->m) : mesh_extrude_edges(&o->m);
         if (!ok) continue;
         o->prim.type = PRIM_NONE;
+        if (faces && (exThick != 0 || exOff != 0)) mesh_offset_faces(&o->m, exThick, exOff);
         if (faces) {
             M4 iM = m4_inv(obj_mat(o));
+            SymMap *sm = sym_get(i);
             for (int f = 0; f < o->m.nf; f++) {
                 if (!o->m.fs[f]) continue;
+                int q = sm ? sm->fm[f] : -1;   /* the mirrored side follows: aim the handle at this side */
+                if (q >= 0 && q != f && o->m.fs[q] && sym_coord(o, mesh_fcenter(&o->m, f)) * symSide < 0) continue;
                 V3 ln = mesh_fnormal(&o->m, f);   /* normal to world: inverse transpose */
                 n = v3add(n, v3norm(v3(v3dot(ln, m4_col(iM, 0)), v3dot(ln, m4_col(iM, 1)), v3dot(ln, m4_col(iM, 2)))));
             }
@@ -2360,7 +2670,9 @@ static void cmd_extrude(void)
         normalFrame = 1;
         lastHandle = H_Z;
     }
-    msg("Extruded - drag the blue (Z) handle to pull along the normal");
+    msg(faces ? "Extruded - drag the blue (Z) handle to pull, or set Thickness / Offset in the side panel"
+              : "Extruded the edges - drag to pull them out");
+    if (faces) liveCmd = CM_EXTRUDE;
 }
 
 /* Mesh > Fill Hole: caps the open borders that the selected vertices, edges or faces touch, or every
@@ -2771,6 +3083,7 @@ static void live_redo(int cmd)
     if (liveCmd != cmd || !nundo) return;
     snap_restore(&undo_s[--nundo]);
     if (cmd == CM_BEVEL) cmd_bevel();
+    else if (cmd == CM_EXTRUDE) cmd_extrude();
     else cmd_bridge();
 }
 
@@ -2800,6 +3113,122 @@ static void cmd_shade(float angle, const char *what)
     char b[96];
     snprintf(b, sizeof b, "%s%s", what, lead() ? "" : " (for new objects)");
     msg(b);
+}
+
+/* ---- symmetry, soft selection and the display toggles */
+
+static void sym_set(int axis)
+{
+    char b[160];
+    symAxis = axis;
+    if (axis) symLast = axis;
+    reg_set_int("SymAxis", symLast);
+    reg_set_int("SymWorld", symWorld);
+    geo_changed();
+    if (!axis) { msg("Symmetry off"); return; }
+    snprintf(b, sizeof b, "Symmetry %s (%s) - edits on one side are mirrored to the other%s", SYM_NAME[axis],
+             symWorld ? "world" : "object space", mode == M_OBJ ? ". It works on vertices, edges and faces (F9-F11)" : "");
+    msg(b);
+}
+
+static void cmd_soft(void)
+{
+    softOn = !softOn;
+    geo_changed();
+    char b[128];
+    snprintf(b, sizeof b, softOn ? "Soft selection on (radius %g) - hold B and drag to change the radius" : "Soft selection off", softRad);
+    msg(b);
+}
+
+/* Mesh > Mirror: each selected object gets a mirrored copy of itself across its own X, Y or Z = 0
+   plane, welded along the seam (vertices within Merge Distance of the plane). An object that sits
+   on one side is mirrored to the other; one that spans the plane keeps its bigger side, which is
+   then copied over the other (a quick way to make a model symmetric again). */
+static void cmd_mirror(int axis)
+{
+    if (!axis) axis = symAxis ? symAxis : symLast;
+    int n = 0, kept = 0;
+    float tol = mergeDist > 1e-5f ? mergeDist : 1e-5f;
+    for (int i = 0; i < nob; i++) {
+        if (!active(&ob[i])) continue;
+        if (!n++) undo_push("Mirror");
+        Mesh *m = &ob[i].m;
+        float lo = 1e30f, hi = -1e30f;
+        for (int v = 0; v < m->nv; v++) { float c = (&m->p[v].x)[axis - 1]; lo = fminf(lo, c); hi = fmaxf(hi, c); }
+        int keep = hi <= tol || lo >= -tol ? 0 : hi >= -lo ? 1 : -1;
+        kept |= keep != 0;
+        mesh_mirror(m, axis - 1, tol, keep);
+        ob[i].prim.type = PRIM_NONE;
+    }
+    if (!n) { msg("Mirror: select objects (or components of them) first"); return; }
+    char b[200];
+    snprintf(b, sizeof b, "Mirrored across %s%s - the seam is welded.%s", SYM_NAME[axis],
+             kept ? " (kept the bigger side)" : "", symAxis ? "" : " Press S for symmetry to keep both halves matched");
+    msg(b);
+}
+
+static void cmd_smooth_mesh(void)
+{
+    int n = 0;
+    for (int i = 0; i < nob; i++) {
+        if (!active(&ob[i])) continue;
+        if (!n++) undo_push("Smooth");
+        Mesh s2 = mesh_smooth(&ob[i].m, 1);
+        mesh_free(&ob[i].m);
+        ob[i].m = s2;
+        ob[i].prim.type = PRIM_NONE;
+    }
+    msg(n ? "Smoothed (each face split in four, rounded) - press 3 instead for a preview that keeps the mesh light"
+          : "Smooth: select objects first");
+}
+
+/* smooth mesh preview on the selected objects (all of them when nothing is selected); on: 1, 0, -1 toggles */
+static void cmd_preview(int on)
+{
+    int any = 0, n = 0;
+    for (int i = 0; i < nob; i++) any |= active(&ob[i]);
+    for (int i = 0; i < nob; i++) {
+        if (any ? !active(&ob[i]) : ob[i].hidden) continue;
+        int v = on < 0 ? !ob[i].smooth : on;
+        if (ob[i].smooth != v) { ob[i].smooth = v; n++; modified = 1; }
+    }
+    char b[128];
+    if (on > 0 || (on < 0 && n)) snprintf(b, sizeof b, "Smooth preview on (level %d, 1 turns it off) - you still edit the cage", smoothLv);
+    else snprintf(b, sizeof b, "Smooth preview off");
+    msg(b);
+}
+
+/* Ctrl+1: show only the selection; again: show the rest again */
+static void cmd_isolate(void)
+{
+    if (isolateOn) {
+        for (int i = 0; i < nob; i++) if (ob[i].isoHid) { ob[i].hidden = 0; ob[i].isoHid = 0; }
+        isolateOn = 0;
+        msg("Showing everything again");
+        return;
+    }
+    int any = 0;
+    for (int i = 0; i < nob; i++) any |= active(&ob[i]);
+    if (!any) { msg("Isolate Select: select what you want to see first"); return; }
+    for (int i = 0; i < nob; i++)
+        if (!active(&ob[i]) && !ob[i].hidden) { ob[i].hidden = 1; ob[i].isoHid = 1; }
+    isolateOn = 1;
+    msg("Isolated the selection - Ctrl+1 shows everything again");
+}
+
+static void cmd_ring(void)
+{
+    int n = 0;
+    for (int i = 0; i < nob; i++) {
+        Mesh *m = &ob[i].m;
+        if (!ob[i].hil || !shows(M_EDGE)) continue;
+        unsigned char *was = malloc(m->ne + 1);
+        memcpy(was, m->es, m->ne);
+        for (int e = 0; e < m->ne; e++) if (was[e]) { mesh_ring_select(m, e); n++; }
+        free(was);
+        sym_select_partners(i, M_EDGE);
+    }
+    msg(n ? "Selected edge rings" : "Edge Ring: select an edge first (edge mode)");
 }
 
 static void cmd_apply_color(void)
@@ -2865,6 +3294,7 @@ static int tuff_save(const char *path, int selOnly)
     int n = 0;
     fprintf(f, "tuff3d scene 1\n");
     fprintf(f, "camera %.9g %.9g %.9g %.9g %.9g %.9g %d\n", coi.x, coi.y, coi.z, yaw, pitch, dist, ortho);
+    fprintf(f, "symmetry %d %d %.9g\n", symAxis, symWorld, symTol);
     for (int i = 0; i < 3; i++)
         if (img[i].tex) fprintf(f, "image %d %.9g %.9g %.9g %.9g %s\n", i, img[i].size, img[i].ox, img[i].oy, img[i].opa, img[i].path);
     for (int i = 0; i < nob; i++) {
@@ -2873,11 +3303,16 @@ static int tuff_save(const char *path, int selOnly)
         const Prim *q = &o->prim;
         if (selOnly && !active(o)) continue;
         fprintf(f, "object %s\n", o->name);
+        int hid = o->hidden && !o->isoHid;   /* objects Isolate Select hid are saved as shown */
         fprintf(f, "xform %.9g %.9g %.9g %.9g %.9g %.9g %.9g %.9g %.9g\n", o->t.x, o->t.y, o->t.z, o->r.x, o->r.y, o->r.z, o->s.x, o->s.y, o->s.z);
-        fprintf(f, "shade %.9g\nhidden %d\n", o->nangle, o->hidden);
-        fprintf(f, "prim %d %.9g %.9g %.9g %d %d %d %.9g %.9g %d %d %d %d %d %.9g %d %d %.9g %.9g %d %d\n", q->type,
+        fprintf(f, "shade %.9g\nhidden %d\n", o->nangle, hid);
+        fprintf(f, "prim %d %.9g %.9g %.9g %d %d %d %.9g %.9g %d %d %d %d %d %.9g %d %d %.9g %.9g %d %d"
+                   " %.9g %.9g %d %d %d %.9g %.9g %d %d %.9g %.9g %.9g %d %d\n", q->type,
                 q->w, q->h, q->d, q->sw, q->sh, q->sd, q->cr, q->ch, q->csides, q->chseg, q->ccap, q->ctop, q->cbot,
-                q->sr, q->scols, q->srows, q->pw, q->pd, q->psw, q->psd);
+                q->sr, q->scols, q->srows, q->pw, q->pd, q->psw, q->psd,
+                q->kr, q->kh, q->ksides, q->khseg, q->kcap, q->tr, q->tsec, q->tsides, q->tsegs,
+                q->ur, q->uh, q->ut, q->usides, q->uhseg);
+        if (o->smooth) fprintf(f, "smooth 1\n");
         for (int v = 0; v < m->nv; v++)
             fprintf(f, "v %.9g %.9g %.9g %.6g %.6g %.6g\n", m->p[v].x, m->p[v].y, m->p[v].z, m->c[v].x, m->c[v].y, m->c[v].z);
         for (int fc = 0; fc < m->nf; fc++) {
@@ -2928,6 +3363,14 @@ static int tuff_load(const char *path, int camera, int images)
             if (camera && sscanf(line + 7, "%f %f %f %f %f %f %d", &cc.x, &cc.y, &cc.z, &y, &pt, &d, &orth) == 7 && d > 0) {
                 coi = cc; yaw = y; pitch = pt; dist = d; ortho = orth != 0;
             }
+        } else if (!strncmp(line, "symmetry ", 9)) {
+            int a, w;
+            float tl;
+            if (camera && sscanf(line + 9, "%d %d %f", &a, &w, &tl) == 3 && a >= 0 && a <= 3) {
+                symAxis = a; symWorld = w != 0;
+                if (a) symLast = a;
+                if (tl > 0) symTol = tl;
+            }
         } else if (!strncmp(line, "image ", 6)) {
             int slot, pos = 0;
             float sz, ox, oy, op;
@@ -2944,11 +3387,17 @@ static int tuff_load(const char *path, int camera, int images)
             c->o.hidden = atoi(line + 7) != 0;
         } else if (!strncmp(line, "prim ", 5)) {
             Prim *q = &c->o.prim;
-            int k = sscanf(line + 5, "%d %f %f %f %d %d %d %f %f %d %d %d %d %d %f %d %d %f %f %d %d", &q->type,
+            prim_defaults(q, PRIM_NONE);   /* files from before cones, tori and pipes leave theirs at the defaults */
+            int k = sscanf(line + 5, "%d %f %f %f %d %d %d %f %f %d %d %d %d %d %f %d %d %f %f %d %d"
+                           " %f %f %d %d %d %f %f %d %d %f %f %f %d %d", &q->type,
                            &q->w, &q->h, &q->d, &q->sw, &q->sh, &q->sd, &q->cr, &q->ch, &q->csides, &q->chseg, &q->ccap,
-                           &q->ctop, &q->cbot, &q->sr, &q->scols, &q->srows, &q->pw, &q->pd, &q->psw, &q->psd);
-            if (k != 21 || q->type < 0 || q->type >= PRIM_COUNT) q->type = PRIM_NONE;
+                           &q->ctop, &q->cbot, &q->sr, &q->scols, &q->srows, &q->pw, &q->pd, &q->psw, &q->psd,
+                           &q->kr, &q->kh, &q->ksides, &q->khseg, &q->kcap, &q->tr, &q->tsec, &q->tsides, &q->tsegs,
+                           &q->ur, &q->uh, &q->ut, &q->usides, &q->uhseg);
+            if ((k != 21 && k != 35) || q->type < 0 || q->type >= PRIM_COUNT || (k == 21 && q->type > PRIM_PLANE)) q->type = PRIM_NONE;
             else prim_clamp(q);
+        } else if (!strncmp(line, "smooth ", 7)) {
+            c->o.smooth = atoi(line + 7) != 0;
         } else if (line[0] == 'v' && line[1] == ' ') {
             if (c->nv == c->cv) { c->cv = c->cv * 2 + 64; c->p = realloc(c->p, c->cv * sizeof(V3)); c->c = realloc(c->c, c->cv * sizeof(V3)); }
             V3 *p = &c->p[c->nv], *cl = &c->c[c->nv];
@@ -3082,6 +3531,7 @@ static void load_file(const char *path, int replace)
         if (replace) {
             for (int i = 0; i < nob; i++) mesh_free(&ob[i].m);
             nob = 0;
+            isolateOn = 0;
             for (int i = 0; i < 3; i++) img_clear(i);
         }
         set_mode(M_OBJ);
@@ -3127,6 +3577,7 @@ static void load_file(const char *path, int replace)
     if (replace) {
         for (int i = 0; i < nob; i++) mesh_free(&ob[i].m);
         nob = 0;
+        isolateOn = 0;
     }
     set_mode(M_OBJ);
     clear_sel();
@@ -3360,7 +3811,8 @@ static void cmd_hide(void)
 static void cmd_show_all(void)
 {
     int n = 0;
-    for (int i = 0; i < nob; i++) if (ob[i].hidden) { ob[i].hidden = 0; n++; }
+    for (int i = 0; i < nob; i++) if (ob[i].hidden) { ob[i].hidden = 0; ob[i].isoHid = 0; n++; }
+    isolateOn = 0;
     char b[64];
     snprintf(b, sizeof b, "Showing %d hidden object(s)", n);
     msg(n ? b : "Nothing is hidden");
@@ -4068,6 +4520,7 @@ static void do_cmd(int id)
         theme_apply(id - CM_THEME, 1);
         if (hPick) { pkKept = themeIdx; InvalidateRect(hPick, NULL, FALSE); }
     }
+    if (id >= CM_UIS && id < CM_UIS + 5) ui_size(100 + 25 * (id - CM_UIS));
     if (id >= CM_RECENT && id < CM_RECENT + NRECENT && recent[id - CM_RECENT][0]) {
         char p[MAX_PATH];
         strcpy(p, recent[id - CM_RECENT]);
@@ -4081,6 +4534,7 @@ static void do_cmd(int id)
         nob = 0;
         for (int i = 0; i < 3; i++) img_clear(i);
         mode = M_OBJ;
+        isolateOn = 0;
         g_path[0] = 0;
         g_suggest[0] = 0;
         modified = 0;
@@ -4115,6 +4569,26 @@ static void do_cmd(int id)
         break;
     }
     case CM_HUD: hudOn = !hudOn; break;
+    case CM_SYMTOG: sym_set(symAxis ? 0 : symLast); break;
+    case CM_SYMOFF: sym_set(0); break;
+    case CM_SYMX: case CM_SYMY: case CM_SYMZ: sym_set(id - CM_SYMX + 1); break;
+    case CM_SYMWORLD: symWorld = !symWorld; sym_set(symAxis); break;
+    case CM_SOFTTOG: cmd_soft(); break;
+    case CM_MIRROR: cmd_mirror(0); break;
+    case CM_MIRRORX: case CM_MIRRORY: case CM_MIRRORZ: cmd_mirror(id - CM_MIRRORX + 1); break;
+    case CM_SMOOTHMESH: cmd_smooth_mesh(); break;
+    case CM_PREVON: cmd_preview(1); break;
+    case CM_PREVOFF: cmd_preview(0); break;
+    case CM_PREVTOG: cmd_preview(-1); break;
+    case CM_XRAY: xray = !xray; geo_changed(); msg(xray ? "X-Ray on - see and select through surfaces" : "X-Ray off"); break;
+    case CM_CULL: cullBack = !cullBack; msg(cullBack ? "Backface culling on - faces seen from behind are hidden" : "Backface culling off"); break;
+    case CM_ISOLATE: cmd_isolate(); break;
+    case CM_RING: cmd_ring(); break;
+    case CM_CONE: cmd_create(PRIM_CONE); break;
+    case CM_TORUS: cmd_create(PRIM_TORUS); break;
+    case CM_PIPE: cmd_create(PRIM_PIPE); break;
+    case CM_UIBIGGER: ui_step(1); break;
+    case CM_UISMALLER: ui_step(0); break;
     case CM_COMPTOG: set_mode(mode == M_OBJ ? lastComp : M_OBJ); break;
     case CM_HOTKEYS: hotkey_editor(); break;
     case CM_MANIPUP: case CM_MANIPDOWN: {
@@ -4153,7 +4627,7 @@ static void do_cmd(int id)
     case CM_PLANE: cmd_create(PRIM_PLANE); break;
     case CM_SELALL: cmd_select_all(0); break;
     case CM_SELINV: cmd_select_all(1); break;
-    case CM_EXTRUDE: cmd_extrude(); break;
+    case CM_EXTRUDE: exThick = exOff = 0; cmd_extrude(); break;
     case CM_MERGE: cmd_merge(); break;
     case CM_FILLHOLE: cmd_fill_hole(); break;
     case CM_APPLYCOL: cmd_apply_color(); break;
@@ -4206,7 +4680,8 @@ static void do_cmd(int id)
     }
     }
     if ((id >= CM_DELETE && id <= CM_MERGE) || id == CM_APPLYCOL || id == CM_GROW || id == CM_SHRINK ||
-        (id >= CM_FREEZE && id <= CM_RESETXF) || id == CM_FILLHOLE || (id >= CM_REVERSE && id <= CM_SOFTEN))
+        (id >= CM_FREEZE && id <= CM_RESETXF) || id == CM_FILLHOLE || (id >= CM_REVERSE && id <= CM_SOFTEN) ||
+        (id >= CM_MIRROR && id <= CM_SMOOTHMESH) || id == CM_RING)
         lastCmd = id;
     refresh_all();
 }
@@ -4220,44 +4695,93 @@ enum {
     PF_SR, PF_SCOLS, PF_SROWS,
     PF_NANGLE,
     PF_PW, PF_PD, PF_PSW, PF_PSD,
+    PF_KR, PF_KH, PF_KSIDES, PF_KHSEG, PF_KCAP,
+    PF_TR, PF_TSEC, PF_TSIDES, PF_TSEGS,
+    PF_UR, PF_UH, PF_UT, PF_USIDES, PF_UHSEG,
+    PF_CX, PF_CY, PF_CZ, PF_BX, PF_BY, PF_BZ,      /* selection center and size (world) */
+    /* from here on: tool settings, not part of the scene, so not undo steps */
     PF_OPA, PF_RAD, PF_COLOR, PF_APPLY,
     PF_MERGED, PF_BEVELW, PF_BRIDGED,
+    PF_EXTHICK, PF_EXOFF, PF_SYMAXIS, PF_SYMSPACE, PF_SYMTOL, PF_SOFTON, PF_SOFTR, PF_PREVLV,
     PF_IMG   /* + plane * 4 + (size, offset x, offset y, opacity) */
 };
-enum { RK_HEAD = 1, RK_FLOAT, RK_INT, RK_BOOL, RK_COLOR, RK_BUTTON, RK_NAME, RK_TIP };
-#define NROW 64
-typedef struct { int kind, id; char label[40]; } Row;
+enum { RK_HEAD = 1, RK_FLOAT, RK_INT, RK_BOOL, RK_COLOR, RK_BUTTON, RK_NAME, RK_TIP, RK_SEG };
+#define NROW 96
+typedef struct { int kind, id; char label[40]; const char *opts; int y, h; } Row;   /* opts: "Off|X|Y|Z" for RK_SEG */
 static Row rows[NROW];
-static int nrows, panelObj = -1, building;
-static HWND rLab[NROW], rEdit[NROW], rChk[NROW], hSwatch, hApply;
+static int nrows, panelObj = -1, building, pScroll, pContent;
+static HWND rLab[NROW], rEdit[NROW], rChk[NROW], rDec[NROW], rInc[NROW], rSeg[NROW], hSwatch, hApply;
 static WNDPROC editProc0;
+static char collapsed[24][40];   /* headers whose section is folded away */
+static float selVal[6];
+
+static int sec_folded(const char *h)
+{
+    for (int i = 0; i < 24; i++) if (collapsed[i][0] && !strcmp(collapsed[i], h)) return 1;
+    return 0;
+}
+
+static void sec_toggle(const char *h)
+{
+    int fr = -1;
+    for (int i = 0; i < 24; i++) {
+        if (collapsed[i][0] && !strcmp(collapsed[i], h)) { collapsed[i][0] = 0; return; }
+        if (!collapsed[i][0] && fr < 0) fr = i;
+    }
+    if (fr >= 0) snprintf(collapsed[fr], 40, "%s", h);
+}
+
+/* selection center / size, read fresh each time */
+static float *sel_val(int k)
+{
+    V3 a, b;
+    if (!sel_bbox(&a, &b, 0)) a = b = v3(0, 0, 0);
+    selVal[0] = (a.x + b.x) * .5f; selVal[1] = (a.y + b.y) * .5f; selVal[2] = (a.z + b.z) * .5f;
+    selVal[3] = b.x - a.x; selVal[4] = b.y - a.y; selVal[5] = b.z - a.z;
+    return &selVal[k];
+}
 
 static float *fld_f(int id)
 {
     Obj *o = panelObj >= 0 && panelObj < nob ? &ob[panelObj] : NULL;
-    if (id == PF_OPA) return &paintOpa;
-    if (id == PF_RAD) return &paintRad;
-    if (id == PF_MERGED) return &mergeDist;
-    if (id == PF_BEVELW) return &bevelW;
+    switch (id) {
+    case PF_OPA: return &paintOpa;
+    case PF_RAD: return &paintRad;
+    case PF_MERGED: return &mergeDist;
+    case PF_BEVELW: return &bevelW;
+    case PF_EXTHICK: return &exThick;
+    case PF_EXOFF: return &exOff;
+    case PF_SYMTOL: return &symTol;
+    case PF_SOFTR: return &softRad;
+    }
     if (id >= PF_IMG && id < PF_IMG + 12) {
         ImgPlane *q = &img[(id - PF_IMG) / 4];
         float *f[4] = { &q->size, &q->ox, &q->oy, &q->opa };
         return f[(id - PF_IMG) % 4];
     }
+    if (id >= PF_CX && id <= PF_BZ) return sel_val(id - PF_CX);
     if (!o) return NULL;
     if (id >= PF_TX && id <= PF_TZ) return &o->t.x + (id - PF_TX);
     if (id >= PF_RX && id <= PF_RZ) return &o->r.x + (id - PF_RX);
     if (id >= PF_SX && id <= PF_SZ) return &o->s.x + (id - PF_SX);
+    Prim *q = &o->prim;
     switch (id) {
-    case PF_CW: return &o->prim.w;
-    case PF_CH: return &o->prim.h;
-    case PF_CD: return &o->prim.d;
-    case PF_YR: return &o->prim.cr;
-    case PF_YH: return &o->prim.ch;
-    case PF_SR: return &o->prim.sr;
+    case PF_CW: return &q->w;
+    case PF_CH: return &q->h;
+    case PF_CD: return &q->d;
+    case PF_YR: return &q->cr;
+    case PF_YH: return &q->ch;
+    case PF_SR: return &q->sr;
     case PF_NANGLE: return &o->nangle;
-    case PF_PW: return &o->prim.pw;
-    case PF_PD: return &o->prim.pd;
+    case PF_PW: return &q->pw;
+    case PF_PD: return &q->pd;
+    case PF_KR: return &q->kr;
+    case PF_KH: return &q->kh;
+    case PF_TR: return &q->tr;
+    case PF_TSEC: return &q->tsec;
+    case PF_UR: return &q->ur;
+    case PF_UH: return &q->uh;
+    case PF_UT: return &q->ut;
     }
     return NULL;
 }
@@ -4265,21 +4789,35 @@ static float *fld_f(int id)
 static int *fld_i(int id)
 {
     Obj *o = panelObj >= 0 && panelObj < nob ? &ob[panelObj] : NULL;
-    if (id == PF_BRIDGED) return &bridgeDivs;
-    if (!o) return NULL;
     switch (id) {
-    case PF_CSW: return &o->prim.sw;
-    case PF_CSH: return &o->prim.sh;
-    case PF_CSD: return &o->prim.sd;
-    case PF_YSIDES: return &o->prim.csides;
-    case PF_YHSEG: return &o->prim.chseg;
-    case PF_YCAP: return &o->prim.ccap;
-    case PF_YTOP: return &o->prim.ctop;
-    case PF_YBOT: return &o->prim.cbot;
-    case PF_SCOLS: return &o->prim.scols;
-    case PF_SROWS: return &o->prim.srows;
-    case PF_PSW: return &o->prim.psw;
-    case PF_PSD: return &o->prim.psd;
+    case PF_BRIDGED: return &bridgeDivs;
+    case PF_SYMAXIS: return &symAxis;
+    case PF_SYMSPACE: return &symWorld;
+    case PF_SOFTON: return &softOn;
+    case PF_PREVLV: return &smoothLv;
+    }
+    if (!o) return NULL;
+    Prim *q = &o->prim;
+    switch (id) {
+    case PF_CSW: return &q->sw;
+    case PF_CSH: return &q->sh;
+    case PF_CSD: return &q->sd;
+    case PF_YSIDES: return &q->csides;
+    case PF_YHSEG: return &q->chseg;
+    case PF_YCAP: return &q->ccap;
+    case PF_YTOP: return &q->ctop;
+    case PF_YBOT: return &q->cbot;
+    case PF_SCOLS: return &q->scols;
+    case PF_SROWS: return &q->srows;
+    case PF_PSW: return &q->psw;
+    case PF_PSD: return &q->psd;
+    case PF_KSIDES: return &q->ksides;
+    case PF_KHSEG: return &q->khseg;
+    case PF_KCAP: return &q->kcap;
+    case PF_TSIDES: return &q->tsides;
+    case PF_TSEGS: return &q->tsegs;
+    case PF_USIDES: return &q->usides;
+    case PF_UHSEG: return &q->uhseg;
     }
     return NULL;
 }
@@ -4308,6 +4846,7 @@ static void panel_sync(void)
     for (int r = 0; r < nrows; r++) {
         if ((rows[r].kind == RK_FLOAT || rows[r].kind == RK_INT || rows[r].kind == RK_NAME) && rEdit[r] != f) row_text(r);
         if (rows[r].kind == RK_BOOL) { int *p = fld_i(rows[r].id); SendMessage(rChk[r], BM_SETCHECK, p && *p ? BST_CHECKED : BST_UNCHECKED, 0); }
+        if (rows[r].kind == RK_SEG) InvalidateRect(rSeg[r], NULL, FALSE);
     }
     InvalidateRect(hSwatch, NULL, TRUE);
 }
@@ -4317,14 +4856,21 @@ static void add_row(int kind, int id, const char *label)
     if (nrows >= NROW) return;
     rows[nrows].kind = kind;
     rows[nrows].id = id;
+    rows[nrows].opts = NULL;
     snprintf(rows[nrows].label, sizeof rows[nrows].label, "%s", label);
     nrows++;
 }
 
-static void panel_build(void)
+static void add_seg(int id, const char *label, const char *opts)
+{
+    add_row(RK_SEG, id, label);
+    if (nrows) rows[nrows - 1].opts = opts;
+}
+
+/* the side panel's rows for the current selection; folded sections keep only their header */
+static void panel_rows(void)
 {
     static const char *trs[9] = { "Translate X", "Translate Y", "Translate Z", "Rotate X", "Rotate Y", "Rotate Z", "Scale X", "Scale Y", "Scale Z" };
-    building = 1;
     nrows = 0;
     Obj *o = lead();
     panelObj = o ? (int)(o - ob) : -1;
@@ -4332,50 +4878,95 @@ static void panel_build(void)
         add_row(RK_NAME, 0, "Name");
         for (int i = 0; i < 9; i++) add_row(RK_FLOAT, PF_TX + i, trs[i]);
         add_row(RK_FLOAT, PF_NANGLE, "Normal Angle");
-        if (o->prim.type == PRIM_CUBE) {
-            add_row(RK_HEAD, 0, "polyCube");
+        switch (o->prim.type) {
+        case PRIM_CUBE:
+            add_row(RK_HEAD, 0, "Cube");
             add_row(RK_FLOAT, PF_CW, "Width");
             add_row(RK_FLOAT, PF_CH, "Height");
             add_row(RK_FLOAT, PF_CD, "Depth");
             add_row(RK_INT, PF_CSW, "Width Divs");
             add_row(RK_INT, PF_CSH, "Height Divs");
             add_row(RK_INT, PF_CSD, "Depth Divs");
-        } else if (o->prim.type == PRIM_CYL) {
-            add_row(RK_HEAD, 0, "polyCylinder");
+            break;
+        case PRIM_CYL:
+            add_row(RK_HEAD, 0, "Cylinder");
+            add_row(RK_INT, PF_YSIDES, "Sides");
             add_row(RK_FLOAT, PF_YR, "Radius");
             add_row(RK_FLOAT, PF_YH, "Height");
-            add_row(RK_INT, PF_YSIDES, "Sides");
             add_row(RK_INT, PF_YHSEG, "Height Divs");
-            add_row(RK_INT, PF_YCAP, "Cap Divs");
+            add_row(RK_INT, PF_YCAP, "Cap Rings");
             add_row(RK_BOOL, PF_YTOP, "Top Cap");
             add_row(RK_BOOL, PF_YBOT, "Bottom Cap");
-        } else if (o->prim.type == PRIM_SPHERE) {
-            add_row(RK_HEAD, 0, "polySphere");
+            break;
+        case PRIM_SPHERE:
+            add_row(RK_HEAD, 0, "Sphere");
+            add_row(RK_INT, PF_SCOLS, "Sides");
+            add_row(RK_INT, PF_SROWS, "Rings");
             add_row(RK_FLOAT, PF_SR, "Radius");
-            add_row(RK_INT, PF_SCOLS, "Columns");
-            add_row(RK_INT, PF_SROWS, "Rows");
-        } else if (o->prim.type == PRIM_PLANE) {
-            add_row(RK_HEAD, 0, "polyPlane");
+            break;
+        case PRIM_PLANE:
+            add_row(RK_HEAD, 0, "Plane");
             add_row(RK_FLOAT, PF_PW, "Width");
-            add_row(RK_FLOAT, PF_PD, "Height");
+            add_row(RK_FLOAT, PF_PD, "Depth");
             add_row(RK_INT, PF_PSW, "Width Divs");
-            add_row(RK_INT, PF_PSD, "Height Divs");
+            add_row(RK_INT, PF_PSD, "Depth Divs");
+            break;
+        case PRIM_CONE:
+            add_row(RK_HEAD, 0, "Cone");
+            add_row(RK_INT, PF_KSIDES, "Sides");
+            add_row(RK_FLOAT, PF_KR, "Radius");
+            add_row(RK_FLOAT, PF_KH, "Height");
+            add_row(RK_INT, PF_KHSEG, "Height Divs");
+            add_row(RK_INT, PF_KCAP, "Cap Rings");
+            break;
+        case PRIM_TORUS:
+            add_row(RK_HEAD, 0, "Torus");
+            add_row(RK_INT, PF_TSIDES, "Sides");
+            add_row(RK_INT, PF_TSEGS, "Tube Sides");
+            add_row(RK_FLOAT, PF_TR, "Radius");
+            add_row(RK_FLOAT, PF_TSEC, "Tube Radius");
+            break;
+        case PRIM_PIPE:
+            add_row(RK_HEAD, 0, "Pipe");
+            add_row(RK_INT, PF_USIDES, "Sides");
+            add_row(RK_FLOAT, PF_UR, "Radius");
+            add_row(RK_FLOAT, PF_UT, "Thickness");
+            add_row(RK_FLOAT, PF_UH, "Height");
+            add_row(RK_INT, PF_UHSEG, "Height Divs");
+            break;
+        }
+        if (mode != M_OBJ && has_sel()) {
+            static const char *lab[6] = { "Center X", "Center Y", "Center Z", "Size X", "Size Y", "Size Z" };
+            add_row(RK_HEAD, 0, "Selection");
+            for (int i = 0; i < 6; i++) add_row(RK_FLOAT, PF_CX + i, lab[i]);
         }
     } else {
         add_row(RK_HEAD, 0, "Nothing selected");
-        add_row(RK_TIP, 0, "Click an object to edit it here.");
-        add_row(RK_TIP, 0, "Tip: drag a label left or right");
-        add_row(RK_TIP, 0, "to scrub its value (Shift = fast).");
+        add_row(RK_TIP, 0, "Click a shape in the toolbar to make");
+        add_row(RK_TIP, 0, "one, then set its sides and size here.");
+        add_row(RK_TIP, 0, "Drag a label to scrub its value");
+        add_row(RK_TIP, 0, "(Shift = fast, Ctrl = fine).");
     }
+    add_row(RK_HEAD, 0, "Symmetry");
+    add_seg(PF_SYMAXIS, "Axis", "Off|X|Y|Z");
+    add_seg(PF_SYMSPACE, "Space", "Object|World");
+    add_row(RK_FLOAT, PF_SYMTOL, "Tolerance");
+    add_row(RK_HEAD, 0, "Soft Selection");
+    add_seg(PF_SOFTON, "Soft (B)", "Off|On");
+    add_row(RK_FLOAT, PF_SOFTR, "Radius");
+    add_row(RK_HEAD, 0, "Extrude");
+    add_row(RK_FLOAT, PF_EXTHICK, "Thickness");
+    add_row(RK_FLOAT, PF_EXOFF, "Offset");
+    add_row(RK_HEAD, 0, "Mesh Tools");
+    add_row(RK_FLOAT, PF_MERGED, "Merge Distance");
+    add_row(RK_FLOAT, PF_BEVELW, "Bevel Width");
+    add_row(RK_INT, PF_BRIDGED, "Bridge Divs");
+    add_seg(PF_PREVLV, "Preview (3)", "1|2|3");
     add_row(RK_HEAD, 0, "Vertex Color");
     add_row(RK_COLOR, PF_COLOR, "Color");
     add_row(RK_FLOAT, PF_OPA, "Opacity");
     add_row(RK_FLOAT, PF_RAD, "Brush Radius");
     add_row(RK_BUTTON, PF_APPLY, "Apply Color to Selection");
-    add_row(RK_HEAD, 0, "Mesh Tools");
-    add_row(RK_FLOAT, PF_MERGED, "Merge Distance");
-    add_row(RK_FLOAT, PF_BEVELW, "Bevel Width");
-    add_row(RK_INT, PF_BRIDGED, "Bridge Divisions");
     for (int i = 0; i < 3; i++) {
         static const char *lab[4] = { "Size", "Offset X", "Offset Y", "Opacity" };
         char b[40];
@@ -4384,41 +4975,69 @@ static void panel_build(void)
         add_row(RK_HEAD, 0, b);
         for (int k = 0; k < 4; k++) add_row(RK_FLOAT, PF_IMG + i * 4 + k, lab[k]);
     }
+}
 
+static void panel_build(void)
+{
+    building = 1;
+    panel_rows();
     RECT rc;
     GetClientRect(hPanel, &rc);
-    int W = rc.right, rh = (int)(22 * ds), pad = (int)(6 * ds), lw = (int)(92 * ds), y = pad;
-    int ew = W - lw - 2 * pad;
+    int W = rc.right, rh = (int)(25 * ds), pad = (int)(8 * ds), lw = (int)(88 * ds), sb = (int)(5 * ds);
+    int ew = W - lw - 2 * pad - sb, bw = (int)(19 * ds);
+    /* lay the rows out top to bottom, then scroll */
+    int y = pad / 2, fold = 0;
+    for (int r = 0; r < nrows; r++) {
+        int k = rows[r].kind;
+        if (k == RK_HEAD) { fold = sec_folded(rows[r].label); if (r) y += pad / 2; }
+        else if (fold) { rows[r].h = 0; continue; }
+        rows[r].y = y;
+        rows[r].h = k == RK_HEAD ? rh + (int)(2 * ds) : k == RK_TIP ? rh * 3 / 4 : k == RK_BUTTON ? rh + (int)(6 * ds) : rh;
+        y += rows[r].h + (k == RK_HEAD ? (int)(3 * ds) : 0);
+    }
+    pContent = y + pad;
+    if (pScroll > pContent - rc.bottom) pScroll = pContent - rc.bottom;
+    if (pScroll < 0) pScroll = 0;
     HWND swatchShown = NULL, applyShown = NULL;
+#define PLACE(hw, x, yy, w, h, show) SetWindowPos(hw, NULL, x, yy, w, h, SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOREDRAW | ((show) ? SWP_SHOWWINDOW : SWP_HIDEWINDOW))
     for (int r = 0; r < NROW; r++) {
-        int k = r < nrows ? rows[r].kind : 0;
-        if (k == RK_HEAD && r) y += pad;
-        int lab = k == RK_HEAD || k == RK_FLOAT || k == RK_INT || k == RK_COLOR || k == RK_TIP;
+        int k = r < nrows && (rows[r].h || rows[r].kind == RK_HEAD) ? rows[r].kind : 0;
+        int yy = r < nrows ? rows[r].y - pScroll : 0, h = r < nrows ? rows[r].h : 0;
+        int lab = k == RK_HEAD || k == RK_FLOAT || k == RK_INT || k == RK_COLOR || k == RK_TIP || k == RK_SEG;
         if (lab) {
-            int wide = k == RK_HEAD || k == RK_TIP;
+            int wide = k == RK_HEAD || k == RK_TIP, ind = k == RK_HEAD ? (int)(16 * ds) : 0;
             SendMessage(rLab[r], WM_SETFONT, (WPARAM)(k == RK_HEAD ? hBold : hFont), FALSE);
             SetWindowTextA(rLab[r], rows[r].label);
-            MoveWindow(rLab[r], pad, y + (int)(3 * ds), wide ? W - 2 * pad : lw - 4, rh - (int)(4 * ds), TRUE);
-        }
-        ShowWindow(rLab[r], lab ? SW_SHOW : SW_HIDE);
-        if (k == RK_FLOAT || k == RK_INT || k == RK_NAME) {
-            int x0 = k == RK_NAME ? pad : pad + lw, w = k == RK_NAME ? W - 2 * pad : ew;
+            PLACE(rLab[r], pad + ind, yy + (h - (int)(16 * ds)) / 2, wide ? W - 2 * pad - ind - sb : lw - 4, (int)(17 * ds), 1);
+        } else PLACE(rLab[r], 0, 0, 0, 0, 0);
+        int fld = k == RK_FLOAT || k == RK_INT || k == RK_NAME;
+        if (fld) {
+            int x0 = k == RK_NAME ? pad : pad + lw, w = k == RK_NAME ? W - 2 * pad - sb : ew;
+            if (k == RK_INT) w -= 2 * bw + (int)(2 * ds);
             SendMessage(rEdit[r], WM_SETFONT, (WPARAM)(k == RK_NAME ? hBold : hFont), FALSE);
-            MoveWindow(rEdit[r], x0 + 1, y + (int)(2 * ds), w - 2, rh - 3 - (int)(2 * ds), TRUE);
+            PLACE(rEdit[r], x0 + 1, yy + (int)(4 * ds), w - 2, h - (int)(7 * ds), 1);
             row_text(r);
-        }
-        ShowWindow(rEdit[r], k == RK_FLOAT || k == RK_INT || k == RK_NAME ? SW_SHOW : SW_HIDE);
+        } else PLACE(rEdit[r], 0, 0, 0, 0, 0);
+        if (k == RK_INT) {
+            int x0 = pad + lw + ew - 2 * bw;
+            PLACE(rDec[r], x0, yy + (int)(3 * ds), bw, h - (int)(5 * ds), 1);
+            PLACE(rInc[r], x0 + bw, yy + (int)(3 * ds), bw, h - (int)(5 * ds), 1);
+        } else { PLACE(rDec[r], 0, 0, 0, 0, 0); PLACE(rInc[r], 0, 0, 0, 0, 0); }
         if (k == RK_BOOL) {
             SetWindowTextA(rChk[r], rows[r].label);
-            MoveWindow(rChk[r], pad + lw, y, ew, rh - 2, TRUE);
-        }
-        ShowWindow(rChk[r], k == RK_BOOL ? SW_SHOW : SW_HIDE);
-        if (k == RK_COLOR) { MoveWindow(hSwatch, pad + lw + 1, y + 1, ew - 2, rh - 4, TRUE); swatchShown = hSwatch; }
-        if (k == RK_BUTTON) { MoveWindow(hApply, pad, y, W - 2 * pad, rh + 2, TRUE); applyShown = hApply; y += 4; }
-        if (k) y += k == RK_TIP ? rh * 3 / 4 : rh;
+            PLACE(rChk[r], pad + lw, yy, ew, h - 2, 1);
+        } else PLACE(rChk[r], 0, 0, 0, 0, 0);
+        if (k == RK_SEG) {
+            SetWindowLongPtrA(rSeg[r], GWLP_USERDATA, r);
+            PLACE(rSeg[r], pad + lw, yy + (int)(3 * ds), ew, h - (int)(5 * ds), 1);
+            InvalidateRect(rSeg[r], NULL, FALSE);
+        } else PLACE(rSeg[r], 0, 0, 0, 0, 0);
+        if (k == RK_COLOR) { PLACE(hSwatch, pad + lw + 1, yy + (int)(4 * ds), ew - 2, h - (int)(8 * ds), 1); swatchShown = hSwatch; }
+        if (k == RK_BUTTON) { PLACE(hApply, pad, yy + (int)(3 * ds), W - 2 * pad - sb, h - (int)(4 * ds), 1); applyShown = hApply; }
     }
-    ShowWindow(hSwatch, swatchShown ? SW_SHOW : SW_HIDE);
-    ShowWindow(hApply, applyShown ? SW_SHOW : SW_HIDE);
+    if (!swatchShown) PLACE(hSwatch, 0, 0, 0, 0, 0);
+    if (!applyShown) PLACE(hApply, 0, 0, 0, 0, 0);
+#undef PLACE
     RedrawWindow(hPanel, NULL, NULL, RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN);
     panel_sync();
     building = 0;
@@ -4437,8 +5056,43 @@ static void prim_rebuild(Obj *o)
 static int panel_get(int r, double *v)
 {
     if (rows[r].kind == RK_FLOAT) { float *p = fld_f(rows[r].id); if (p) *v = *p; return p != NULL; }
-    if (rows[r].kind == RK_INT || rows[r].kind == RK_BOOL) { int *p = fld_i(rows[r].id); if (p) *v = *p; return p != NULL; }
+    if (rows[r].kind == RK_INT || rows[r].kind == RK_BOOL || rows[r].kind == RK_SEG) {
+        int *p = fld_i(rows[r].id);
+        if (p) *v = *p - (rows[r].id == PF_PREVLV);   /* the preview level choice starts at 1 */
+        return p != NULL;
+    }
     return 0;
+}
+
+/* typed center / size of the selected components: moved or scaled like a manipulator drag
+   (symmetry and soft selection included) */
+typedef struct { V3 d, piv, sc; } PanXf;
+
+static V3 pan_xf(V3 w, float wt, const void *ctx)
+{
+    const PanXf *x = ctx;
+    V3 r = v3sub(v3add(w, v3mul(x->d, wt)), x->piv);
+    r = v3(r.x * (1 + (x->sc.x - 1) * wt), r.y * (1 + (x->sc.y - 1) * wt), r.z * (1 + (x->sc.z - 1) * wt));
+    return v3add(x->piv, r);
+}
+
+static void comp_xf(int k, double v)
+{
+    float cur = *sel_val(k);
+    PanXf x;
+    x.d = v3(0, 0, 0);
+    x.sc = v3(1, 1, 1);
+    x.piv = v3(selVal[0], selVal[1], selVal[2]);
+    if (k < 3) (&x.d.x)[k] = (float)v - cur;
+    else if (cur > 1e-6f) (&x.sc.x)[k - 3] = (float)(v < 0 ? 0 : v) / cur;
+    else return;
+    for (int i = 0; i < nob; i++) {
+        DEnt e;
+        if (!ob[i].hil || !edit_build(i, &e)) continue;
+        edit_apply(&e, pan_xf, &x);
+        edit_free(&e);
+        ob[i].prim.type = PRIM_NONE;
+    }
 }
 
 /* writes a value with no undo step or refresh (scrubbing calls this on every mouse move) */
@@ -4446,9 +5100,16 @@ static void panel_set(int r, double v)
 {
     int id = rows[r].id;
     if (rows[r].kind == RK_FLOAT) {
-        if (id == PF_OPA) { paintOpa = (float)(v < 0 ? 0 : v > 1 ? 1 : v); return; }
-        if (id == PF_RAD) { paintRad = (float)(v < 1 ? 1 : v > 2000 ? 2000 : v); return; }
-        if (id == PF_MERGED) { mergeDist = (float)(v < 0 ? 0 : v > 1e4 ? 1e4 : v); return; }
+        switch (id) {
+        case PF_OPA: paintOpa = (float)(v < 0 ? 0 : v > 1 ? 1 : v); return;
+        case PF_RAD: paintRad = (float)(v < 1 ? 1 : v > 2000 ? 2000 : v); return;
+        case PF_MERGED: mergeDist = (float)(v < 0 ? 0 : v > 1e4 ? 1e4 : v); return;
+        case PF_BEVELW: bevelW = (float)(v < 1e-4 ? 1e-4 : v > 1e4 ? 1e4 : v); live_redo(CM_BEVEL); return;
+        case PF_EXTHICK: exThick = (float)v; live_redo(CM_EXTRUDE); return;
+        case PF_EXOFF: exOff = (float)v; live_redo(CM_EXTRUDE); return;
+        case PF_SYMTOL: symTol = (float)(v < 1e-6 ? 1e-6 : v > 10 ? 10 : v); geo_changed(); return;
+        case PF_SOFTR: softRad = (float)(v < 1e-4 ? 1e-4 : v > 1e5 ? 1e5 : v); geo_changed(); return;
+        }
         if (id >= PF_IMG) {
             float *f = fld_f(id);
             int k = (id - PF_IMG) % 4;
@@ -4456,7 +5117,7 @@ static void panel_set(int r, double v)
             modified = 1;
             return;
         }
-        if (id == PF_BEVELW) { bevelW = (float)(v < 1e-4 ? 1e-4 : v > 1e4 ? 1e4 : v); live_redo(CM_BEVEL); return; }
+        if (id >= PF_CX && id <= PF_BZ) { comp_xf(id - PF_CX, v); return; }
         if (id <= PF_SZ) {
             /* channel edits apply to every selected object */
             for (int i = 0; i < nob; i++)
@@ -4471,19 +5132,29 @@ static void panel_set(int r, double v)
         }
         *fld_f(id) = (float)v;
     } else {
-        if (id == PF_BRIDGED) { bridgeDivs = v < 0 ? 0 : v > 50 ? 50 : (int)v; live_redo(CM_BRIDGE); return; }
-        *fld_i(id) = (int)v;
+        int iv = (int)floor(v + 0.5);
+        switch (id) {
+        case PF_BRIDGED: bridgeDivs = iv < 0 ? 0 : iv > 50 ? 50 : iv; live_redo(CM_BRIDGE); return;
+        case PF_SYMAXIS: sym_set(iv < 0 ? 0 : iv > 3 ? 3 : iv); return;
+        case PF_SYMSPACE: symWorld = iv != 0; sym_set(symAxis); return;
+        case PF_SOFTON: if ((iv != 0) != softOn) cmd_soft(); return;
+        case PF_PREVLV:
+            smoothLv = iv < 0 ? 1 : iv > 2 ? 3 : iv + 1;
+            reg_set_int("PreviewLevel", smoothLv);
+            geo_changed();
+            return;
+        }
+        *fld_i(id) = iv;
     }
     prim_rebuild(&ob[panelObj]);
 }
 
-/* tool settings are not part of the scene, so changing them is not an undo step */
-static int panel_undoable(int r) { return rows[r].id != PF_OPA && rows[r].id != PF_RAD && rows[r].id < PF_MERGED; }
+static int panel_undoable(int r) { return rows[r].id < PF_OPA && rows[r].kind != RK_HEAD; }
 
 static void panel_commit(int r, double v)
 {
     double cur;
-    if (!panel_get(r, &cur) || (rows[r].kind == RK_FLOAT ? fabs(cur - v) < 1e-7 : (int)cur == (int)v)) return;
+    if (!panel_get(r, &cur) || (rows[r].kind == RK_FLOAT ? fabs(cur - v) < 1e-7 : (int)cur == (int)floor(v + 0.5))) return;
     if (panel_undoable(r)) undo_push(rows[r].label);
     panel_set(r, v);
     refresh_all();
@@ -4524,28 +5195,34 @@ static void panel_commit_edit(int r)
 
 static struct { int row, x0, pushed; double v0; } scrub = { -1, 0, 0, 0 };
 
-static int scrub_row(int x, int y)
+static int row_at(int x, int y, int head)
 {
     POINT pt = { x, y };
     for (int r = 0; r < nrows; r++) {
         RECT rc;
-        if ((rows[r].kind != RK_FLOAT && rows[r].kind != RK_INT) || !IsWindowVisible(rLab[r])) continue;
+        if (head ? rows[r].kind != RK_HEAD : rows[r].kind != RK_FLOAT && rows[r].kind != RK_INT) continue;
+        if (!IsWindowVisible(rLab[r])) continue;
         GetWindowRect(rLab[r], &rc);
         MapWindowPoints(NULL, hPanel, (POINT *)&rc, 2);
-        InflateRect(&rc, 0, 2);
+        InflateRect(&rc, head ? (int)(16 * ds) : 0, (int)(4 * ds));
+        if (head) rc.right = 10000;
         if (PtInRect(&rc, pt)) return r;
     }
     return -1;
 }
 
+static int scrub_row(int x, int y) { return row_at(x, y, 0); }
+
 static void scrub_move(int x)
 {
     int id = rows[scrub.row].id, dx = x - scrub.x0;
     float mul = key(VK_SHIFT) ? 10 : key(VK_CONTROL) ? 0.1f : 1;
-    double step = (id >= PF_RX && id <= PF_RZ) || id == PF_NANGLE ? 0.5 : id == PF_RAD ? 1 : id == PF_OPA ? 0.005 : id == PF_MERGED ? 0.001 : id == PF_BEVELW ? 0.002 : id >= PF_IMG && (id - PF_IMG) % 4 == 3 ? 0.005 : 0.01;
-    double v = rows[scrub.row].kind == RK_INT ? scrub.v0 + (int)(dx * mul / 6) : scrub.v0 + dx * step * mul;
+    double step = (id >= PF_RX && id <= PF_RZ) || id == PF_NANGLE ? 0.5 : id == PF_RAD ? 1 : id == PF_OPA ? 0.005 : id == PF_MERGED ? 0.001
+                : id == PF_BEVELW || id == PF_EXTHICK || id == PF_EXOFF ? 0.002 : id == PF_SYMTOL ? 0.0001
+                : id >= PF_IMG && (id - PF_IMG) % 4 == 3 ? 0.005 : 0.01;
+    double v = rows[scrub.row].kind == RK_INT ? scrub.v0 + (int)(dx * mul / (6 * ds)) : scrub.v0 + dx * step * mul / ds;
     double cur;
-    if (rows[scrub.row].kind == RK_FLOAT) v = round(v * 1000) / 1000;
+    if (rows[scrub.row].kind == RK_FLOAT) v = round(v * 10000) / 10000;
     if (!panel_get(scrub.row, &cur) || cur == v) return;
     if (!scrub.pushed && panel_undoable(scrub.row)) { undo_push(rows[scrub.row].label); scrub.pushed = 1; }
     panel_set(scrub.row, v);
@@ -4561,6 +5238,20 @@ static LRESULT CALLBACK EditProc(HWND h, UINT m, WPARAM wp, LPARAM lp)
         SetFocus(hView);
         return 0;
     }
+    if (m == WM_KEYDOWN && (wp == VK_UP || wp == VK_DOWN)) {
+        /* arrow keys step a number (Shift: 10x, Ctrl: 0.1x) */
+        int r = GetDlgCtrlID(h) - 1000;
+        double v;
+        if (r >= 0 && r < nrows && (rows[r].kind == RK_FLOAT || rows[r].kind == RK_INT) && panel_get(r, &v)) {
+            double st = rows[r].kind == RK_INT ? 1 : (rows[r].id >= PF_RX && rows[r].id <= PF_RZ) || rows[r].id == PF_NANGLE ? 1 : 0.1;
+            if (key(VK_SHIFT)) st *= 10;
+            if (key(VK_CONTROL) && rows[r].kind == RK_FLOAT) st *= 0.1;
+            panel_commit(r, v + (wp == VK_UP ? st : -st));
+            row_text(r);
+            SendMessage(h, EM_SETSEL, 0, -1);
+        }
+        return 0;
+    }
     if (m == WM_CHAR && (wp == '\r' || wp == 27)) return 0;
     if (m == WM_LBUTTONDOWN && GetFocus() != h) {   /* first click selects the whole value */
         SetFocus(h);
@@ -4568,6 +5259,70 @@ static LRESULT CALLBACK EditProc(HWND h, UINT m, WPARAM wp, LPARAM lp)
         return 0;
     }
     return CallWindowProc(editProc0, h, m, wp, lp);
+}
+
+/* ---- segmented choice buttons ("Off | X | Y | Z") */
+
+static void rrect(HDC dc, RECT r, int rad, COLORREF fill, COLORREF line);
+
+static int seg_count(const char *o)
+{
+    int n = 1;
+    for (; *o; o++) n += *o == '|';
+    return n;
+}
+
+static LRESULT CALLBACK SegProc(HWND h, UINT m, WPARAM wp, LPARAM lp)
+{
+    int r = (int)GetWindowLongPtrA(h, GWLP_USERDATA);
+    if (r < 0 || r >= nrows || rows[r].kind != RK_SEG) return DefWindowProc(h, m, wp, lp);
+    int n = seg_count(rows[r].opts);
+    RECT rc;
+    GetClientRect(h, &rc);
+    switch (m) {
+    case WM_ERASEBKGND: return 1;
+    case WM_PAINT: {
+        PAINTSTRUCT p;
+        HDC wdc = BeginPaint(h, &p);
+        HDC dc = CreateCompatibleDC(wdc);
+        HBITMAP bm = CreateCompatibleBitmap(wdc, rc.right, rc.bottom), old = SelectObject(dc, bm);
+        FillRect(dc, &rc, brUi);
+        double v = 0;
+        panel_get(r, &v);
+        COLORREF acc = th.sys ? GetSysColor(COLOR_HIGHLIGHT) : th.head;
+        rrect(dc, rc, (int)(6 * ds), th.field, th.line);
+        const char *o = rows[r].opts;
+        SetBkMode(dc, TRANSPARENT);
+        SelectObject(dc, hFont);
+        for (int i = 0; i < n; i++) {
+            const char *e = strchr(o, '|');
+            int len = e ? (int)(e - o) : (int)strlen(o);
+            RECT s = { rc.right * i / n, 0, rc.right * (i + 1) / n, rc.bottom };
+            if (i == (int)v) {
+                RECT q = s;
+                InflateRect(&q, -(int)(2 * ds), -(int)(2 * ds));
+                rrect(dc, q, (int)(5 * ds), lerpc(th.ui, acc, .35f), acc);
+            }
+            SetTextColor(dc, i == (int)v ? th.text : mix(th.text, th.ui));
+            DrawTextA(dc, o, len, &s, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+            o = e ? e + 1 : o + len;
+        }
+        BitBlt(wdc, 0, 0, rc.right, rc.bottom, dc, 0, 0, SRCCOPY);
+        SelectObject(dc, old);
+        DeleteObject(bm);
+        DeleteDC(dc);
+        EndPaint(h, &p);
+        return 0;
+    }
+    case WM_LBUTTONDOWN: {
+        int i = (short)LOWORD(lp) * n / (rc.right ? rc.right : 1);
+        panel_commit(r, i);
+        InvalidateRect(h, NULL, FALSE);
+        SetFocus(hView);
+        return 0;
+    }
+    }
+    return DefWindowProc(h, m, wp, lp);
 }
 
 static LRESULT CALLBACK PanelProc(HWND h, UINT m, WPARAM wp, LPARAM lp)
@@ -4580,6 +5335,12 @@ static LRESULT CALLBACK PanelProc(HWND h, UINT m, WPARAM wp, LPARAM lp)
         else if (id >= 2000 && id < 2000 + NROW && code == BN_CLICKED && !building) {
             int r = id - 2000;
             panel_commit(r, SendMessage(rChk[r], BM_GETCHECK, 0, 0) == BST_CHECKED);
+            SetFocus(hView);
+        } else if (id >= 4000 && id < 4000 + 2 * NROW && code == BN_CLICKED && !building) {
+            /* - / + steppers next to whole numbers */
+            int r = (id - 4000) % NROW, up = id >= 4000 + NROW;
+            double v;
+            if (r < nrows && panel_get(r, &v)) panel_commit(r, v + (up ? 1 : -1) * (key(VK_SHIFT) ? 10 : 1));
             SetFocus(hView);
         } else if (id == 3000 && code == STN_CLICKED) { do_cmd(CM_SETCOL); SetFocus(hView); }
         else if (id == 3001 && code == BN_CLICKED) { do_cmd(CM_APPLYCOL); SetFocus(hView); }
@@ -4595,8 +5356,8 @@ static LRESULT CALLBACK PanelProc(HWND h, UINT m, WPARAM wp, LPARAM lp)
         for (int r = 0; r < nrows; r++)
             if (rLab[r] == (HWND)lp) kind = rows[r].kind;
         SetTextColor((HDC)wp, kind == RK_HEAD ? th.head : kind == RK_TIP ? mix(th.text, th.ui) : th.text);
-        SetBkColor((HDC)wp, th.ui);
-        return (LRESULT)brUi;
+        SetBkColor((HDC)wp, kind == RK_HEAD ? th.hot : th.ui);
+        return (LRESULT)(kind == RK_HEAD ? brHot : brUi);
     }
     case WM_SETCURSOR: {
         POINT pt;
@@ -4606,13 +5367,16 @@ static LRESULT CALLBACK PanelProc(HWND h, UINT m, WPARAM wp, LPARAM lp)
             SetCursor(LoadCursor(NULL, IDC_SIZEWE));
             return TRUE;
         }
+        if (LOWORD(lp) == HTCLIENT && row_at(pt.x, pt.y, 1) >= 0) { SetCursor(LoadCursor(NULL, IDC_HAND)); return TRUE; }
         break;
     }
     case WM_LBUTTONDOWN: {
-        int r = scrub_row((short)LOWORD(lp), (short)HIWORD(lp));
+        int x = (short)LOWORD(lp), y = (short)HIWORD(lp), r = scrub_row(x, y);
+        int hr = r < 0 ? row_at(x, y, 1) : -1;
+        if (hr >= 0) { sec_toggle(rows[hr].label); panel_build(); return 0; }   /* fold / unfold a section */
         if (r < 0 || !panel_get(r, &scrub.v0)) return 0;
         scrub.row = r;
-        scrub.x0 = (short)LOWORD(lp);
+        scrub.x0 = x;
         scrub.pushed = 0;
         SetFocus(hView);
         SetCapture(h);
@@ -4628,26 +5392,62 @@ static LRESULT CALLBACK PanelProc(HWND h, UINT m, WPARAM wp, LPARAM lp)
             refresh_all();
         }
         return 0;
+    case WM_MOUSEWHEEL: {
+        RECT rc;
+        GetClientRect(h, &rc);
+        int old = pScroll;
+        pScroll -= (short)HIWORD(wp) * (int)(25 * ds) * 3 / 120;
+        if (pScroll > pContent - rc.bottom) pScroll = pContent - rc.bottom;
+        if (pScroll < 0) pScroll = 0;
+        if (pScroll != old) panel_build();
+        return 0;
+    }
     case WM_CTLCOLOREDIT:
         SetTextColor((HDC)wp, th.fieldText);
         SetBkColor((HDC)wp, th.field);
         return (LRESULT)brField;
     case WM_ERASEBKGND: {
-        RECT rc;
+        RECT rc, cl;
         HDC dc = (HDC)wp;
-        GetClientRect(h, &rc);
-        FillRect(dc, &rc, brUi);
+        GetClientRect(h, &cl);
+        FillRect(dc, &cl, brUi);
+        rc = cl;
         rc.right = 1;
         FillRect(dc, &rc, brLine);
+        COLORREF acc = th.sys ? GetSysColor(COLOR_HIGHLIGHT) : th.head;
+        int pad = (int)(8 * ds), sb = (int)(5 * ds);
+        for (int r = 0; r < nrows; r++) {
+            if (rows[r].kind != RK_HEAD) continue;
+            /* section band with a fold arrow */
+            RECT b = { pad / 2, rows[r].y - pScroll, cl.right - sb - pad / 2, rows[r].y - pScroll + rows[r].h };
+            rrect(dc, b, (int)(6 * ds), th.hot, th.hot);
+            HBRUSH ab = CreateSolidBrush(acc);
+            HPEN ap = CreatePen(PS_SOLID, 1, acc);
+            HGDIOBJ ob_ = SelectObject(dc, ab), op = SelectObject(dc, ap);
+            int cx = pad + (int)(5 * ds), cy = (b.top + b.bottom) / 2, a = (int)(4 * ds);
+            POINT tri[3];
+            if (sec_folded(rows[r].label)) { tri[0].x = cx - a / 2; tri[0].y = cy - a; tri[1].x = cx + a; tri[1].y = cy; tri[2].x = cx - a / 2; tri[2].y = cy + a; }
+            else { tri[0].x = cx - a; tri[0].y = cy - a / 2; tri[1].x = cx + a; tri[1].y = cy - a / 2; tri[2].x = cx; tri[2].y = cy + a; }
+            Polygon(dc, tri, 3);
+            SelectObject(dc, ob_);
+            SelectObject(dc, op);
+            DeleteObject(ab);
+            DeleteObject(ap);
+        }
         for (int r = 0; r <= nrows; r++) {
             HWND c = r < nrows ? rEdit[r] : hSwatch;
             if (!IsWindowVisible(c)) continue;
             GetWindowRect(c, &rc);
             MapWindowPoints(NULL, h, (POINT *)&rc, 2);
             if (c != hSwatch) rc.top -= (int)(2 * ds) - 1;
-            InflateRect(&rc, 1, 1);
-            FillRect(dc, &rc, brField);
-            FrameRect(dc, &rc, GetFocus() == c ? brAcc : brLine);   /* the field being typed in */
+            InflateRect(&rc, (int)(2 * ds), (int)(2 * ds));
+            rrect(dc, rc, (int)(5 * ds), th.field, GetFocus() == c ? acc : th.line);   /* the field being typed in */
+        }
+        if (pContent > cl.bottom) {
+            /* a slim scroll thumb (the wheel scrolls) */
+            int th_ = cl.bottom * cl.bottom / pContent, ty = (cl.bottom - th_) * pScroll / (pContent - cl.bottom);
+            RECT t = { cl.right - sb, ty, cl.right - (int)(1 * ds), ty + th_ };
+            rrect(dc, t, sb / 2, th.line, th.line);
         }
         return 1;
     }
@@ -4655,15 +5455,14 @@ static LRESULT CALLBACK PanelProc(HWND h, UINT m, WPARAM wp, LPARAM lp)
         DRAWITEMSTRUCT *d = (DRAWITEMSTRUCT *)lp;
         int down = d->itemState & ODS_SELECTED;
         RECT rc = d->rcItem;
-        if (th.sys) DrawFrameControl(d->hDC, &rc, DFC_BUTTON, DFCS_BUTTONPUSH | (down ? DFCS_PUSHED : 0));
-        else {
-            FillRect(d->hDC, &rc, down ? brField : brHot);
-            FrameRect(d->hDC, &rc, brLine);
-        }
+        COLORREF acc = th.sys ? GetSysColor(COLOR_HIGHLIGHT) : th.head;
+        FillRect(d->hDC, &rc, brUi);
+        rrect(d->hDC, rc, (int)(6 * ds), down ? lerpc(th.ui, acc, .45f) : th.hot, th.line);
         char b[64];
         GetWindowTextA(d->hwndItem, b, sizeof b);
         SetBkMode(d->hDC, TRANSPARENT);
         SetTextColor(d->hDC, th.text);
+        SelectObject(d->hDC, d->hwndItem == hApply ? hFont : hBold);
         if (down) OffsetRect(&rc, 1, 1);
         DrawTextA(d->hDC, b, -1, &rc, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
         return TRUE;
@@ -4675,66 +5474,702 @@ static LRESULT CALLBACK PanelProc(HWND h, UINT m, WPARAM wp, LPARAM lp)
     return DefWindowProc(h, m, wp, lp);
 }
 
+static void panel_fonts(void)
+{
+    for (int r = 0; r < NROW; r++) {
+        SendMessage(rLab[r], WM_SETFONT, (WPARAM)hFont, 0);
+        SendMessage(rEdit[r], WM_SETFONT, (WPARAM)hFont, 0);
+        SendMessage(rChk[r], WM_SETFONT, (WPARAM)hFont, 0);
+        SendMessage(rDec[r], WM_SETFONT, (WPARAM)hBold, 0);
+        SendMessage(rInc[r], WM_SETFONT, (WPARAM)hBold, 0);
+        SendMessage(rEdit[r], EM_SETMARGINS, EC_LEFTMARGIN | EC_RIGHTMARGIN, MAKELPARAM((int)(4 * ds), (int)(4 * ds)));
+    }
+    SendMessage(hApply, WM_SETFONT, (WPARAM)hFont, 0);
+}
+
 static void panel_create(HINSTANCE inst)
 {
+    WNDCLASSEXA wc;
+    memset(&wc, 0, sizeof wc);
+    wc.cbSize = sizeof wc;
+    wc.hInstance = inst;
+    wc.hCursor = LoadCursor(NULL, IDC_HAND);
+    wc.lpfnWndProc = SegProc;
+    wc.lpszClassName = "Tuff3DSeg";
+    RegisterClassExA(&wc);
     for (int r = 0; r < NROW; r++) {
         rLab[r] = CreateWindowA("STATIC", "", WS_CHILD | SS_LEFTNOWORDWRAP | SS_NOPREFIX, 0, 0, 1, 1, hPanel, NULL, inst, NULL);
         rEdit[r] = CreateWindowA("EDIT", "", WS_CHILD | ES_AUTOHSCROLL, 0, 0, 1, 1, hPanel, (HMENU)(INT_PTR)(1000 + r), inst, NULL);
         rChk[r] = CreateWindowA("BUTTON", "", WS_CHILD | BS_AUTOCHECKBOX, 0, 0, 1, 1, hPanel, (HMENU)(INT_PTR)(2000 + r), inst, NULL);
-        SendMessage(rLab[r], WM_SETFONT, (WPARAM)hFont, 0);
-        SendMessage(rEdit[r], WM_SETFONT, (WPARAM)hFont, 0);
-        SendMessage(rChk[r], WM_SETFONT, (WPARAM)hFont, 0);
-        SendMessage(rEdit[r], EM_SETMARGINS, EC_LEFTMARGIN | EC_RIGHTMARGIN, MAKELPARAM((int)(3 * ds), (int)(3 * ds)));
+        rDec[r] = CreateWindowA("BUTTON", "-", WS_CHILD | BS_OWNERDRAW, 0, 0, 1, 1, hPanel, (HMENU)(INT_PTR)(4000 + r), inst, NULL);
+        rInc[r] = CreateWindowA("BUTTON", "+", WS_CHILD | BS_OWNERDRAW, 0, 0, 1, 1, hPanel, (HMENU)(INT_PTR)(4000 + NROW + r), inst, NULL);
+        rSeg[r] = CreateWindowA("Tuff3DSeg", "", WS_CHILD, 0, 0, 1, 1, hPanel, NULL, inst, NULL);
+        SetWindowLongPtrA(rSeg[r], GWLP_USERDATA, -1);
         editProc0 = (WNDPROC)SetWindowLongPtrA(rEdit[r], GWLP_WNDPROC, (LONG_PTR)EditProc);
     }
     hSwatch = CreateWindowA("STATIC", "", WS_CHILD | SS_NOTIFY, 0, 0, 1, 1, hPanel, (HMENU)3000, inst, NULL);
     hApply = CreateWindowA("BUTTON", "Apply Color to Selection", WS_CHILD | BS_OWNERDRAW, 0, 0, 1, 1, hPanel, (HMENU)3001, inst, NULL);
-    SendMessage(hApply, WM_SETFONT, (WPARAM)hFont, 0);
+    panel_fonts();
 }
 
-/* ================================================================ toolbar (shelf) */
+/* ================================================================ icons
 
-/* Every button shows its hotkey under its name, so the toolbar doubles as a cheat sheet. */
-typedef struct { const char *label, *hotkey; int cmd; const char *desc; } Tool;
-static const Tool tbItems[] = {
-    { "Select", "Q", CM_TSEL, "Select tool: click or drag a box to select" },
-    { "Move", "W", CM_TMOVE, "Move tool: drag the arrows (1 axis), squares (2 axes) or center" },
-    { "Rotate", "E", CM_TROT, "Rotate tool: drag a ring; hold J for 15 degree steps" },
-    { "Scale", "R", CM_TSCALE, "Scale tool: drag a handle; drag components past the center to flatten them" },
-    { "Paint", "", CM_TPAINT, "Paint vertex colors: drag over a mesh; B + drag sets the brush size" }, { 0 },
-    { "Object", "F8", CM_MOBJ, "Object mode: pick whole objects (F8 toggles object/component)" },
-    { "Vertex", "F9", CM_MVERT, "Vertex mode (Ctrl+F9 converts the selection to vertices)" },
-    { "Edge", "F10", CM_MEDGE, "Edge mode: double-click an edge to select its loop" },
-    { "Face", "F11", CM_MFACE, "Face mode (Ctrl+F11 converts the selection to faces)" },
-    { "Multi", "F7", CM_MMULTI, "Multi mode: vertices, edges and faces at once" }, { 0 },
-    { "Cube", "", CM_CUBE, "Create a polygon cube (edit its size and divisions in the side panel)" },
-    { "Cylinder", "", CM_CYL, "Create a polygon cylinder" },
-    { "Sphere", "", CM_SPHERE, "Create a polygon sphere" },
-    { "Plane", "", CM_PLANE, "Create a polygon plane" }, { 0 },
-    { "Extrude", "Ctrl+E", CM_EXTRUDE, "Extrude the selected faces or edges, then drag the blue handle" },
-    { "Bevel", "Ctrl+B", CM_BEVEL, "Bevel the selected edges (Bevel Width in the side panel adjusts it)" },
-    { "Bridge", "", CM_BRIDGE, "Join two selected open borders with faces" },
-    { "Edge Loop", "", CM_TLOOP, "Insert Edge Loop tool: click an edge to add a loop across it" },
-    { "Multi-Cut", "", CM_TCUT, "Multi-Cut tool: click points on edges to cut faces; Enter finishes" },
-    { "Merge", "", CM_MERGE, "Merge the selected vertices to their center" },
-    { "Fill Hole", "", CM_FILLHOLE, "Cap the hole the selection is on (an object: all its holes)" },
-    { "Combine", "", CM_COMBINE, "Combine the selected objects into one" },
-    { "Separate", "", CM_SEPARATE, "Split objects into their loose pieces, or selected faces into a new object" },
-    { "Duplicate", "Ctrl+D", CM_DUP, "Duplicate the selected objects" },
-    { "Delete", "Del", CM_DELETE, "Delete the selected objects or faces" }, { 0 },
-    { "Grid Snap", "X", CM_SNAPGRID, "Toggle snapping moves to the grid (or hold X while dragging)" },
-    { "Point Snap", "V", CM_SNAPPOINT, "Toggle snapping moves onto vertices (or hold V while dragging)" }, { 0 },
-    { "Wire", "4 / 5", CM_WIRETOG, "Toggle wireframe (4) and shaded (5) display" },
-    { "Hard", "", CM_HARD, "Hard Shade: every edge looks sharp (faceted)" },
-    { "Smooth", "", CM_SMOOTH, "Smooth Shade: every edge looks soft" },
-    { "Auto", "", CM_AUTOSMOOTH, "Auto Smooth: edges sharper than the Normal Angle (side panel) stay hard" },
-    { "Frame", "F", CM_FRAMESEL, "Frame the selection (A frames everything, Home resets the view)" }, { 0 },
-    { "Undo", "Z", CM_UNDO, "Undo the last change" },
-    { "Redo", "Shift+Z", CM_REDO, "Redo" },
+   The toolbar icons are little vector drawings on a 24 x 24 grid, drawn anti-aliased with GDI+
+   (gdiplus.dll ships with Windows; plain GDI is the fallback) in the theme's text and accent
+   colors, so they follow every theme. */
+
+typedef struct { float x, y; } GpPt;
+static struct {
+    int ok;
+    int (WINAPI *FromHDC)(HDC, void **);
+    int (WINAPI *DelG)(void *);
+    int (WINAPI *Smooth)(void *, int);
+    int (WINAPI *Pen)(DWORD, float, int, void **);
+    int (WINAPI *DelPen)(void *);
+    int (WINAPI *Caps)(void *, int, int, int);
+    int (WINAPI *Join)(void *, int);
+    int (WINAPI *Dash)(void *, int);
+    int (WINAPI *Brush)(DWORD, void **);
+    int (WINAPI *DelBrush)(void *);
+    int (WINAPI *Lines)(void *, void *, const GpPt *, int);
+    int (WINAPI *Poly)(void *, void *, const GpPt *, int);
+    int (WINAPI *FillPoly)(void *, void *, const GpPt *, int, int);
+    int (WINAPI *Ell)(void *, void *, float, float, float, float);
+    int (WINAPI *FillEll)(void *, void *, float, float, float, float);
+    int (WINAPI *Arc)(void *, void *, float, float, float, float, float, float);
+    int (WINAPI *NewPath)(int, void **);
+    int (WINAPI *PathArc)(void *, float, float, float, float, float, float);
+    int (WINAPI *ClosePath)(void *);
+    int (WINAPI *FillPath)(void *, void *, void *);
+    int (WINAPI *DrawPath)(void *, void *, void *);
+    int (WINAPI *DelPath)(void *);
+} gp;
+
+static void gp_init(void)
+{
+    static int tried;
+    if (tried) return;
+    tried = 1;
+    HMODULE m = LoadLibraryA("gdiplus.dll");
+    if (!m) return;
+    int (WINAPI *Startup)(ULONG_PTR *, const GpStartIn *, void *) = (void *)GetProcAddress(m, "GdiplusStartup");
+#define GPF(f, n) (*(void **)&gp.f = (void *)GetProcAddress(m, n))
+    GPF(FromHDC, "GdipCreateFromHDC"); GPF(DelG, "GdipDeleteGraphics"); GPF(Smooth, "GdipSetSmoothingMode");
+    GPF(Pen, "GdipCreatePen1"); GPF(DelPen, "GdipDeletePen"); GPF(Caps, "GdipSetPenLineCap197819");
+    GPF(Join, "GdipSetPenLineJoin"); GPF(Dash, "GdipSetPenDashStyle"); GPF(Brush, "GdipCreateSolidFill");
+    GPF(DelBrush, "GdipDeleteBrush"); GPF(Lines, "GdipDrawLines"); GPF(Poly, "GdipDrawPolygon");
+    GPF(FillPoly, "GdipFillPolygon"); GPF(Ell, "GdipDrawEllipse"); GPF(FillEll, "GdipFillEllipse");
+    GPF(Arc, "GdipDrawArc"); GPF(NewPath, "GdipCreatePath"); GPF(PathArc, "GdipAddPathArc");
+    GPF(ClosePath, "GdipClosePathFigure"); GPF(FillPath, "GdipFillPath"); GPF(DrawPath, "GdipDrawPath");
+    GPF(DelPath, "GdipDeletePath");
+#undef GPF
+    void **f = (void **)&gp.FromHDC;
+    int all = Startup != NULL;
+    for (int i = 0; i < 22; i++) all &= f[i] != NULL;
+    ULONG_PTR tok;
+    GpStartIn in = { 1, NULL, FALSE, FALSE };
+    gp.ok = all && !Startup(&tok, &in, NULL);
+}
+
+#define ARGB_OF(a, c) (((DWORD)(a) << 24) | ((DWORD)GetRValue(c) << 16) | ((DWORD)GetGValue(c) << 8) | GetBValue(c))
+
+static struct { HDC dc; void *g; float x, y, k; DWORD fg, acc, soft, bg; } ic;   /* origin, pixels per icon unit */
+
+static void ic_begin(HDC dc)
+{
+    gp_init();
+    ic.dc = dc;
+    ic.g = NULL;
+    if (gp.ok && !gp.FromHDC(dc, &ic.g)) gp.Smooth(ic.g, 4 /* anti-alias */);
+}
+
+static void ic_end(void)
+{
+    if (ic.g) gp.DelG(ic.g);
+    ic.g = NULL;
+}
+
+static void ic_xy(const float *p, int n, GpPt *o)
+{
+    for (int i = 0; i < n; i++) { o[i].x = ic.x + p[2 * i] * ic.k; o[i].y = ic.y + p[2 * i + 1] * ic.k; }
+}
+
+static void *ic_pen(DWORD c, float w, int dash)
+{
+    void *pen = NULL;
+    gp.Pen(c, w * ic.k, 2 /* pixels */, &pen);
+    if (pen) {
+        gp.Caps(pen, 2, 2, 2);   /* round */
+        gp.Join(pen, 2);
+        if (dash) gp.Dash(pen, 1);
+    }
+    return pen;
+}
+
+static COLORREF rgb_of(DWORD c) { return RGB((c >> 16) & 255, (c >> 8) & 255, c & 255); }
+
+/* GDI fallback helpers: a pen / brush selected for one shape */
+static void gdi_sel(DWORD line, float w, DWORD fill, HGDIOBJ *op, HGDIOBJ *ob_)
+{
+    HPEN pen = line >> 24 ? CreatePen(PS_SOLID, (int)(w * ic.k + .5f), rgb_of(line)) : (HPEN)GetStockObject(NULL_PEN);
+    HBRUSH br = fill >> 24 ? CreateSolidBrush(rgb_of(fill)) : (HBRUSH)GetStockObject(NULL_BRUSH);
+    *op = SelectObject(ic.dc, pen);
+    *ob_ = SelectObject(ic.dc, br);
+}
+
+static void gdi_unsel(HGDIOBJ op, HGDIOBJ ob_)
+{
+    DeleteObject(SelectObject(ic.dc, op));
+    DeleteObject(SelectObject(ic.dc, ob_));
+}
+
+/* polygon (closed) or polyline (open), filled and / or outlined; 0 alpha skips a part */
+static void ic_shape(const float *p, int n, DWORD fill, DWORD line, float w, int closed, int dash)
+{
+    GpPt q[64];
+    if (n > 64) n = 64;
+    ic_xy(p, n, q);
+    if (ic.g) {
+        if (closed && fill >> 24) {
+            void *b = NULL;
+            gp.Brush(fill, &b);
+            if (b) { gp.FillPoly(ic.g, b, q, n, 0); gp.DelBrush(b); }
+        }
+        if (line >> 24) {
+            void *pen = ic_pen(line, w, dash);
+            if (pen) { (closed ? gp.Poly : gp.Lines)(ic.g, pen, q, n); gp.DelPen(pen); }
+        }
+        return;
+    }
+    POINT pt[64];
+    for (int i = 0; i < n; i++) { pt[i].x = (int)q[i].x; pt[i].y = (int)q[i].y; }
+    HGDIOBJ op, ob_;
+    gdi_sel(line, w, closed ? fill : 0, &op, &ob_);
+    if (closed) Polygon(ic.dc, pt, n); else Polyline(ic.dc, pt, n);
+    gdi_unsel(op, ob_);
+}
+
+static void ic_line(float x1, float y1, float x2, float y2, DWORD c, float w)
+{
+    float p[4] = { x1, y1, x2, y2 };
+    ic_shape(p, 2, 0, c, w, 0, 0);
+}
+
+static void ic_dline(float x1, float y1, float x2, float y2, DWORD c, float w)
+{
+    float p[4] = { x1, y1, x2, y2 };
+    ic_shape(p, 2, 0, c, w, 0, 1);
+}
+
+static void ic_ell(float cx, float cy, float rx, float ry, DWORD fill, DWORD line, float w)
+{
+    float x = ic.x + (cx - rx) * ic.k, y = ic.y + (cy - ry) * ic.k, W = 2 * rx * ic.k, H = 2 * ry * ic.k;
+    if (ic.g) {
+        if (fill >> 24) { void *b = NULL; gp.Brush(fill, &b); if (b) { gp.FillEll(ic.g, b, x, y, W, H); gp.DelBrush(b); } }
+        if (line >> 24) { void *pen = ic_pen(line, w, 0); if (pen) { gp.Ell(ic.g, pen, x, y, W, H); gp.DelPen(pen); } }
+        return;
+    }
+    HGDIOBJ op, ob_;
+    gdi_sel(line, w, fill, &op, &ob_);
+    Ellipse(ic.dc, (int)x, (int)y, (int)(x + W), (int)(y + H));
+    gdi_unsel(op, ob_);
+}
+
+/* arc of an ellipse, angles in degrees, clockwise from +x (screen y points down) */
+static void ic_arc(float cx, float cy, float rx, float ry, float a0, float sweep, DWORD c, float w, int dash)
+{
+    if (ic.g) {
+        void *pen = ic_pen(c, w, dash);
+        if (pen) { gp.Arc(ic.g, pen, ic.x + (cx - rx) * ic.k, ic.y + (cy - ry) * ic.k, 2 * rx * ic.k, 2 * ry * ic.k, a0, sweep); gp.DelPen(pen); }
+        return;
+    }
+    float p[2 * 25];
+    for (int i = 0; i <= 24; i++) {
+        float a = (a0 + sweep * i / 24) * PI_F / 180;
+        p[2 * i] = cx + rx * cosf(a);
+        p[2 * i + 1] = cy + ry * sinf(a);
+    }
+    ic_shape(p, 25, 0, c, w, 0, dash);
+}
+
+/* a filled arrowhead at (x, y) pointing along (dx, dy) */
+static void ic_head(float x, float y, float dx, float dy, float s, DWORD c)
+{
+    float l = sqrtf(dx * dx + dy * dy);
+    if (l < 1e-6f) return;
+    dx /= l; dy /= l;
+    float p[6] = { x + dx * s, y + dy * s, x - dy * s * .8f, y + dx * s * .8f, x + dy * s * .8f, y - dx * s * .8f };
+    ic_shape(p, 3, c, c, 1, 1, 0);
+}
+
+/* an arc that ends in an arrowhead */
+static void ic_arc_arrow(float cx, float cy, float r, float a0, float sweep, DWORD c, float w)
+{
+    ic_arc(cx, cy, r, r, a0, sweep, c, w, 0);
+    float a = (a0 + sweep) * PI_F / 180, sg = sweep > 0 ? 1.0f : -1.0f;
+    ic_head(cx + r * cosf(a), cy + r * sinf(a), -sinf(a) * sg, cosf(a) * sg, 3, c);
+}
+
+/* an isometric cube centered at (cx, cy); f: fills of top, left, right (0 alpha: none) */
+static void ic_cube(float cx, float cy, float s, DWORD top, DWORD left, DWORD right, DWORD line, float w)
+{
+    float T[2] = { cx, cy - s }, UR[2] = { cx + .87f * s, cy - .5f * s }, LR[2] = { cx + .87f * s, cy + .5f * s };
+    float B[2] = { cx, cy + s }, LL[2] = { cx - .87f * s, cy + .5f * s }, UL[2] = { cx - .87f * s, cy - .5f * s };
+    float ft[8] = { T[0], T[1], UR[0], UR[1], cx, cy, UL[0], UL[1] };
+    float fl[8] = { UL[0], UL[1], cx, cy, B[0], B[1], LL[0], LL[1] };
+    float fr[8] = { cx, cy, UR[0], UR[1], LR[0], LR[1], B[0], B[1] };
+    ic_shape(ft, 4, top, line, w, 1, 0);
+    ic_shape(fl, 4, left, line, w, 1, 0);
+    ic_shape(fr, 4, right, line, w, 1, 0);
+}
+
+static DWORD ic_mix(DWORD a, DWORD b, float t)
+{
+    int r = (int)(((a >> 16) & 255) * (1 - t) + ((b >> 16) & 255) * t), g = (int)(((a >> 8) & 255) * (1 - t) + ((b >> 8) & 255) * t);
+    int bl = (int)((a & 255) * (1 - t) + (b & 255) * t);
+    return 0xFF000000u | (DWORD)r << 16 | (DWORD)g << 8 | (DWORD)bl;
+}
+
+enum {
+    IC_NONE, IC_SELECT, IC_MOVE, IC_ROTATE, IC_SCALE, IC_PAINT, IC_WELD, IC_LOOP, IC_CUT,
+    IC_OBJ, IC_VERT, IC_EDGE, IC_FACE, IC_MULTI,
+    IC_CUBE, IC_CYL, IC_SPHERE, IC_PLANE, IC_CONE, IC_TORUS, IC_PIPE,
+    IC_EXTRUDE, IC_BEVEL, IC_BRIDGE, IC_MERGE, IC_FILL, IC_MIRROR, IC_SUBDIV, IC_COMBINE, IC_SEPARATE, IC_DUP, IC_DELETE,
+    IC_SYM, IC_SOFT, IC_GRID, IC_POINT,
+    IC_WIRE, IC_HARD, IC_SMOOTHS, IC_AUTO, IC_PREVIEW, IC_XRAY, IC_FRAME, IC_UNDO, IC_REDO, IC_ISOLATE
 };
-#define NTB ((int)(sizeof tbItems / sizeof *tbItems))
-static RECT tbRc[NTB];
-static int tbHover = -1, tbDown = -1;
+
+/* draws icon id with its top left corner at (x, y), size px */
+static void draw_icon(int id, float x, float y, float px)
+{
+    ic.x = x; ic.y = y; ic.k = px / 24;
+    DWORD fg = ic.fg, ac = ic.acc, so = ic.soft, bg = ic.bg, none = 0;
+    DWORD mid = ic_mix(so, ac, .5f), dark = ic_mix(ac, fg, .25f);
+    float w = 1.6f;
+    switch (id) {
+    case IC_SELECT: {
+        float p[] = { 6, 3, 6, 19.5f, 10, 15.5f, 13, 21.5f, 16, 20.2f, 13, 14, 18.5f, 14 };
+        ic_shape(p, 7, so, fg, w, 1, 0);
+        break;
+    }
+    case IC_MOVE:
+        ic_line(12, 4.5f, 12, 19.5f, fg, w);
+        ic_line(4.5f, 12, 19.5f, 12, fg, w);
+        ic_head(12, 4, 0, -1, 3.2f, ac); ic_head(12, 20, 0, 1, 3.2f, ac);
+        ic_head(4, 12, -1, 0, 3.2f, ac); ic_head(20, 12, 1, 0, 3.2f, ac);
+        ic_ell(12, 12, 2.2f, 2.2f, so, fg, 1.2f);
+        break;
+    case IC_ROTATE:
+        ic_ell(12, 12, 2, 2, ac, none, 0);
+        ic_arc_arrow(12, 12, 7.5f, 200, 280, fg, w);
+        break;
+    case IC_SCALE: {
+        float big[] = { 4, 4, 20, 4, 20, 20, 4, 20 }, sm[] = { 4, 13, 11, 13, 11, 20, 4, 20 };
+        ic_shape(big, 4, none, fg, 1.2f, 1, 1);
+        ic_shape(sm, 4, so, fg, w, 1, 0);
+        ic_line(10, 14, 17.5f, 6.5f, ac, w);
+        ic_head(18, 6, 1, -1, 3, ac);
+        break;
+    }
+    case IC_PAINT: {
+        float tip[] = { 10.5f, 12.5f, 13.5f, 15.5f, 10, 19.5f, 4, 21, 5.5f, 15.5f };
+        ic_line(20, 3.5f, 13, 12, fg, 2.6f);
+        ic_shape(tip, 5, ac, fg, 1.2f, 1, 0);
+        ic_ell(18, 19, 1.6f, 1.6f, mid, none, 0);
+        break;
+    }
+    case IC_WELD:
+        ic_ell(5.5f, 17, 2.4f, 2.4f, so, fg, 1.3f);
+        ic_ell(18, 7, 3, 3, ac, fg, 1.3f);
+        ic_arc(11, 17, 6, 8, 180, 75, fg, w, 1);
+        ic_head(14.5f, 9.8f, .9f, -.5f, 2.6f, fg);
+        break;
+    case IC_LOOP: {
+        float q[] = { 4, 5, 20, 5, 20, 19, 4, 19 };
+        ic_shape(q, 4, so, fg, w, 1, 0);
+        ic_line(12, 3, 12, 21, ac, 2.4f);
+        ic_ell(12, 5, 1.5f, 1.5f, ac, none, 0); ic_ell(12, 19, 1.5f, 1.5f, ac, none, 0);
+        break;
+    }
+    case IC_CUT: {
+        float q[] = { 4, 5, 20, 5, 20, 19, 4, 19 }, c[] = { 4, 15, 11, 9, 20, 12 };
+        ic_shape(q, 4, so, fg, w, 1, 0);
+        ic_shape(c, 3, none, ac, 2.2f, 0, 0);
+        ic_ell(4, 15, 1.8f, 1.8f, ac, none, 0); ic_ell(11, 9, 1.8f, 1.8f, ac, none, 0); ic_ell(20, 12, 1.8f, 1.8f, ac, none, 0);
+        break;
+    }
+    case IC_OBJ:
+        ic_cube(12, 12.5f, 8.5f, so, mid, dark, fg, w);
+        break;
+    case IC_VERT:
+        ic_cube(12, 12.5f, 8.5f, none, none, none, fg, 1.1f);
+        {
+            float pts[][2] = { { 12, 4 }, { 19.4f, 8.25f }, { 19.4f, 16.75f }, { 12, 21 }, { 4.6f, 16.75f }, { 4.6f, 8.25f }, { 12, 12.5f } };
+            for (int i = 0; i < 7; i++) ic_ell(pts[i][0], pts[i][1], 2, 2, ac, fg, .8f);
+        }
+        break;
+    case IC_EDGE:
+        ic_cube(12, 12.5f, 8.5f, none, none, none, fg, 1.1f);
+        ic_line(12, 12.5f, 12, 21, ac, 3);
+        ic_line(4.6f, 8.25f, 12, 4, ac, 3);
+        break;
+    case IC_FACE:
+        ic_cube(12, 12.5f, 8.5f, ac, none, none, fg, 1.1f);
+        break;
+    case IC_MULTI:
+        ic_cube(12, 12.5f, 8.5f, mid, none, none, fg, 1.1f);
+        ic_line(12, 12.5f, 12, 21, ac, 2.6f);
+        ic_ell(19.4f, 16.75f, 2.2f, 2.2f, ac, fg, .8f);
+        break;
+    case IC_CUBE:
+        ic_cube(12, 12.5f, 9, so, mid, dark, fg, w);
+        /* a little face */
+        ic_ell(6.6f, 13.2f, .9f, 1.2f, fg, none, 0);
+        ic_ell(9.6f, 14.9f, .9f, 1.2f, fg, none, 0);
+        ic_arc(8.2f, 15.8f, 1.6f, 1.2f, 20, 140, fg, 1, 0);
+        break;
+    case IC_CYL: {
+        float side[] = { 5, 6.5f, 19, 6.5f, 19, 17.5f, 5, 17.5f };
+        ic_shape(side, 4, mid, none, 0, 1, 0);
+        ic_ell(12, 17.5f, 7, 3, mid, none, 0);
+        ic_arc(12, 17.5f, 7, 3, 0, 180, fg, w, 0);
+        ic_line(5, 6.5f, 5, 17.5f, fg, w);
+        ic_line(19, 6.5f, 19, 17.5f, fg, w);
+        ic_ell(12, 6.5f, 7, 3, so, fg, w);
+        break;
+    }
+    case IC_SPHERE:
+        ic_ell(12, 12, 8.5f, 8.5f, mid, fg, w);
+        ic_arc(12, 12, 8.5f, 3, 0, 180, fg, 1, 0);
+        ic_arc(12, 12, 3.2f, 8.5f, 90, 180, fg, 1, 1);
+        ic_ell(8.5f, 8, 2.2f, 1.6f, ARGB_OF(200, RGB(255, 255, 255)), none, 0);
+        break;
+    case IC_PLANE: {
+        float q[] = { 2.5f, 13, 12, 7.5f, 21.5f, 13, 12, 18.5f };
+        ic_shape(q, 4, so, fg, w, 1, 0);
+        ic_line(7.25f, 10.25f, 16.75f, 15.75f, fg, .9f);
+        ic_line(16.75f, 10.25f, 7.25f, 15.75f, fg, .9f);
+        break;
+    }
+    case IC_CONE: {
+        float side[] = { 12, 3, 19.5f, 18, 4.5f, 18 };
+        ic_shape(side, 3, mid, none, 0, 1, 0);
+        ic_ell(12, 18, 7.5f, 3, mid, none, 0);
+        ic_arc(12, 18, 7.5f, 3, 0, 180, fg, w, 0);
+        ic_line(12, 3, 4.5f, 18, fg, w);
+        ic_line(12, 3, 19.5f, 18, fg, w);
+        ic_arc(12, 18, 7.5f, 3, 180, 180, fg, 1, 1);
+        break;
+    }
+    case IC_TORUS:
+        ic_ell(12, 12.5f, 9.5f, 6, mid, fg, w);
+        ic_ell(12, 11.5f, 3.6f, 1.7f, bg, fg, w);
+        ic_arc(12, 12.5f, 7, 3.6f, 200, 140, ARGB_OF(160, RGB(255, 255, 255)), 1.3f, 0);
+        break;
+    case IC_PIPE: {
+        float side[] = { 5, 6.5f, 19, 6.5f, 19, 17.5f, 5, 17.5f };
+        ic_shape(side, 4, mid, none, 0, 1, 0);
+        ic_ell(12, 17.5f, 7, 3, mid, none, 0);
+        ic_arc(12, 17.5f, 7, 3, 0, 180, fg, w, 0);
+        ic_line(5, 6.5f, 5, 17.5f, fg, w);
+        ic_line(19, 6.5f, 19, 17.5f, fg, w);
+        ic_ell(12, 6.5f, 7, 3, so, fg, w);
+        ic_ell(12, 6.5f, 3.8f, 1.6f, bg, fg, 1.2f);
+        break;
+    }
+    case IC_EXTRUDE: {
+        float base[] = { 3, 17, 12, 13, 21, 17, 12, 21 }, top[] = { 6, 10, 12, 7.5f, 18, 10, 12, 12.5f };
+        ic_shape(base, 4, so, fg, 1.2f, 1, 0);
+        ic_shape(top, 4, ac, fg, 1.2f, 1, 1);
+        ic_line(12, 15.5f, 12, 5, fg, w);
+        ic_head(12, 4, 0, -1, 2.8f, fg);
+        break;
+    }
+    case IC_BEVEL: {
+        float p[] = { 4, 20, 4, 4, 13, 4, 20, 11, 20, 20 };
+        ic_shape(p, 5, so, fg, w, 1, 0);
+        ic_line(13, 4, 20, 11, ac, 3);
+        break;
+    }
+    case IC_BRIDGE: {
+        float l[] = { 3, 5, 7, 5, 7, 19, 3, 19 }, r[] = { 17, 5, 21, 5, 21, 19, 17, 19 }, mid_[] = { 7, 8, 17, 8, 17, 16, 7, 16 };
+        ic_shape(mid_, 4, ac, none, 0, 1, 0);
+        ic_shape(l, 4, so, fg, w, 1, 0);
+        ic_shape(r, 4, so, fg, w, 1, 0);
+        ic_line(7, 12, 17, 12, fg, 1);
+        break;
+    }
+    case IC_MERGE:
+        ic_ell(12, 12, 3, 3, ac, fg, 1.2f);
+        ic_ell(4, 4.5f, 1.8f, 1.8f, so, fg, 1); ic_ell(20, 4.5f, 1.8f, 1.8f, so, fg, 1); ic_ell(12, 21, 1.8f, 1.8f, so, fg, 1);
+        ic_line(5.5f, 6, 8.5f, 9, fg, 1.2f); ic_head(9.2f, 9.6f, 1, 1, 2, fg);
+        ic_line(18.5f, 6, 15.5f, 9, fg, 1.2f); ic_head(14.8f, 9.6f, -1, 1, 2, fg);
+        ic_line(12, 19, 12, 16.5f, fg, 1.2f); ic_head(12, 15.8f, 0, -1, 2, fg);
+        break;
+    case IC_FILL:
+        ic_ell(12, 12, 8.5f, 6.5f, ac, none, 0);
+        ic_ell(12, 12, 8.5f, 6.5f, none, fg, w);
+        ic_ell(12, 12, 4, 2.5f, ARGB_OF(140, RGB(255, 255, 255)), none, 0);
+        break;
+    case IC_MIRROR: {
+        /* a heart: one half drawn, the other its dashed mirror image */
+        float L[2 * 26], R[2 * 26];
+        for (int i = 0; i <= 25; i++) {
+            float t = PI_F * i / 25, hx = 16 * powf(sinf(t), 3), hy = 13 * cosf(t) - 5 * cosf(2 * t) - 2 * cosf(3 * t) - cosf(4 * t);
+            R[2 * i] = 12 + hx * .48f; R[2 * i + 1] = 11 - hy * .48f;
+            L[2 * i] = 12 - hx * .48f; L[2 * i + 1] = 11 - hy * .48f;
+        }
+        ic_shape(L, 26, ac, fg, w, 1, 0);
+        ic_shape(R, 26, none, fg, 1.2f, 0, 1);
+        ic_dline(12, 1.5f, 12, 22.5f, fg, 1);
+        break;
+    }
+    case IC_SUBDIV: {
+        float q[] = { 3, 9, 9, 9, 9, 21, 3, 21 };
+        ic_shape(q, 4, so, fg, 1.3f, 1, 0);
+        ic_ell(15.5f, 15, 5.5f, 5.5f, mid, fg, w);
+        /* sparkles */
+        float s1[] = { 18, 2, 19, 5, 22, 6, 19, 7, 18, 10, 17, 7, 14, 6, 17, 5 };
+        ic_shape(s1, 8, ac, none, 0, 1, 0);
+        ic_ell(9, 4.5f, 1.2f, 1.2f, ac, none, 0);
+        break;
+    }
+    case IC_COMBINE: {
+        float a[] = { 3, 5, 14, 5, 14, 16, 3, 16 }, b[] = { 10, 9, 21, 9, 21, 20, 10, 20 };
+        ic_shape(a, 4, mid, fg, w, 1, 0);
+        ic_shape(b, 4, so, fg, w, 1, 0);
+        break;
+    }
+    case IC_SEPARATE: {
+        float a[] = { 2, 4, 10, 4, 10, 12, 2, 12 }, b[] = { 14, 12, 22, 12, 22, 20, 14, 20 };
+        ic_shape(a, 4, mid, fg, w, 1, 0);
+        ic_shape(b, 4, so, fg, w, 1, 0);
+        ic_dline(10.5f, 19, 13.5f, 5, fg, 1);
+        break;
+    }
+    case IC_DUP: {
+        float a[] = { 3, 3, 14, 3, 14, 14, 3, 14 }, b[] = { 8, 8, 19, 8, 19, 19, 8, 19 };
+        ic_shape(a, 4, none, fg, 1.2f, 1, 1);
+        ic_shape(b, 4, so, fg, w, 1, 0);
+        ic_line(13.5f, 11, 13.5f, 16, ac, 2);
+        ic_line(11, 13.5f, 16, 13.5f, ac, 2);
+        break;
+    }
+    case IC_DELETE: {
+        float body[] = { 6, 7.5f, 18, 7.5f, 16.8f, 21, 7.2f, 21 };
+        ic_shape(body, 4, so, fg, w, 1, 0);
+        ic_line(4, 6.5f, 20, 6.5f, fg, w);
+        ic_line(10, 6.5f, 10.5f, 3.5f, fg, w); ic_line(10.5f, 3.5f, 13.5f, 3.5f, fg, w); ic_line(13.5f, 3.5f, 14, 6.5f, fg, w);
+        ic_line(10, 10.5f, 10.3f, 18, fg, 1); ic_line(14, 10.5f, 13.7f, 18, fg, 1);
+        break;
+    }
+    case IC_SYM: {
+        /* a butterfly: two mirrored wings around a dashed plane */
+        float lw_[] = { 11, 11, 6, 4, 2.5f, 6.5f, 4.5f, 11, 3.5f, 16, 6.5f, 19.5f, 11, 14 };
+        float rw[14];
+        for (int i = 0; i < 7; i++) { rw[2 * i] = 24 - lw_[2 * i]; rw[2 * i + 1] = lw_[2 * i + 1]; }
+        ic_shape(lw_, 7, ac, fg, 1.3f, 1, 0);
+        ic_shape(rw, 7, mid, fg, 1.3f, 1, 0);
+        ic_dline(12, 1.5f, 12, 22.5f, fg, 1);
+        ic_line(12, 7, 12, 18, fg, 2.2f);
+        ic_line(12, 7, 10, 3.5f, fg, 1); ic_line(12, 7, 14, 3.5f, fg, 1);
+        break;
+    }
+    case IC_SOFT:
+        ic_ell(12, 12, 9.5f, 9.5f, ARGB_OF(70, rgb_of(ac)), none, 0);
+        ic_ell(12, 12, 6.5f, 6.5f, ARGB_OF(130, rgb_of(ac)), none, 0);
+        ic_ell(12, 12, 3.5f, 3.5f, ac, fg, 1.2f);
+        ic_ell(12, 12, 9.5f, 9.5f, none, fg, 1);
+        break;
+    case IC_GRID:
+        for (int i = 0; i < 4; i++) {
+            float t = 4 + i * 16 / 3.0f;
+            ic_line(t, 3, t, 21, fg, 1);
+            ic_line(3, t, 21, t, fg, 1);
+        }
+        ic_ell(9.33f, 14.67f, 2.4f, 2.4f, ac, fg, 1);
+        break;
+    case IC_POINT:
+        ic_ell(12, 12, 7.5f, 7.5f, none, fg, 1.2f);
+        ic_line(12, 2, 12, 6, fg, 1.2f); ic_line(12, 18, 12, 22, fg, 1.2f);
+        ic_line(2, 12, 6, 12, fg, 1.2f); ic_line(18, 12, 22, 12, fg, 1.2f);
+        ic_ell(12, 12, 2.8f, 2.8f, ac, fg, 1);
+        break;
+    case IC_WIRE:
+        ic_cube(12, 12.5f, 8.5f, none, none, none, fg, 1.3f);
+        ic_dline(4.6f, 16.75f, 12, 21 - 8.5f * 2 + 8.5f, fg, .9f);
+        break;
+    case IC_HARD: {
+        float o[16];
+        for (int i = 0; i < 8; i++) { o[2 * i] = 12 + 8.5f * cosf(PI_F * (i + .5f) / 4); o[2 * i + 1] = 12 + 8.5f * sinf(PI_F * (i + .5f) / 4); }
+        ic_shape(o, 8, mid, fg, w, 1, 0);
+        ic_line(o[10], o[11], o[0], o[1], fg, .9f);
+        ic_line(o[12], o[13], o[6], o[7], fg, .9f);
+        break;
+    }
+    case IC_SMOOTHS:
+        ic_ell(12, 12, 8.5f, 8.5f, mid, fg, w);
+        ic_ell(9, 9, 3, 2.3f, ARGB_OF(190, RGB(255, 255, 255)), none, 0);
+        break;
+    case IC_AUTO: {
+        float side[] = { 5, 7, 19, 7, 19, 17, 5, 17 };
+        ic_shape(side, 4, mid, none, 0, 1, 0);
+        ic_ell(12, 17, 7, 2.8f, mid, none, 0);
+        ic_arc(12, 17, 7, 2.8f, 0, 180, fg, w, 0);
+        ic_line(5, 7, 5, 17, fg, w); ic_line(19, 7, 19, 17, fg, w);
+        ic_line(8.5f, 9, 8.5f, 17.5f, ARGB_OF(170, RGB(255, 255, 255)), 1.6f);
+        ic_ell(12, 7, 7, 2.8f, so, fg, w);
+        break;
+    }
+    case IC_PREVIEW: {
+        float q[] = { 4, 4, 20, 4, 20, 20, 4, 20 };
+        ic_ell(12, 12, 7, 7, mid, none, 0);
+        ic_shape(q, 4, none, fg, 1.2f, 1, 1);
+        ic_ell(12, 12, 7, 7, none, fg, w);
+        ic_ell(9.5f, 9.5f, 2, 1.5f, ARGB_OF(190, RGB(255, 255, 255)), none, 0);
+        break;
+    }
+    case IC_XRAY: {
+        /* a friendly ghost */
+        float g[2 * 22];
+        int n = 0;
+        for (int i = 0; i <= 12; i++) { float a = PI_F + PI_F * i / 12; g[n++] = 12 + 7.5f * cosf(a); g[n++] = 10 + 7.5f * sinf(a); }
+        float tail[] = { 19.5f, 20.5f, 17, 18.5f, 14.5f, 21, 12, 18.5f, 9.5f, 21, 7, 18.5f, 4.5f, 20.5f, 4.5f, 10 };
+        for (int i = 0; i < 16; i++) g[n++] = tail[i];
+        ic_shape(g, n / 2, ARGB_OF(200, rgb_of(so)), fg, w, 1, 0);
+        ic_ell(9.5f, 10, 1.4f, 1.9f, fg, none, 0);
+        ic_ell(14.5f, 10, 1.4f, 1.9f, fg, none, 0);
+        ic_ell(7.3f, 13, 1.3f, .8f, ARGB_OF(150, RGB(255, 120, 150)), none, 0);
+        ic_ell(16.7f, 13, 1.3f, .8f, ARGB_OF(150, RGB(255, 120, 150)), none, 0);
+        break;
+    }
+    case IC_FRAME: {
+        float c1[] = { 3, 8, 3, 3, 8, 3 }, c2[] = { 16, 3, 21, 3, 21, 8 }, c3[] = { 21, 16, 21, 21, 16, 21 }, c4[] = { 8, 21, 3, 21, 3, 16 };
+        ic_shape(c1, 3, none, fg, w, 0, 0); ic_shape(c2, 3, none, fg, w, 0, 0);
+        ic_shape(c3, 3, none, fg, w, 0, 0); ic_shape(c4, 3, none, fg, w, 0, 0);
+        ic_cube(12, 12, 5, so, mid, dark, fg, 1);
+        break;
+    }
+    case IC_UNDO:
+        ic_arc_arrow(12, 13, 7, 30, -250, fg, 2);
+        break;
+    case IC_REDO:
+        ic_arc_arrow(12, 13, 7, 150, 250, fg, 2);
+        break;
+    case IC_ISOLATE: {
+        float eye[2 * 26];
+        for (int i = 0; i <= 12; i++) { float t = PI_F * i / 12; eye[2 * i] = 12 - 10 * cosf(t); eye[2 * i + 1] = 12 - 6 * sinf(t); }
+        for (int i = 0; i <= 12; i++) { float t = PI_F * i / 12; eye[26 + 2 * i] = 12 + 10 * cosf(t); eye[26 + 2 * i + 1] = 12 + 6 * sinf(t); }
+        ic_shape(eye, 26, so, fg, w, 1, 0);
+        ic_ell(12, 12, 4, 4, ac, fg, 1.2f);
+        ic_ell(12, 12, 1.6f, 1.6f, fg, none, 0);
+        break;
+    }
+    }
+}
+
+/* rounded rectangle (GDI+ when available) */
+static void rrect(HDC dc, RECT r, int rad, COLORREF fill, COLORREF line)
+{
+    gp_init();
+    void *g = NULL;
+    if (gp.ok && !gp.FromHDC(dc, &g)) {
+        void *path = NULL, *b = NULL, *pen = NULL;
+        float x = (float)r.left, y = (float)r.top, w = (float)(r.right - r.left - 1), h = (float)(r.bottom - r.top - 1), d = 2.0f * rad;
+        if (d > w) d = w;
+        if (d > h) d = h;
+        gp.Smooth(g, 4);
+        gp.NewPath(0, &path);
+        if (path && d > 0) {
+            gp.PathArc(path, x, y, d, d, 180, 90);
+            gp.PathArc(path, x + w - d, y, d, d, 270, 90);
+            gp.PathArc(path, x + w - d, y + h - d, d, d, 0, 90);
+            gp.PathArc(path, x, y + h - d, d, d, 90, 90);
+            gp.ClosePath(path);
+            gp.Brush(ARGB_OF(255, fill), &b);
+            if (b) { gp.FillPath(g, b, path); gp.DelBrush(b); }
+            if (line != fill) {
+                gp.Pen(ARGB_OF(255, line), 1, 2, &pen);
+                if (pen) { gp.DrawPath(g, pen, path); gp.DelPen(pen); }
+            }
+            gp.DelPath(path);
+        }
+        gp.DelG(g);
+        if (d > 0) return;
+    }
+    HBRUSH b = CreateSolidBrush(fill);
+    HPEN p = CreatePen(PS_SOLID, 1, line);
+    HGDIOBJ ob_ = SelectObject(dc, b), op = SelectObject(dc, p);
+    RoundRect(dc, r.left, r.top, r.right, r.bottom, 2 * rad, 2 * rad);
+    SelectObject(dc, ob_);
+    SelectObject(dc, op);
+    DeleteObject(b);
+    DeleteObject(p);
+}
+
+/* ================================================================ toolbars
+
+   The toolbox on the left holds the tools and selection modes; the shelf on top holds shapes,
+   mesh operations, modeling aids and display toggles. Every button has an icon, its name, and its
+   hotkey in the corner, so the bars double as a cheat sheet. Right-click Symmetry or Mirror to pick
+   an axis. */
+
+typedef struct { const char *label, *hotkey; int cmd; const char *desc; int icon; } Tool;
+static const Tool boxItems[] = {
+    { "Select", "Q", CM_TSEL, "Select tool: click or drag a box to select", IC_SELECT },
+    { "Move", "W", CM_TMOVE, "Move tool: drag the arrows (1 axis), squares (2 axes) or center", IC_MOVE },
+    { "Rotate", "E", CM_TROT, "Rotate tool: drag a ring; hold J for 15 degree steps", IC_ROTATE },
+    { "Scale", "R", CM_TSCALE, "Scale tool: drag a handle; drag components past the center to flatten them", IC_SCALE },
+    { "Paint", "", CM_TPAINT, "Paint vertex colors: drag over a mesh; B + drag sets the brush size", IC_PAINT },
+    { "Loop", "", CM_TLOOP, "Insert Edge Loop tool: click an edge to add a loop across it", IC_LOOP },
+    { "Cut", "", CM_TCUT, "Multi-Cut tool: click points on edges to cut faces; Enter finishes", IC_CUT },
+    { "Weld", "", CM_TWELD, "Target Weld tool: drag one vertex onto another to join them", IC_WELD }, { 0 },
+    { "Object", "F8", CM_MOBJ, "Object mode: pick whole objects (F8 toggles object/component)", IC_OBJ },
+    { "Vertex", "F9", CM_MVERT, "Vertex mode (double-click: vertex loop, Ctrl+F9 converts)", IC_VERT },
+    { "Edge", "F10", CM_MEDGE, "Edge mode (double-click: edge loop)", IC_EDGE },
+    { "Face", "F11", CM_MFACE, "Face mode (double-click: face loop, Ctrl+F11 converts)", IC_FACE },
+    { "Multi", "F7", CM_MMULTI, "Multi mode: vertices, edges and faces at once", IC_MULTI },
+};
+static const Tool shelfItems[] = {
+    { "Cube", "", CM_CUBE, "Make a cube (set its size and divisions in the side panel)", IC_CUBE },
+    { "Sphere", "", CM_SPHERE, "Make a sphere (sides, rings and radius in the side panel)", IC_SPHERE },
+    { "Cylinder", "", CM_CYL, "Make a cylinder (sides, radius, height and caps in the side panel)", IC_CYL },
+    { "Cone", "", CM_CONE, "Make a cone (sides, radius and height in the side panel)", IC_CONE },
+    { "Torus", "", CM_TORUS, "Make a torus, a donut (sides and both radii in the side panel)", IC_TORUS },
+    { "Pipe", "", CM_PIPE, "Make a pipe, a tube with a wall (sides, thickness, height in the side panel)", IC_PIPE },
+    { "Plane", "", CM_PLANE, "Make a flat plane (size and divisions in the side panel)", IC_PLANE }, { 0 },
+    { "Extrude", "Ctrl+E", CM_EXTRUDE, "Extrude the selected faces or edges, then drag the blue handle (or set Thickness)", IC_EXTRUDE },
+    { "Bevel", "Ctrl+B", CM_BEVEL, "Bevel the selected edges (Bevel Width in the side panel adjusts it)", IC_BEVEL },
+    { "Bridge", "", CM_BRIDGE, "Join two selected open borders with faces", IC_BRIDGE },
+    { "Merge", "", CM_MERGE, "Merge the selected vertices to their center", IC_MERGE },
+    { "Fill Hole", "", CM_FILLHOLE, "Cap the hole the selection is on (an object: all its holes)", IC_FILL },
+    { "Mirror", "", CM_MIRROR, "Mirror the selected objects and weld the seam (right-click: pick the axis)", IC_MIRROR },
+    { "Smooth", "", CM_SMOOTHMESH, "Smooth the mesh: split every face in four and round it off", IC_SUBDIV },
+    { "Combine", "", CM_COMBINE, "Combine the selected objects into one", IC_COMBINE },
+    { "Separate", "", CM_SEPARATE, "Split objects into their loose pieces, or selected faces into a new object", IC_SEPARATE },
+    { "Duplicate", "Ctrl+D", CM_DUP, "Duplicate the selected objects", IC_DUP },
+    { "Delete", "Del", CM_DELETE, "Delete the selected objects or faces (edges and vertices: their faces join)", IC_DELETE }, { 0 },
+    { "Symmetry", "S", CM_SYMTOG, "Symmetry: edits on one side are mirrored to the other (right-click: pick the axis)", IC_SYM },
+    { "Soft Sel", "B", CM_SOFTTOG, "Soft selection: nearby vertices follow with a smooth falloff; hold B and drag for the radius", IC_SOFT },
+    { "Grid", "X", CM_SNAPGRID, "Snap moves to the grid (or hold X while dragging)", IC_GRID },
+    { "Point", "V", CM_SNAPPOINT, "Snap moves onto vertices (or hold V while dragging)", IC_POINT }, { 0 },
+    { "Wire", "4/5", CM_WIRETOG, "Toggle wireframe (4) and shaded (5) display", IC_WIRE },
+    { "Hard", "", CM_HARD, "Hard shading: every edge looks sharp (faceted)", IC_HARD },
+    { "Smooth", "", CM_SMOOTH, "Smooth shading: every edge looks soft", IC_SMOOTHS },
+    { "Auto", "", CM_AUTOSMOOTH, "Auto smooth: edges sharper than the Normal Angle (side panel) stay hard", IC_AUTO },
+    { "Preview", "3/1", CM_PREVTOG, "Smooth preview: see the selection subdivided while you edit the simple cage (3 on, 1 off)", IC_PREVIEW },
+    { "X-Ray", "", CM_XRAY, "X-Ray: see (and select) through surfaces", IC_XRAY },
+    { "Isolate", "Ctrl+1", CM_ISOLATE, "Isolate Select: show only the selection (again: show everything)", IC_ISOLATE },
+    { "Frame", "F", CM_FRAMESEL, "Frame the selection (A frames everything, Home resets the view)", IC_FRAME }, { 0 },
+    { "Undo", "Z", CM_UNDO, "Undo the last change", IC_UNDO },
+    { "Redo", "Shift+Z", CM_REDO, "Redo", IC_REDO },
+};
+
+#define NBOX ((int)(sizeof boxItems / sizeof *boxItems))
+#define NSHELF ((int)(sizeof shelfItems / sizeof *shelfItems))
+typedef struct { const Tool *it; int n, vert, hover, down; RECT rc[48]; HWND h; } Bar;
+static Bar box = { boxItems, NBOX, 1, -1, -1, { { 0 } }, NULL }, shelf = { shelfItems, NSHELF, 0, -1, -1, { { 0 } }, NULL };
+static const char *barTip;   /* the hovered button's description, for the status line */
 
 static int tb_on(int cmd)
 {
@@ -4745,85 +6180,253 @@ static int tb_on(int cmd)
         return cmd == (a <= 0 ? CM_HARD : a >= 180 ? CM_SMOOTH : CM_AUTOSMOOTH);
     }
     if (cmd >= CM_MOBJ && cmd <= CM_MMULTI) return mode == cmd - CM_MOBJ;
-    if (cmd == CM_WIRE || cmd == CM_SHADED) return wire == (cmd == CM_WIRE);
-    if (cmd == CM_WIRETOG) return wire;
-    if (cmd == CM_SNAPGRID) return snapGrid;
-    if (cmd == CM_SNAPPOINT) return snapPoint;
+    switch (cmd) {
+    case CM_WIRE: return wire;
+    case CM_SHADED: return !wire;
+    case CM_WIRETOG: return wire;
+    case CM_SNAPGRID: return snapGrid;
+    case CM_SNAPPOINT: return snapPoint;
+    case CM_SYMTOG: return symAxis != 0;
+    case CM_SOFTTOG: return softOn;
+    case CM_XRAY: return xray;
+    case CM_ISOLATE: return isolateOn;
+    case CM_PREVTOG: { Obj *l = lead(); return l && l->smooth; }
+    }
     return 0;
 }
 
-/* lays the buttons out in rows across width W and returns the bar height */
-static int tb_layout(int W)
+/* button label (Symmetry shows its axis) */
+static const char *tb_label(const Tool *t)
 {
-    HDC dc = GetDC(hMain);
-    int pad = (int)(4 * ds), gap = (int)(7 * ds), bh = (int)(36 * ds), x = pad, y = pad;
-    for (int i = 0; i < NTB; i++) {
-        if (!tbItems[i].label) { x += gap; SetRectEmpty(&tbRc[i]); continue; }
-        SIZE a, b;
-        SelectObject(dc, hFont);
-        GetTextExtentPoint32A(dc, tbItems[i].label, (int)strlen(tbItems[i].label), &a);
-        SelectObject(dc, hSmall);
-        char hk[48];
-        const char *ht = cmd_key(tbItems[i].cmd, hk, sizeof hk);
-        if (!ht) ht = tbItems[i].hotkey;
-        GetTextExtentPoint32A(dc, ht, (int)strlen(ht), &b);
-        int w = (a.cx > b.cx ? a.cx : b.cx) + (int)(9 * ds);
-        if (x + w > W - pad && x > pad) { x = pad; y += bh + pad; }
-        SetRect(&tbRc[i], x, y, x + w, y + bh);
-        x += w + 2;
-    }
-    ReleaseDC(hMain, dc);
-    return y + bh + pad + 1;
+    static char b[24];
+    if (t->cmd == CM_SYMTOG && symAxis) { snprintf(b, sizeof b, "Sym %s", SYM_NAME[symAxis]); return b; }
+    return t->label;
 }
 
-static int tb_hit(int x, int y)
+static int bar_icon_px(void) { return (int)(24 * ds); }
+
+/* the hotkey shown on a button ("" if none) */
+static const char *tb_key(const Tool *t, char *buf, int n)
+{
+    const char *k = cmd_key(t->cmd, buf, n);
+    return k ? k : t->hotkey;
+}
+
+/* width of a short hotkey badge, or 0 when the key is long (those show in the tooltip) */
+static int badge_w(HDC dc, const Tool *t)
+{
+    char hk[48];
+    const char *k = tb_key(t, hk, sizeof hk);
+    SIZE z;
+    if (!k[0] || strlen(k) > 3) return 0;
+    SelectObject(dc, hSmall);
+    GetTextExtentPoint32A(dc, k, (int)strlen(k), &z);
+    return z.cx;
+}
+
+/* lays the buttons out (rows across a shelf of width L; a grid of one or two columns down a
+   toolbox of height L) and returns the bar's height (shelf) or width (toolbox) */
+static int bar_layout(Bar *b, int L)
+{
+    HDC dc = GetDC(hMain);
+    int pad = (int)(5 * ds), gap = (int)(8 * ds), ip = bar_icon_px(), bh = ip + (int)(27 * ds);
+    int x = pad, y = pad, extent = 0;
+    if (b->vert) {
+        int colw = ip + (int)(22 * ds), rows1 = 0, gaps = 0;
+        for (int i = 0; i < b->n; i++) {
+            SIZE a;
+            if (!b->it[i].label) { gaps++; continue; }
+            rows1++;
+            SelectObject(dc, hFont);
+            GetTextExtentPoint32A(dc, b->it[i].label, (int)strlen(b->it[i].label), &a);
+            if (a.cx + (int)(14 * ds) > colw) colw = a.cx + (int)(14 * ds);
+            int bw = badge_w(dc, &b->it[i]);
+            if (bw && ip + 2 * (bw + (int)(5 * ds)) > colw) colw = ip + 2 * (bw + (int)(5 * ds));
+        }
+        int cols = pad + rows1 * (bh + 2) + gaps * gap <= L ? 1 : 2, c = 0;
+        for (int i = 0; i < b->n; i++) {
+            if (!b->it[i].label) {
+                if (c) { c = 0; y += bh + 2; }   /* a group starts on a new row */
+                y += gap;
+                SetRectEmpty(&b->rc[i]);
+                continue;
+            }
+            x = pad + c * (colw + 2);
+            SetRect(&b->rc[i], x, y, x + colw, y + bh);
+            if (++c == cols) { c = 0; y += bh + 2; }
+        }
+        extent = pad + cols * (colw + 2) + pad;
+    } else {
+        for (int i = 0; i < b->n; i++) {
+            if (!b->it[i].label) {
+                x += gap;
+                SetRectEmpty(&b->rc[i]);
+                continue;
+            }
+            SIZE a;
+            const char *lab = tb_label(&b->it[i]);
+            SelectObject(dc, hFont);
+            GetTextExtentPoint32A(dc, lab, (int)strlen(lab), &a);
+            int w = a.cx + (int)(16 * ds), bw = badge_w(dc, &b->it[i]);
+            if (w < ip + (int)(22 * ds)) w = ip + (int)(22 * ds);
+            if (bw && w < ip + 2 * (bw + (int)(5 * ds))) w = ip + 2 * (bw + (int)(5 * ds));
+            if (x + w > L - pad && x > pad) { x = pad; y += bh + 2; }
+            SetRect(&b->rc[i], x, y, x + w, y + bh);
+            x += w + 2;
+            extent = y + bh + pad + 1;
+        }
+    }
+    ReleaseDC(hMain, dc);
+    return extent;
+}
+
+/* ---- tooltips: the button's name, hotkey and what it does, after a short hover */
+
+static HWND hTip;
+static char tipHead[80], tipBody[200];
+
+static LRESULT CALLBACK TipProc(HWND h, UINT m, WPARAM wp, LPARAM lp)
+{
+    if (m == WM_NCHITTEST) return HTTRANSPARENT;
+    if (m == WM_ERASEBKGND) return 1;
+    if (m == WM_PAINT) {
+        PAINTSTRUCT p;
+        RECT rc;
+        HDC dc = BeginPaint(h, &p);
+        GetClientRect(h, &rc);
+        FillRect(dc, &rc, brField);
+        FrameRect(dc, &rc, brLine);
+        SetBkMode(dc, TRANSPARENT);
+        int pad = (int)(8 * ds);
+        RECT t = { pad, pad / 2 + 2, rc.right - pad, rc.bottom - pad / 2 };
+        SelectObject(dc, hBold);
+        SetTextColor(dc, th.fieldText);
+        RECT hr = t;
+        DrawTextA(dc, tipHead, -1, &hr, DT_CALCRECT | DT_SINGLELINE | DT_NOPREFIX);
+        DrawTextA(dc, tipHead, -1, &t, DT_SINGLELINE | DT_NOPREFIX);
+        t.top += hr.bottom - hr.top + (int)(2 * ds);
+        SelectObject(dc, hFont);
+        SetTextColor(dc, mix(th.fieldText, th.field));
+        DrawTextA(dc, tipBody, -1, &t, DT_WORDBREAK | DT_NOPREFIX);
+        EndPaint(h, &p);
+        return 0;
+    }
+    return DefWindowProc(h, m, wp, lp);
+}
+
+static void tip_hide(void)
+{
+    if (hTip) ShowWindow(hTip, SW_HIDE);
+}
+
+static void tip_show(Bar *b, int i)
+{
+    if (!hTip) {
+        WNDCLASSEXA wc;
+        memset(&wc, 0, sizeof wc);
+        wc.cbSize = sizeof wc;
+        wc.hInstance = GetModuleHandle(NULL);
+        wc.lpfnWndProc = TipProc;
+        wc.lpszClassName = "Tuff3DTip";
+        RegisterClassExA(&wc);
+        hTip = CreateWindowExA(WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE, "Tuff3DTip", "", WS_POPUP,
+                               0, 0, 1, 1, hMain, NULL, wc.hInstance, NULL);
+    }
+    const Tool *t = &b->it[i];
+    char hk[48];
+    const char *k = tb_key(t, hk, sizeof hk);
+    snprintf(tipHead, sizeof tipHead, k[0] ? "%s   (%s)" : "%s", tb_label(t), k);
+    snprintf(tipBody, sizeof tipBody, "%s", t->desc);
+    HDC dc = GetDC(hTip);
+    int pad = (int)(8 * ds), maxw = (int)(300 * ds);
+    RECT hr = { 0, 0, maxw, 0 }, br = { 0, 0, maxw, 0 };
+    SelectObject(dc, hBold);
+    DrawTextA(dc, tipHead, -1, &hr, DT_CALCRECT | DT_SINGLELINE | DT_NOPREFIX);
+    SelectObject(dc, hFont);
+    DrawTextA(dc, tipBody, -1, &br, DT_CALCRECT | DT_WORDBREAK | DT_NOPREFIX);
+    ReleaseDC(hTip, dc);
+    int w = (hr.right > br.right ? hr.right : br.right) + 2 * pad, hh = hr.bottom + br.bottom + pad + (int)(6 * ds);
+    POINT pt = { b->vert ? b->rc[i].right + (int)(6 * ds) : b->rc[i].left, b->vert ? b->rc[i].top : b->rc[i].bottom + (int)(6 * ds) };
+    ClientToScreen(b->h, &pt);
+    RECT wa;
+    SystemParametersInfoA(SPI_GETWORKAREA, 0, &wa, 0);
+    if (pt.x + w > wa.right) pt.x = wa.right - w;
+    if (pt.y + hh > wa.bottom) pt.y = wa.bottom - hh;
+    SetWindowPos(hTip, HWND_TOPMOST, pt.x, pt.y, w, hh, SWP_NOACTIVATE | SWP_SHOWWINDOW);
+    InvalidateRect(hTip, NULL, FALSE);
+}
+
+static int bar_hit(Bar *b, int x, int y)
 {
     POINT pt = { x, y };
-    for (int i = 0; i < NTB; i++)
-        if (tbItems[i].label && PtInRect(&tbRc[i], pt)) return i;
+    for (int i = 0; i < b->n; i++)
+        if (b->it[i].label && PtInRect(&b->rc[i], pt)) return i;
     return -1;
 }
 
-static void tb_paint(HWND h)
+static void bar_paint(Bar *bar)
 {
     PAINTSTRUCT ps_;
     RECT rc;
+    HWND h = bar->h;
     HDC wdc = BeginPaint(h, &ps_);
     GetClientRect(h, &rc);
     HDC dc = CreateCompatibleDC(wdc);    /* draw off screen so the bar never flickers */
     HBITMAP bm = CreateCompatibleBitmap(wdc, rc.right, rc.bottom), old = SelectObject(dc, bm);
     FillRect(dc, &rc, brUi);
     RECT ln = rc;
-    ln.top = ln.bottom - 1;
+    if (bar->vert) ln.left = ln.right - 1; else ln.top = ln.bottom - 1;
     FillRect(dc, &ln, brLine);
     SetBkMode(dc, TRANSPARENT);
-    for (int i = 0; i < NTB; i++) {
-        const Tool *t = &tbItems[i];
+    COLORREF acc = th.sys ? GetSysColor(COLOR_HIGHLIGHT) : th.head;
+    int ip = bar_icon_px(), rad = (int)(7 * ds);
+    ic.fg = ARGB_OF(255, th.text);
+    ic.acc = ARGB_OF(255, acc);
+    ic.soft = ARGB_OF(255, lerpc(th.ui, acc, .3f));
+    ic.bg = ARGB_OF(255, th.ui);
+    /* separators: a faint line */
+    for (int i = 1; i < bar->n; i++) {
+        if (bar->it[i].label || !bar->it[i - 1].label) continue;
+        RECT p = bar->rc[i - 1], s;
+        if (bar->vert) SetRect(&s, p.left + (int)(10 * ds), p.bottom + (int)(4 * ds), p.right - (int)(10 * ds), p.bottom + (int)(5 * ds));
+        else SetRect(&s, p.right + (int)(3 * ds), p.top + (int)(8 * ds), p.right + (int)(4 * ds), p.bottom - (int)(8 * ds));
+        FillRect(dc, &s, brLine);
+    }
+    for (int i = 0; i < bar->n; i++) {
+        const Tool *t = &bar->it[i];
         if (!t->label) continue;
-        RECT r = tbRc[i];
-        int on = tb_on(t->cmd), down = i == tbDown && i == tbHover;
-        if (down) FillRect(dc, &r, brField);
-        else if (on || i == tbHover) FillRect(dc, &r, brHot);
-        if (on || i == tbHover || down) FrameRect(dc, &r, brLine);
+        RECT r = bar->rc[i];
+        int on = tb_on(t->cmd), hot = i == bar->hover, down = i == bar->down && hot;
+        if (down) rrect(dc, r, rad, lerpc(th.ui, acc, .45f), acc);
+        else if (on) rrect(dc, r, rad, lerpc(th.ui, acc, .22f), lerpc(th.ui, acc, .6f));
+        else if (hot) rrect(dc, r, rad, th.hot, th.line);
         if (on) {
-            RECT u = r;
-            InflateRect(&u, -1, 0);
-            u.top = u.bottom - (int)(3 * ds);
-            FillRect(dc, &u, brAcc);
+            /* a little pill under an active button */
+            int cx = (r.left + r.right) / 2, pw = (int)(7 * ds);
+            RECT u = { cx - pw, r.bottom - (int)(4 * ds), cx + pw, r.bottom - (int)(2 * ds) };
+            rrect(dc, u, (int)(1 * ds), acc, acc);
         }
-        int mid = r.top + (r.bottom - r.top) * 11 / 20;
-        RECT a = r, b = r;
-        a.bottom = mid;
-        b.top = mid;
-        b.bottom -= (int)(3 * ds);
+        float ix = (r.left + r.right - ip) * .5f, iy = (float)r.top + (int)(4 * ds);
+        ic_begin(dc);
+        draw_icon(t->icon, ix + (down ? 1 : 0), iy + (down ? 1 : 0), (float)ip);
+        ic_end();
+        RECT lr = r;
+        lr.top = (int)iy + ip + (int)(1 * ds);
+        lr.bottom = r.bottom - (int)(4 * ds);
         SelectObject(dc, hFont);
         SetTextColor(dc, th.text);
-        DrawTextA(dc, t->label, -1, &a, DT_CENTER | DT_BOTTOM | DT_SINGLELINE | DT_NOPREFIX);
-        SelectObject(dc, hSmall);
-        SetTextColor(dc, mix(th.text, mix(th.text, th.ui)));
+        DrawTextA(dc, tb_label(t), -1, &lr, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
         char hk[48];
-        const char *ht = cmd_key(t->cmd, hk, sizeof hk);
-        DrawTextA(dc, ht ? ht : t->hotkey, -1, &b, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+        const char *ht = tb_key(t, hk, sizeof hk);
+        if (badge_w(dc, t) && (r.right - r.left - ip) / 2 >= badge_w(dc, t) + (int)(4 * ds)) {
+            /* hotkey in the corner */
+            RECT kr = r;
+            kr.right -= (int)(4 * ds);
+            kr.top += (int)(2 * ds);
+            SelectObject(dc, hSmall);
+            SetTextColor(dc, mix(th.text, th.ui));
+            DrawTextA(dc, ht, -1, &kr, DT_RIGHT | DT_TOP | DT_SINGLELINE | DT_NOPREFIX);
+        }
     }
     BitBlt(wdc, 0, 0, rc.right, rc.bottom, dc, 0, 0, SRCCOPY);
     SelectObject(dc, old);
@@ -4832,39 +6435,87 @@ static void tb_paint(HWND h)
     EndPaint(h, &ps_);
 }
 
+/* right-click menus on a few buttons */
+static void bar_menu(int cmd, int x, int y, HWND h)
+{
+    HMENU m = CreatePopupMenu();
+    if (cmd == CM_SYMTOG) {
+        AppendMenuA(m, MF_STRING | (!symAxis ? MF_CHECKED : 0), CM_SYMOFF, "Symmetry &Off");
+        AppendMenuA(m, MF_STRING | (symAxis == 1 ? MF_CHECKED : 0), CM_SYMX, "Symmetry &X");
+        AppendMenuA(m, MF_STRING | (symAxis == 2 ? MF_CHECKED : 0), CM_SYMY, "Symmetry &Y");
+        AppendMenuA(m, MF_STRING | (symAxis == 3 ? MF_CHECKED : 0), CM_SYMZ, "Symmetry &Z");
+        AppendMenuA(m, MF_SEPARATOR, 0, NULL);
+        AppendMenuA(m, MF_STRING | (symWorld ? MF_CHECKED : 0), CM_SYMWORLD, "&World Space (off: the object's own axes)");
+    } else if (cmd == CM_MIRROR) {
+        AppendMenuA(m, MF_STRING, CM_MIRRORX, "Mirror across &X");
+        AppendMenuA(m, MF_STRING, CM_MIRRORY, "Mirror across &Y");
+        AppendMenuA(m, MF_STRING, CM_MIRRORZ, "Mirror across &Z");
+    } else if (cmd == CM_SOFTTOG) {
+        AppendMenuA(m, MF_STRING | (softOn ? MF_CHECKED : 0), CM_SOFTTOG, "&Soft Selection");
+    } else {
+        DestroyMenu(m);
+        return;
+    }
+    POINT pt = { x, y };
+    ClientToScreen(h, &pt);
+    int c = TrackPopupMenu(m, TPM_RETURNCMD | TPM_RIGHTBUTTON, pt.x, pt.y, 0, h, NULL);
+    DestroyMenu(m);
+    if (c) do_cmd(c);
+}
+
 static LRESULT CALLBACK BarProc(HWND h, UINT m, WPARAM wp, LPARAM lp)
 {
+    Bar *b = (Bar *)GetWindowLongPtrA(h, GWLP_USERDATA);
     int x = (short)LOWORD(lp), y = (short)HIWORD(lp);
+    if (!b) return DefWindowProc(h, m, wp, lp);
     switch (m) {
-    case WM_PAINT: tb_paint(h); return 0;
+    case WM_PAINT: bar_paint(b); return 0;
     case WM_ERASEBKGND: return 1;
     case WM_MOUSEMOVE: {
-        int i = tb_hit(x, y);
-        if (i != tbHover) {
-            tbHover = i;
+        int i = bar_hit(b, x, y);
+        if (i != b->hover) {
+            int wasTip = hTip && IsWindowVisible(hTip);
+            b->hover = i;
+            barTip = i >= 0 ? b->it[i].desc : NULL;
             status_text();
             InvalidateRect(h, NULL, FALSE);
             TRACKMOUSEEVENT tme = { sizeof tme, TME_LEAVE, h, 0 };
             TrackMouseEvent(&tme);
+            tip_hide();
+            if (i >= 0) SetTimer(h, 7, wasTip ? 60 : 450, NULL);   /* a tooltip after a short hover */
         }
         return 0;
     }
+    case WM_TIMER:
+        KillTimer(h, 7);
+        if (b->hover >= 0 && b->down < 0) tip_show(b, b->hover);
+        return 0;
     case WM_MOUSELEAVE:
-        tbHover = -1;
+        b->hover = -1;
+        barTip = NULL;
+        tip_hide();
+        KillTimer(h, 7);
         status_text();
         InvalidateRect(h, NULL, FALSE);
         return 0;
     case WM_LBUTTONDOWN:
-        tbDown = tb_hit(x, y);
+        tip_hide();
+        b->down = bar_hit(b, x, y);
         SetCapture(h);
         InvalidateRect(h, NULL, FALSE);
         return 0;
     case WM_LBUTTONUP: {
-        int i = tbDown;
-        tbDown = -1;
+        int i = b->down;
+        b->down = -1;
         ReleaseCapture();
         InvalidateRect(h, NULL, FALSE);
-        if (i >= 0 && i == tb_hit(x, y)) do_cmd(tbItems[i].cmd);
+        if (i >= 0 && i == bar_hit(b, x, y)) do_cmd(b->it[i].cmd);
+        SetFocus(hView);
+        return 0;
+    }
+    case WM_RBUTTONUP: {
+        int i = bar_hit(b, x, y);
+        if (i >= 0) bar_menu(b->it[i].cmd, x, y, h);
         SetFocus(hView);
         return 0;
     }
@@ -4898,8 +6549,8 @@ static void status_text(void)
     }
     char s[600], c[64] = "", h[300] = "";
     if (mode != M_OBJ) snprintf(c, sizeof c, ", %d component(s)", ncomp);
-    if (tbHover >= 0) {
-        snprintf(h, sizeof h, "%s", tbItems[tbHover].desc);
+    if (barTip) {
+        snprintf(h, sizeof h, "%s", barTip);
     } else if (dk == D_MANIP || (g_msg[0] && GetTickCount() - msgT < 5000)) {
         snprintf(h, sizeof h, "%s", g_msg);
     } else if (hvObj >= 0 && hvObj < nob) {
@@ -4913,8 +6564,11 @@ static void status_text(void)
     } else {
         snprintf(h, sizeof h, "%s", hint[tool]);
     }
-    snprintf(s, sizeof s, "  %s  |  %s  |  %d %s%s  |  %s", mn[mode], tn[tool], nsel,
-             mode == M_OBJ ? "selected" : "hilited", c, h);
+    char extra[64] = "";
+    if (symAxis) snprintf(extra, sizeof extra, "  |  Symmetry %s", SYM_NAME[symAxis]);
+    if (softOn) snprintf(extra + strlen(extra), sizeof extra - strlen(extra), "  |  Soft %.3g", softRad);
+    snprintf(s, sizeof s, "  %s  |  %s  |  %d %s%s%s  |  %s", mn[mode], tn[tool], nsel,
+             mode == M_OBJ ? "selected" : "hilited", c, extra, h);
     SetWindowTextA(hStatus, s);
 }
 
@@ -4939,6 +6593,14 @@ static void status_update(void)
     CheckMenuItem(hMenu, CM_ORTHO, MF_BYCOMMAND | (ortho ? MF_CHECKED : MF_UNCHECKED));
     CheckMenuItem(hMenu, CM_SNAPGRID, MF_BYCOMMAND | (snapGrid ? MF_CHECKED : MF_UNCHECKED));
     CheckMenuItem(hMenu, CM_SNAPPOINT, MF_BYCOMMAND | (snapPoint ? MF_CHECKED : MF_UNCHECKED));
+    CheckMenuItem(hMenu, CM_SYMTOG, MF_BYCOMMAND | (symAxis ? MF_CHECKED : MF_UNCHECKED));
+    CheckMenuRadioItem(hMenu, CM_SYMOFF, CM_SYMZ, CM_SYMOFF + symAxis, MF_BYCOMMAND);
+    CheckMenuItem(hMenu, CM_SYMWORLD, MF_BYCOMMAND | (symWorld ? MF_CHECKED : MF_UNCHECKED));
+    CheckMenuItem(hMenu, CM_SOFTTOG, MF_BYCOMMAND | (softOn ? MF_CHECKED : MF_UNCHECKED));
+    CheckMenuItem(hMenu, CM_XRAY, MF_BYCOMMAND | (xray ? MF_CHECKED : MF_UNCHECKED));
+    CheckMenuItem(hMenu, CM_CULL, MF_BYCOMMAND | (cullBack ? MF_CHECKED : MF_UNCHECKED));
+    CheckMenuItem(hMenu, CM_ISOLATE, MF_BYCOMMAND | (isolateOn ? MF_CHECKED : MF_UNCHECKED));
+    for (int i = 0; i < 5; i++) CheckMenuItem(hMenu, CM_UIS + i, MF_BYCOMMAND | (uiPct == 100 + 25 * i ? MF_CHECKED : MF_UNCHECKED));
     char u[96], k[48];
     cmd_key(CM_UNDO, k, sizeof k);
     snprintf(u, sizeof u, "&Undo%s%s%s%s", nundo ? " " : "", nundo ? undo_s[nundo - 1].what : "", k[0] ? "\t" : "", k);
@@ -4947,6 +6609,7 @@ static void status_update(void)
     snprintf(u, sizeof u, "&Redo%s%s%s%s", nredo ? " " : "", nredo ? redo_s[nredo - 1].what : "", k[0] ? "\t" : "", k);
     ModifyMenuA(hMenu, CM_REDO, MF_BYCOMMAND | MF_STRING | (nredo ? 0 : MF_GRAYED), CM_REDO, u);
     InvalidateRect(hBar, NULL, FALSE);
+    InvalidateRect(hBox, NULL, FALSE);
     CheckMenuRadioItem(hThemeMenu, CM_THEME, CM_THEME + NTHEME - 1, CM_THEME + themeIdx, MF_BYCOMMAND);
 }
 
@@ -5048,10 +6711,23 @@ static void draw_axis_gizmo(void)
 
 static const float HOV[3] = { 1, .25f, .25f };
 
+static void draw_hover_comp(const Obj *o, int hvIdx, float a);
+
 static void draw_hover(const Obj *o)
 {
+    if (hvKind) {
+        int q = sym_partner((int)(o - ob), hvKind, hvIdx);
+        if (q >= 0 && q != hvIdx) draw_hover_comp(o, q, .45f);   /* symmetry: its mirror image, fainter */
+    }
+    draw_hover_comp(o, hvIdx, 1);
+}
+
+static void draw_hover_comp(const Obj *o, int hvIdx, float a)
+{
     const Mesh *m = &o->m;
-    glColor3fv(HOV);
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    glColor4f(HOV[0], HOV[1], HOV[2], a);
     if (hvKind == M_VERT && hvIdx < m->nv) {
         glPointSize(9 * ds);
         glBegin(GL_POINTS);
@@ -5069,13 +6745,12 @@ static void draw_hover(const Obj *o)
         glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
         glEnable(GL_POLYGON_OFFSET_FILL);
         glPolygonOffset(-1, -1);
-        glColor4f(HOV[0], HOV[1], HOV[2], .35f);
+        glColor4f(HOV[0], HOV[1], HOV[2], .35f * a);
         glBegin(GL_POLYGON);
         for (int k = 0; k < n; k++) glVertex3fv(&m->p[m->fi[s + k]].x);
         glEnd();
         glDisable(GL_POLYGON_OFFSET_FILL);
-        glDisable(GL_BLEND);
-        glColor3fv(HOV);
+        glColor4f(HOV[0], HOV[1], HOV[2], a);
         glLineWidth(2 * ds);
         glBegin(GL_LINE_LOOP);
         for (int k = 0; k < n; k++) glVertex3fv(&m->p[m->fi[s + k]].x);
@@ -5084,7 +6759,76 @@ static void draw_hover(const Obj *o)
         glLineWidth(1.5f * ds);
         draw_all_edges(m);
     }
+    glDisable(GL_BLEND);
     glLineWidth(1);
+}
+
+/* the symmetry plane, through each object being edited (or the world origin) */
+static void draw_sym_plane(void)
+{
+    if (!symAxis || mode == M_OBJ) return;
+    int a = symAxis - 1, u = (a + 1) % 3, w = (a + 2) % 3, any = 0;
+    V3 lo = v3(1e30f, 1e30f, 1e30f), hi = v3(-1e30f, -1e30f, -1e30f);
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    glDepthMask(GL_FALSE);
+    for (int i = 0; i <= nob; i++) {
+        V3 l, h;
+        if (i < nob) {
+            if (!ob[i].hil || ob[i].hidden) continue;
+            DrawCache *c = cache_get(i);
+            if (symWorld) {   /* gather a world box, drawn once after the loop */
+                M4 M = obj_mat(&ob[i]);
+                for (int k = 0; k < 8; k++) {
+                    V3 p = m4_pt(M, v3(k & 1 ? c->hi.x : c->lo.x, k & 2 ? c->hi.y : c->lo.y, k & 4 ? c->hi.z : c->lo.z));
+                    lo = v3(fminf(lo.x, p.x), fminf(lo.y, p.y), fminf(lo.z, p.z));
+                    hi = v3(fmaxf(hi.x, p.x), fmaxf(hi.y, p.y), fmaxf(hi.z, p.z));
+                }
+                any = 1;
+                continue;
+            }
+            l = c->lo; h = c->hi;
+            glPushMatrix();
+            M4 M = obj_mat(&ob[i]);
+            glMultMatrixf(M.m);
+        } else {
+            if (!any) break;
+            l = lo; h = hi;
+            glPushMatrix();
+        }
+        float pu = ((&h.x)[u] - (&l.x)[u]) * .12f + 1e-3f, pw = ((&h.x)[w] - (&l.x)[w]) * .12f + 1e-3f;
+        float q[4][2] = { { (&l.x)[u] - pu, (&l.x)[w] - pw }, { (&h.x)[u] + pu, (&l.x)[w] - pw },
+                          { (&h.x)[u] + pu, (&h.x)[w] + pw }, { (&l.x)[u] - pu, (&h.x)[w] + pw } };
+        for (int pass = 0; pass < 2; pass++) {
+            glColor4f(AXIS_COL[a][0], AXIS_COL[a][1], AXIS_COL[a][2], pass ? .7f : .07f);
+            glBegin(pass ? GL_LINE_LOOP : GL_QUADS);
+            for (int k = 0; k < 4; k++) {
+                float pt[3];
+                pt[a] = 0; pt[u] = q[k][0]; pt[w] = q[k][1];
+                glVertex3fv(pt);
+            }
+            glEnd();
+        }
+        glPopMatrix();
+    }
+    glDepthMask(GL_TRUE);
+    glDisable(GL_BLEND);
+}
+
+/* soft selection falloff: yellow at the selection, through orange to red at the edge */
+static void draw_soft(int i)
+{
+    const float *wt = soft_get(i);
+    if (!wt) return;
+    const Mesh *m = &ob[i].m;
+    glPointSize(5 * ds);
+    glBegin(GL_POINTS);
+    for (int v = 0; v < m->nv; v++) {
+        if (wt[v] < .01f) continue;
+        glColor3f(1, wt[v] * .95f, wt[v] > .99f ? .2f : 0);
+        glVertex3fv(&m->p[v].x);
+    }
+    glEnd();
 }
 
 /* x < -999: the mouse left the view */
@@ -5198,6 +6942,22 @@ static void draw_hud(void)
             text_at(c2 + 10 * ds, y, b, GOLD3, 1);
         }
     }
+    /* what is switched on that changes how editing behaves */
+    y += lh * 0.4f;
+    char t[64];
+    if (symAxis) {
+        snprintf(t, sizeof t, "Symmetry %s%s", SYM_NAME[symAxis], symWorld ? " (world)" : "");
+        text_at(x, y, t, AXIS_COL[symAxis - 1], 1);
+        y += lh;
+    }
+    if (softOn) {
+        static const float SOFT3[3] = { 1, .6f, .15f };
+        snprintf(t, sizeof t, "Soft select  r %.3g", softRad);
+        text_at(x, y, t, SOFT3, 1);
+        y += lh;
+    }
+    if (xray) { text_at(x, y, "X-Ray", WHITE3, .9f); y += lh; }
+    if (isolateOn) { text_at(x, y, "Isolated (Ctrl+1)", WHITE3, .9f); y += lh; }
 }
 
 /* centered tips while the scene is empty */
@@ -5205,13 +6965,54 @@ static void draw_empty_hint(void)
 {
     static const char *lines[] = {
         "Empty scene",
-        "Make something with Cube, Cylinder, Sphere or Plane in the toolbar,",
+        "Make something with Cube, Sphere, Cylinder, Cone, Torus, Pipe or Plane in the toolbar,",
         "or drop a .tuff, .obj or .mlt file here (Ctrl+O opens one).",
         "",
         "Alt + left drag: orbit     Alt + middle drag: pan     Alt + right drag / wheel: zoom",
         "F1: every hotkey",
     };
     float lh = hudAsc * 1.5f, y = vh * 0.5f - lh * 3;
+    {
+        float s = 34 * ds, cx = vw * 0.5f, cy = y - s * 1.9f;
+        float T[2] = { cx, cy - s }, UR[2] = { cx + .87f * s, cy - .5f * s }, LR[2] = { cx + .87f * s, cy + .5f * s };
+        float B[2] = { cx, cy + s }, LL[2] = { cx - .87f * s, cy + .5f * s }, UL[2] = { cx - .87f * s, cy - .5f * s }, C[2] = { cx, cy };
+        const float *face[3][4] = { { T, UR, C, UL }, { UL, C, B, LL }, { C, UR, LR, B } };
+        static const float fc[3][3] = { { .80f, .88f, 1 }, { .58f, .70f, .98f }, { .42f, .53f, .86f } };
+        glEnable(GL_BLEND);
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+        shade_box(cx - s * 1.1f, B[1] + s * .18f, cx + s * 1.1f, B[1] + s * .3f, .12f);   /* a soft shadow */
+        for (int f = 0; f < 3; f++) {
+            glColor3fv(fc[f]);
+            glBegin(GL_QUADS);
+            for (int k = 0; k < 4; k++) glVertex2fv(face[f][k]);
+            glEnd();
+        }
+        /* a face on the front: eyes, blush and a smile */
+        float ax = .87f * s, ay = .5f * s, fx = cx - .435f * s, fy = cy + .3f * s;
+        glColor3f(.13f, .14f, .25f);
+        for (int e = -1; e <= 1; e += 2) {
+            float ex = fx + e * .2f * ax, ey = fy + e * .2f * ay - .12f * s;
+            glBegin(GL_POLYGON);
+            for (int k = 0; k < 12; k++) glVertex2f(ex + .07f * s * cosf(2 * PI_F * k / 12), ey + .09f * s * sinf(2 * PI_F * k / 12));
+            glEnd();
+        }
+        glColor4f(1, .5f, .62f, .75f);
+        for (int e = -1; e <= 1; e += 2) {
+            float ex = fx + e * .36f * ax, ey = fy + e * .36f * ay + .03f * s;
+            glBegin(GL_POLYGON);
+            for (int k = 0; k < 12; k++) glVertex2f(ex + .08f * s * cosf(2 * PI_F * k / 12), ey + .05f * s * sinf(2 * PI_F * k / 12));
+            glEnd();
+        }
+        glColor3f(.13f, .14f, .25f);
+        glLineWidth(2 * ds);
+        glBegin(GL_LINE_STRIP);
+        for (int k = 0; k <= 10; k++) {
+            float t = k / 5.0f - 1;
+            glVertex2f(fx + t * .13f * ax, fy + t * .13f * ay + (.02f + .06f * (1 - t * t)) * s);
+        }
+        glEnd();
+        glLineWidth(1);
+    }
     for (int i = 0; i < 6; i++, y += lh)
         text_at((vw - text_w(lines[i])) * 0.5f, y, lines[i], i ? GREY3 : WHITE3, i ? .85f : 1);
 }
@@ -5231,7 +7032,7 @@ static void draw_toast(void)
 /* live move/rotate/scale amount beside the cursor */
 static void draw_drag_label(void)
 {
-    if (dk != D_MANIP || !g_msg[0]) return;
+    if ((dk != D_MANIP && dk != D_SOFTRAD) || !g_msg[0]) return;
     float x = curx + 18 * ds, y = cury + 18 * ds, w = (float)text_w(g_msg), p = 4 * ds;
     if (x + w + p > vw) x = curx - 18 * ds - w;
     shade_box(x - p, y - p, x + w + p, y + hudAsc + p, .55f);
@@ -5246,6 +7047,7 @@ static HCURSOR view_cursor(void)
     if (dk == D_TUMBLE) c = IDC_SIZEALL;
     else if (dk == D_PAN) c = IDC_HAND;
     else if (dk == D_DOLLY) c = IDC_SIZENS;
+    else if (dk == D_SOFTRAD) c = IDC_SIZEWE;
     else if (dk == D_MARQ || tool == T_PAINT || tool == T_WELD || tool == T_LOOP || tool == T_CUT) c = IDC_CROSS;
     else if (gizmoHover >= 0) c = IDC_HAND;
     return LoadCursor(NULL, c);
@@ -5295,7 +7097,11 @@ static void render(void)
             glEnable(GL_LIGHTING);
             glEnable(GL_POLYGON_OFFSET_FILL);
             glPolygonOffset(1, 1);
+            if (xray) { glEnable(GL_BLEND); glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA); glDepthMask(GL_FALSE); }
+            cull_begin(o);
             draw_cached(i, 1);
+            cull_end();
+            if (xray) { glDisable(GL_BLEND); glDepthMask(GL_TRUE); }
             glDisable(GL_POLYGON_OFFSET_FILL);
             glDisable(GL_LIGHTING);
         } else if (hil && shows(M_FACE)) {
@@ -5341,14 +7147,16 @@ static void render(void)
             if (l == o) glColor3f(0.26f, 1, 0.64f);
             else glColor3fv(th.sel2);
             draw_all_edges(m);
-        } else if (wire) {
+        } else if (wire || xray) {
             glColor3fv(th.wire);
             draw_all_edges(m);
         }
+        if (hil) draw_soft(i);
         if (i == hvObj) draw_hover(o);
         glPopMatrix();
     }
 
+    draw_sym_plane();
     draw_manip();
 
     /* 2D overlays */
@@ -5414,6 +7222,20 @@ static void render(void)
             glLineWidth(1);
         }
     }
+    if (dk == D_SOFTRAD) {
+        sel_cache();
+        float sx, sy;
+        V3 c = selc.any ? selc.piv : v3(0, 0, 0);
+        if (proj(c, &sx, &sy, NULL)) {
+            float r = softRad / wpp(c);
+            glColor4f(1, .6f, .15f, .9f);
+            glLineWidth(2 * ds);
+            glBegin(GL_LINE_LOOP);
+            for (int k = 0; k < 64; k++) glVertex2f(sx + r * cosf(2 * PI_F * k / 64), sy + r * sinf(2 * PI_F * k / 64));
+            glEnd();
+            glLineWidth(1);
+        }
+    }
     draw_weld();
     draw_loop_preview();
     draw_cut();
@@ -5424,6 +7246,63 @@ static void render(void)
     glDisable(GL_BLEND);
     draw_axis_gizmo();
     SwapBuffers(hdc);
+}
+
+/* ---- UI size: everything (bars, panel, text, handles) is measured in ds */
+
+static void gl_font(void)
+{
+    TEXTMETRICA tm;
+    SelectObject(hdc, hHud);
+    GetTextMetricsA(hdc, &tm);
+    hudAsc = tm.tmAscent;
+    if (fontBase) glDeleteLists(fontBase, 96);
+    fontBase = glGenLists(96);
+    if (!wglUseFontBitmapsA(hdc, 32, 96, fontBase) && !wglUseFontBitmapsA(hdc, 32, 96, fontBase)) fontBase = 0;
+    glListBase(fontBase - 32);
+}
+
+static void make_fonts(void)
+{
+    HFONT *f[4] = { &hFont, &hHud, &hSmall, &hBold };
+    for (int i = 0; i < 4; i++) if (*f[i]) DeleteObject(*f[i]);
+    hFont = CreateFontA(-(int)(12.5f * ds), 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0, "Segoe UI");
+    hHud = CreateFontA(-(int)(13 * ds), 0, 0, 0, FW_SEMIBOLD, 0, 0, 0, DEFAULT_CHARSET, 0, 0, NONANTIALIASED_QUALITY, 0, "Segoe UI");
+    hSmall = CreateFontA(-(int)(10.5f * ds), 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0, "Segoe UI");
+    hBold = CreateFontA(-(int)(12.5f * ds), 0, 0, 0, FW_SEMIBOLD, 0, 0, 0, DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0, "Segoe UI");
+}
+
+static const int UI_SIZES[] = { 90, 100, 110, 125, 140, 150, 175, 200, 225, 250 };
+#define NUIS ((int)(sizeof UI_SIZES / sizeof *UI_SIZES))
+
+static void ui_size(int pct)
+{
+    char b[48];
+    if (pct < UI_SIZES[0]) pct = UI_SIZES[0];
+    if (pct > UI_SIZES[NUIS - 1]) pct = UI_SIZES[NUIS - 1];
+    uiPct = pct;
+    ds = dpiScale * pct / 100.0f;
+    reg_set_int("UIScale", pct);
+    make_fonts();
+    panel_fonts();
+    SendMessage(hStatus, WM_SETFONT, (WPARAM)hFont, 0);
+    gl_font();
+    RECT rc;
+    GetClientRect(hMain, &rc);
+    SendMessage(hMain, WM_SIZE, 0, MAKELPARAM(rc.right, rc.bottom));
+    for (int i = 0; i < 5; i++) CheckMenuItem(hMenu, CM_UIS + i, MF_BYCOMMAND | (pct == 100 + 25 * i ? MF_CHECKED : MF_UNCHECKED));
+    snprintf(b, sizeof b, "UI size %d%% (Ctrl+Plus / Ctrl+Minus)", pct);
+    toast(b);
+}
+
+static void ui_step(int up)
+{
+    int pick = up ? UI_SIZES[NUIS - 1] : UI_SIZES[0];
+    for (int i = 0; i < NUIS; i++) {
+        if (up && UI_SIZES[i] > uiPct) { pick = UI_SIZES[i]; break; }
+        if (!up && UI_SIZES[i] < uiPct) pick = UI_SIZES[i];
+    }
+    ui_size(pick);
 }
 
 /* ================================================================ viewport window */
@@ -5524,6 +7403,7 @@ static void end_drag(int cancel)
 /* Esc while dragging: put everything back as it was when the drag started */
 static void cancel_drag(void)
 {
+    if (dk == D_SOFTRAD) { softRad = rad0; geo_changed(); }
     if ((dk == D_MANIP && dg.dirty) || (dk == D_PAINT && ps.dirty)) {
         snap_restore(&undo_s[--nundo]);
         dg.dirty = ps.dirty = 0;
@@ -5532,16 +7412,68 @@ static void cancel_drag(void)
     msg("Cancelled");
 }
 
-/* double-click an edge: select its edge loop. Returns 0 when it was not on an edge. */
+/* double-click: an edge selects its edge loop, a face the face loop running across the edge
+   nearest the cursor, a vertex the vertex loop along the edge nearest the cursor. Returns 0 when
+   nothing was there. */
 static int dbl_click(int x, int y)
 {
-    if (!shows(M_EDGE) || key(VK_MENU) || tool == T_PAINT) return 0;
-    int o, k, i;
-    cam_update();
-    if (!pick_comp(x, y, &o, &k, &i) || k != M_EDGE) return 0;
-    if (!key(VK_SHIFT) && !key(VK_CONTROL)) clear_sel();
+    if (mode == M_OBJ || key(VK_MENU) || tool == T_PAINT) return 0;
+    int o, k, i, ee = -1;
     char b[64];
-    snprintf(b, sizeof b, "Edge loop: %d edges", mesh_edge_loop(&ob[o].m, i));
+    cam_update();
+    if (!pick_comp(x, y, &o, &k, &i)) return 0;
+    Mesh *m = &ob[o].m;
+    if (k == M_FACE) {
+        /* the face's edge nearest the cursor: the loop runs across it */
+        float bd = 1e30f;
+        M4 M = obj_mat(&ob[o]);
+        for (int c = m->fo[i]; c < m->fo[i + 1]; c++) {
+            int a = m->fi[c], d = m->fi[c + 1 < m->fo[i + 1] ? c + 1 : m->fo[i]];
+            float ax, ay, bx, by;
+            if (!proj(m4_pt(M, m->p[a]), &ax, &ay, NULL) || !proj(m4_pt(M, m->p[d]), &bx, &by, NULL)) continue;
+            float dd = seg_dist((float)x, (float)y, ax, ay, bx, by, NULL);
+            if (dd < bd) { bd = dd; ee = mesh_edge_find(m, a, d); }
+        }
+        if (ee < 0) return 0;
+    }
+    if (!key(VK_SHIFT) && !key(VK_CONTROL)) clear_sel();
+    if (k == M_EDGE) {
+        snprintf(b, sizeof b, "Edge loop: %d edges", mesh_edge_loop(m, i));
+    } else if (k == M_FACE) {
+        if (m->ef[2 * ee] != i && m->ef[2 * ee + 1] != i) return 0;
+        snprintf(b, sizeof b, "Face loop: %d faces", mesh_face_loop(m, i, ee));
+    } else {
+        /* the edge loop through the nearest edge at this vertex, as vertices */
+        unsigned char *keep = malloc(m->ne + 1);
+        memcpy(keep, m->es, m->ne);
+        memset(m->es, 0, m->ne);
+        int best = -1;
+        float bd = 1e30f;
+        M4 M = obj_mat(&ob[o]);
+        float vx, vy;
+        proj(m4_pt(M, m->p[i]), &vx, &vy, NULL);
+        for (int e = 0; e < m->ne; e++) {
+            if (m->ev[2 * e] != i && m->ev[2 * e + 1] != i) continue;
+            int other = m->ev[2 * e] == i ? m->ev[2 * e + 1] : m->ev[2 * e];
+            float ox, oy;
+            if (!proj(m4_pt(M, m->p[other]), &ox, &oy, NULL)) continue;
+            /* the edge pointing most toward the cursor (or nearest it) */
+            float dd = seg_dist((float)x, (float)y, vx, vy, ox, oy, NULL);
+            if (dd < bd) { bd = dd; best = e; }
+        }
+        int n = 0;
+        if (best >= 0) {
+            mesh_edge_loop(m, best);
+            for (int e = 0; e < m->ne; e++)
+                if (m->es[e]) { m->vs[m->ev[2 * e]] = m->vs[m->ev[2 * e + 1]] = 1; }
+        }
+        memcpy(m->es, keep, m->ne);
+        free(keep);
+        for (int v = 0; v < m->nv; v++) n += m->vs[v] != 0;
+        snprintf(b, sizeof b, "Vertex loop: %d vertices", n);
+    }
+    sym_select_partners(o, k);
+    sym_note_side(o, comp_center(m, k, i));
     msg(b);
     refresh_all();
     return 1;
@@ -5560,6 +7492,8 @@ static void handle_key(WPARAM wp)
     int code = (int)wp | (ctrl ? KC_CTRL : 0) | (shift ? KC_SHIFT : 0);
     for (int i = 0; i < NBIND && !id; i++)
         if (binds[i].key[0] == code || binds[i].key[1] == code) id = binds[i].cmd;
+    /* the soft selection key toggles when it is let go, unless it was held for a radius drag */
+    if (id == CM_SOFTTOG && !ctrl && !shift) { bHeld = (int)wp; bUsed = 0; return; }
     if (id) do_cmd(id);
 }
 
@@ -5580,13 +7514,7 @@ static LRESULT CALLBACK ViewProc(HWND h, UINT m, WPARAM wp, LPARAM lp)
         hdc = GetDC(h);
         SetPixelFormat(hdc, ChoosePixelFormat(hdc, &pfd), &pfd);
         wglMakeCurrent(hdc, wglCreateContext(hdc));
-        TEXTMETRICA tm;
-        SelectObject(hdc, hHud);
-        GetTextMetricsA(hdc, &tm);
-        hudAsc = tm.tmAscent;
-        fontBase = glGenLists(96);
-        if (!wglUseFontBitmapsA(hdc, 32, 96, fontBase) && !wglUseFontBitmapsA(hdc, 32, 96, fontBase)) fontBase = 0;
-        glListBase(fontBase - 32);
+        gl_font();
         return 0;
     }
     case WM_TIMER:
@@ -5627,6 +7555,12 @@ static LRESULT CALLBACK ViewProc(HWND h, UINT m, WPARAM wp, LPARAM lp)
         tween.on = 0;
         if (key(VK_MENU)) {
             dk = btn == 0 ? D_TUMBLE : btn == 1 ? D_PAN : D_DOLLY;
+        } else if (bHeld && key(bHeld) && tool != T_PAINT && btn < 2) {
+            /* hold B and drag: soft selection radius (turns soft selection on) */
+            dk = D_SOFTRAD;
+            bUsed = 1;
+            rad0 = softRad;
+            if (!softOn) { softOn = 1; geo_changed(); }
         } else if (btn == 2 && !(tool == T_CUT && mc.n)) {
             marking_menu(x, y);
             return 0;
@@ -5651,6 +7585,7 @@ static LRESULT CALLBACK ViewProc(HWND h, UINT m, WPARAM wp, LPARAM lp)
             dk = D_WELD;
         } else if (tool == T_PAINT) {
             dk = key('B') ? D_BRUSH : D_PAINT;
+            if (dk == D_BRUSH) bUsed = 1;
             rad0 = paintRad;
             if (dk == D_PAINT) paint_begin(x, y);
         } else {
@@ -5710,6 +7645,14 @@ static LRESULT CALLBACK ViewProc(HWND h, UINT m, WPARAM wp, LPARAM lp)
             if (paintRad < 1) paintRad = 1;
             panel_sync();
             break;
+        case D_SOFTRAD:
+            softRad = rad0 * expf((x - mx0) * 0.008f / ds);
+            if (softRad < 1e-4f) softRad = 1e-4f;
+            if (softRad > 1e5f) softRad = 1e5f;
+            snprintf(g_msg, sizeof g_msg, "Soft radius %.3g", softRad);
+            geo_changed();
+            panel_sync();
+            break;
         default:
             if (!tracking) {
                 TRACKMOUSEEVENT tme = { sizeof tme, TME_LEAVE, h, 0 };
@@ -5758,6 +7701,12 @@ static LRESULT CALLBACK ViewProc(HWND h, UINT m, WPARAM wp, LPARAM lp)
     case WM_KEYDOWN:
         if (wp == VK_ESCAPE && dk != D_NONE) { cancel_drag(); return 0; }
         if (!(lp & (1 << 30)) && dk == D_NONE) handle_key(wp);
+        return 0;
+    case WM_KEYUP:
+        if (bHeld && (int)wp == bHeld) {
+            if (!bUsed && dk == D_NONE) do_cmd(CM_SOFTTOG);
+            bHeld = 0;
+        }
         return 0;
     case WM_SYSKEYDOWN:
         if (wp == VK_F10) { if (!(lp & (1 << 30)) && dk == D_NONE) handle_key(wp); return 0; }
@@ -5808,6 +7757,9 @@ static HMENU build_menu(void)
     AppendMenuA(m, MF_STRING, CM_CYL, "Polygon C&ylinder");
     AppendMenuA(m, MF_STRING, CM_SPHERE, "Polygon &Sphere");
     AppendMenuA(m, MF_STRING, CM_PLANE, "Polygon &Plane");
+    AppendMenuA(m, MF_STRING, CM_CONE, "Polygon C&one");
+    AppendMenuA(m, MF_STRING, CM_TORUS, "Polygon &Torus");
+    AppendMenuA(m, MF_STRING, CM_PIPE, "Polygon P&ipe");
     AppendMenuA(bar, MF_POPUP, (UINT_PTR)m, "&Create");
     m = CreatePopupMenu();
     AppendMenuA(m, MF_STRING, CM_MOBJ, "&Object Mode\tF8");
@@ -5821,6 +7773,7 @@ static HMENU build_menu(void)
     AppendMenuA(m, MF_STRING, CM_GROW, "&Grow Selection\t>");
     AppendMenuA(m, MF_STRING, CM_SHRINK, "S&hrink Selection\t<");
     AppendMenuA(m, MF_STRING, CM_LOOP, "Edge &Loop\tdouble-click edge");
+    AppendMenuA(m, MF_STRING, CM_RING, "Edge Ri&ng");
     AppendMenuA(m, MF_SEPARATOR, 0, NULL);
     AppendMenuA(m, MF_STRING, CM_TOVERT, "Convert to Ve&rtices\tCtrl+F9");
     AppendMenuA(m, MF_STRING, CM_TOEDGE, "Convert to E&dges\tCtrl+F10");
@@ -5836,6 +7789,14 @@ static HMENU build_menu(void)
     AppendMenuA(m, MF_STRING, CM_TRIANG, "&Triangulate");
     AppendMenuA(m, MF_STRING, CM_QUAD, "&Quadrangulate");
     AppendMenuA(m, MF_STRING, CM_REVERSE, "&Reverse Normals");
+    AppendMenuA(m, MF_SEPARATOR, 0, NULL);
+    AppendMenuA(m, MF_STRING, CM_MIRROR, "M&irror (symmetry axis)");
+    HMENU mm = CreatePopupMenu();
+    AppendMenuA(mm, MF_STRING, CM_MIRRORX, "Across &X");
+    AppendMenuA(mm, MF_STRING, CM_MIRRORY, "Across &Y");
+    AppendMenuA(mm, MF_STRING, CM_MIRRORZ, "Across &Z");
+    AppendMenuA(m, MF_POPUP, (UINT_PTR)mm, "Mirror &Across");
+    AppendMenuA(m, MF_STRING, CM_SMOOTHMESH, "Sm&ooth (subdivide)");
     AppendMenuA(bar, MF_POPUP, (UINT_PTR)m, "&Mesh");
     m = CreatePopupMenu();
     AppendMenuA(m, MF_STRING, CM_EXTRUDE, "&Extrude\tCtrl+E");
@@ -5856,6 +7817,18 @@ static HMENU build_menu(void)
     AppendMenuA(m, MF_SEPARATOR, 0, NULL);
     AppendMenuA(m, MF_STRING, CM_SNAPGRID, "Snap to &Grid\thold X");
     AppendMenuA(m, MF_STRING, CM_SNAPPOINT, "Snap to &Point\thold V");
+    AppendMenuA(m, MF_SEPARATOR, 0, NULL);
+    HMENU sym = CreatePopupMenu();
+    AppendMenuA(sym, MF_STRING, CM_SYMTOG, "Symmetry &On/Off\tS");
+    AppendMenuA(sym, MF_SEPARATOR, 0, NULL);
+    AppendMenuA(sym, MF_STRING, CM_SYMOFF, "O&ff");
+    AppendMenuA(sym, MF_STRING, CM_SYMX, "&X");
+    AppendMenuA(sym, MF_STRING, CM_SYMY, "&Y");
+    AppendMenuA(sym, MF_STRING, CM_SYMZ, "&Z");
+    AppendMenuA(sym, MF_SEPARATOR, 0, NULL);
+    AppendMenuA(sym, MF_STRING, CM_SYMWORLD, "&World Space");
+    AppendMenuA(m, MF_POPUP, (UINT_PTR)sym, "&Symmetry");
+    AppendMenuA(m, MF_STRING, CM_SOFTTOG, "S&oft Selection\tB");
     AppendMenuA(bar, MF_POPUP, (UINT_PTR)m, "Mo&dify");
     m = CreatePopupMenu();
     AppendMenuA(m, MF_STRING, CM_TSEL, "&Select Tool\tQ");
@@ -5880,6 +7853,12 @@ static HMENU build_menu(void)
     AppendMenuA(m, MF_STRING, CM_AUTOSMOOTH, "Auto Smooth (Normal Angle)");
     AppendMenuA(m, MF_STRING, CM_HARDEN, "Har&den Edge");
     AppendMenuA(m, MF_STRING, CM_SOFTEN, "S&often Edge");
+    AppendMenuA(m, MF_SEPARATOR, 0, NULL);
+    AppendMenuA(m, MF_STRING, CM_PREVON, "Smooth Pre&view On\t3");
+    AppendMenuA(m, MF_STRING, CM_PREVOFF, "Smooth Preview Off\t1");
+    AppendMenuA(m, MF_STRING, CM_XRAY, "&X-Ray");
+    AppendMenuA(m, MF_STRING, CM_CULL, "&Backface Culling");
+    AppendMenuA(m, MF_STRING, CM_ISOLATE, "&Isolate Select\tCtrl+1");
     AppendMenuA(m, MF_SEPARATOR, 0, NULL);
     AppendMenuA(m, MF_STRING, CM_FRAMESEL, "&Frame Selected\tF");
     AppendMenuA(m, MF_STRING, CM_FRAMEALL, "Frame &All\tA");
@@ -5907,6 +7886,16 @@ static HMENU build_menu(void)
     for (int i = 0; i < NTHEME; i++)   /* the full list, in columns */
         AppendMenuA(hThemeMenu, MF_STRING | (i && i % 16 == 0 ? MF_MENUBARBREAK : 0), CM_THEME + i, themes[i].name);
     AppendMenuA(m, MF_POPUP, (UINT_PTR)hThemeMenu, "&Theme");
+    HMENU um = CreatePopupMenu();
+    for (int i = 0; i < 5; i++) {
+        char b[32];
+        snprintf(b, sizeof b, "&%d%%", 100 + 25 * i);
+        AppendMenuA(um, MF_STRING, CM_UIS + i, b);
+    }
+    AppendMenuA(um, MF_SEPARATOR, 0, NULL);
+    AppendMenuA(um, MF_STRING, CM_UIBIGGER, "&Bigger\tCtrl++");
+    AppendMenuA(um, MF_STRING, CM_UISMALLER, "&Smaller\tCtrl+-");
+    AppendMenuA(m, MF_POPUP, (UINT_PTR)um, "&UI Size");
     AppendMenuA(bar, MF_POPUP, (UINT_PTR)m, "&Display");
     m = CreatePopupMenu();
     AppendMenuA(m, MF_STRING, CM_HELP, "&Hotkeys\tF1");
@@ -5921,10 +7910,14 @@ static LRESULT CALLBACK MainProc(HWND h, UINT m, WPARAM wp, LPARAM lp)
     case WM_SIZE: {
         if (wp == SIZE_MINIMIZED) return 0;
         int W = LOWORD(lp), H = HIWORD(lp);
-        int sh = (int)(20 * ds), pw = panelOn ? (int)(215 * ds) : 0, bh = tb_layout(W);
+        int sh = (int)(24 * ds), pw = panelOn ? (int)(240 * ds) : 0, bh = bar_layout(&shelf, W);
+        int tw = bar_layout(&box, H - sh - bh);
         if (pw > W / 2) pw = W / 2;
         MoveWindow(hBar, 0, 0, W, bh, TRUE);
-        MoveWindow(hView, 0, bh, W - pw, H - sh - bh, TRUE);
+        MoveWindow(hBox, 0, bh, tw, H - sh - bh, TRUE);
+        InvalidateRect(hBar, NULL, FALSE);   /* the buttons may have moved inside an unchanged area */
+        InvalidateRect(hBox, NULL, FALSE);
+        MoveWindow(hView, tw, bh, W - pw - tw, H - sh - bh, TRUE);
         MoveWindow(hPanel, W - pw, bh, pw, H - sh - bh, TRUE);
         ShowWindow(hPanel, panelOn ? SW_SHOW : SW_HIDE);
         MoveWindow(hStatus, 0, H - sh, W, sh, TRUE);
@@ -6003,6 +7996,7 @@ static LRESULT CALLBACK MainProc(HWND h, UINT m, WPARAM wp, LPARAM lp)
         reg_set_int("ManipSize", (int)(manipSize * 1000));
         reg_set_int("MergeDist", (int)(mergeDist * 1e5f));
         reg_set_int("BevelWidth", (int)(bevelW * 1e5f));
+        reg_set_int("SoftRadius", (int)(softRad * 1e5f));
         autosave_remove();
         PostQuitMessage(0);
         return 0;
@@ -6016,9 +8010,12 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmd, int show)
     (void)prev;
     SetProcessDPIAware();
     HDC sdc = GetDC(NULL);
-    ds = GetDeviceCaps(sdc, LOGPIXELSY) / 96.0f;
+    dpiScale = GetDeviceCaps(sdc, LOGPIXELSY) / 96.0f;
     ReleaseDC(NULL, sdc);
-    if (ds < 1) ds = 1;
+    if (dpiScale < 1) dpiScale = 1;
+    uiPct = reg_int("UIScale", 125);
+    if (uiPct < 80 || uiPct > 250) uiPct = 125;
+    ds = dpiScale * uiPct / 100.0f;
     for (int t = 0; t < PRIM_COUNT; t++) prim_defaults(&defPrim[t], t);
     srand(GetTickCount());
     theme_load(reg_int("Theme", 0));
@@ -6032,13 +8029,17 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmd, int show)
     mergeDist = reg_int("MergeDist", 1000) / 1e5f;
     bevelW = reg_int("BevelWidth", 10000) / 1e5f;
     if (bevelW <= 0) bevelW = 0.1f;
+    symLast = reg_int("SymAxis", 1);
+    if (symLast < 1 || symLast > 3) symLast = 1;
+    symWorld = reg_int("SymWorld", 0) != 0;
+    softRad = reg_int("SoftRadius", 100000) / 1e5f;
+    if (softRad <= 0) softRad = 1;
+    smoothLv = reg_int("PreviewLevel", 2);
+    if (smoothLv < 1 || smoothLv > 3) smoothLv = 2;
     recent_load();
     binds_load();
 
-    hFont = CreateFontA(-(int)(12 * ds), 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0, "Segoe UI");
-    hHud = CreateFontA(-(int)(13 * ds), 0, 0, 0, FW_SEMIBOLD, 0, 0, 0, DEFAULT_CHARSET, 0, 0, NONANTIALIASED_QUALITY, 0, "Segoe UI");
-    hSmall = CreateFontA(-(int)(11 * ds), 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0, "Segoe UI");
-    hBold = CreateFontA(-(int)(12 * ds), 0, 0, 0, FW_BOLD, 0, 0, 0, DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0, "Segoe UI");
+    make_fonts();
 
     WNDCLASSEXA wc;
     memset(&wc, 0, sizeof wc);
@@ -6066,8 +8067,13 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmd, int show)
     hMenu = build_menu();
     menu_keys();
     hMain = CreateWindowA("Tuff3DMain", APP_NAME, WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN, CW_USEDEFAULT, CW_USEDEFAULT,
-                          (int)(1280 * ds), (int)(800 * ds), NULL, hMenu, inst, NULL);
+                          (int)(1280 * dpiScale * 1.15f), (int)(820 * dpiScale * 1.15f), NULL, hMenu, inst, NULL);
     hBar = CreateWindowA("Tuff3DBar", "", WS_CHILD | WS_VISIBLE, 0, 0, 1, 1, hMain, NULL, inst, NULL);
+    hBox = CreateWindowA("Tuff3DBar", "", WS_CHILD | WS_VISIBLE, 0, 0, 1, 1, hMain, NULL, inst, NULL);
+    shelf.h = hBar;
+    box.h = hBox;
+    SetWindowLongPtrA(hBar, GWLP_USERDATA, (LONG_PTR)&shelf);
+    SetWindowLongPtrA(hBox, GWLP_USERDATA, (LONG_PTR)&box);
     hView = CreateWindowA("Tuff3DView", "", WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS, 0, 0, 1, 1, hMain, NULL, inst, NULL);
     hPanel = CreateWindowA("Tuff3DPanel", "", WS_CHILD | WS_VISIBLE | WS_CLIPCHILDREN, 0, 0, 1, 1, hMain, NULL, inst, NULL);
     hStatus = CreateWindowA("STATIC", "", WS_CHILD | WS_VISIBLE | SS_LEFTNOWORDWRAP | SS_CENTERIMAGE | SS_NOPREFIX,
