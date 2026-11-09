@@ -40,6 +40,11 @@ typedef struct Mesh {
     int nf; int *fo; int *fi; unsigned char *fs;
     int ne; int *ev; int *ef; unsigned char *es;   /* ev: 2 verts (lo,hi), ef: up to 2 faces (-1) */
     unsigned char *eh;
+    /* skinning (NULL / 0 when the mesh is not bound): 4 influences per vertex, wj indexing sj (the
+       skin's joints, as object ids), weights in ww summing to 1; ibm: one inverse bind matrix
+       (16 floats, column-major) per joint. Every mesh op carries the weights over to new vertices. */
+    unsigned char *wj; float *ww;
+    int nsj; unsigned *sj; float *ibm;
 } Mesh;
 
 enum { EH_AUTO, EH_HARD, EH_SOFT };
@@ -64,6 +69,11 @@ Mesh mesh_prim(const Prim *p);
 
 void mesh_free(Mesh *m);
 Mesh mesh_copy(const Mesh *m);
+void mesh_unskin(Mesh *m);                                   /* drop the skin weights and joints */
+void mesh_skin_alloc(Mesh *m, int nsj);                      /* zeroed weights for nsj joints */
+/* add weight w of skin joint j to vertex v's 4 influences (replacing the weakest); no normalizing */
+void skin_add(unsigned char *wj, float *ww, int v, int j, float w);
+void skin_normalize(unsigned char *wj, float *ww, int v);
 void mesh_edges(Mesh *m);
 V3 mesh_fnormal(const Mesh *m, int f);
 V3 mesh_fcenter(const Mesh *m, int f);

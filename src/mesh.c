@@ -229,8 +229,11 @@ static int edge_at(HMap *h, int a, int b)
 
 /* ---------------------------------------------------------------- mesh basics */
 
-/* mesh builder; hp holds (a, b, eh) triples: shading overrides for the edges a-b once built */
-typedef struct { Mesh m; int cv, cf, ci, ni; int *hp, nhp, chp; } MB;
+/* mesh builder; hp holds (a, b, eh) triples: shading overrides for the edges a-b once built.
+   src (from mb_from_verts): the mesh being rebuilt. Its vertices 0..nsrc-1 are copied first, and each
+   later vertex may say what it was made from (vertices pa / pb of src, t of the way to pb, see
+   mb_vert_from), so skin weights carry over: blended from those, or from the nearest source vertex. */
+typedef struct { Mesh m; int cv, cf, ci, ni; int *hp, nhp, chp; const Mesh *src; int nsrc, *pa, *pb; float *pt; } MB;
 
 static void mb_hard(MB *b, int a, int c, int val)
 {
@@ -249,7 +252,8 @@ static void mb_init(MB *b)
     b->m.fo[0] = 0;
 }
 
-static int mb_vert(MB *b, V3 p, V3 c)
+/* a vertex made from source vertices a and c (t of the way to c; c < 0: a copy of a; a < 0: unknown) */
+static int mb_vert_from(MB *b, V3 p, V3 c, int a, int cc, float t)
 {
     Mesh *m = &b->m;
     if (m->nv == b->cv) {
@@ -257,12 +261,20 @@ static int mb_vert(MB *b, V3 p, V3 c)
         m->p = xrealloc(m->p, b->cv * sizeof(V3));
         m->c = xrealloc(m->c, b->cv * sizeof(V3));
         m->vs = xrealloc(m->vs, b->cv);
+        if (b->src) {
+            b->pa = xrealloc(b->pa, b->cv * sizeof(int));
+            b->pb = xrealloc(b->pb, b->cv * sizeof(int));
+            b->pt = xrealloc(b->pt, b->cv * sizeof(float));
+        }
     }
+    if (b->src) { b->pa[m->nv] = a; b->pb[m->nv] = cc; b->pt[m->nv] = t; }
     m->p[m->nv] = p;
     m->c[m->nv] = c;
     m->vs[m->nv] = 0;
     return m->nv++;
 }
+
+static int mb_vert(MB *b, V3 p, V3 c) { return mb_vert_from(b, p, c, -1, -1, 0); }
 
 static void mb_face(MB *b, const int *idx, int n, int sel)
 {
@@ -318,6 +330,7 @@ static void mesh_compact(Mesh *m, int **mapout)
         m->p[n] = m->p[i];
         m->c[n] = m->c[i];
         m->vs[n] = m->vs[i];
+        if (m->ww) { memmove(m->ww + 4 * n, m->ww + 4 * i, 4 * sizeof(float)); memmove(m->wj + 4 * n, m->wj + 4 * i, 4); }
         n++;
     }
     for (int i = 0; i < ni; i++) m->fi[i] = map[m->fi[i]];
@@ -326,8 +339,87 @@ static void mesh_compact(Mesh *m, int **mapout)
     else free(map);
 }
 
+/* ---- skin weights */
+
+void skin_add(unsigned char *wj, float *ww, int v, int j, float w)
+{
+    unsigned char *J = wj + 4 * v;
+    float *W = ww + 4 * v;
+    int lo = 0;
+    for (int k = 0; k < 4; k++) {
+        if (W[k] > 0 && J[k] == j) { W[k] += w; return; }
+        if (W[k] < W[lo]) lo = k;
+    }
+    if (W[lo] < w) { J[lo] = (unsigned char)j; W[lo] = w; }
+}
+
+void skin_normalize(unsigned char *wj, float *ww, int v)
+{
+    float *W = ww + 4 * v, s = 0;
+    for (int k = 0; k < 4; k++) { if (W[k] < 1e-6f) { W[k] = 0; wj[4 * v + k] = 0; } s += W[k]; }
+    if (s > 0) for (int k = 0; k < 4; k++) W[k] /= s;
+}
+
+void mesh_skin_alloc(Mesh *m, int nsj)
+{
+    free(m->wj); free(m->ww); free(m->sj); free(m->ibm);
+    m->wj = xcalloc(m->nv + 1, 4);
+    m->ww = xcalloc(m->nv + 1, 4 * sizeof(float));
+    m->nsj = nsj;
+    m->sj = xcalloc(nsj + 1, sizeof(unsigned));
+    m->ibm = xcalloc(nsj + 1, 16 * sizeof(float));
+}
+
+void mesh_unskin(Mesh *m)
+{
+    free(m->wj); free(m->ww); free(m->sj); free(m->ibm);
+    m->wj = NULL; m->ww = NULL; m->sj = NULL; m->ibm = NULL; m->nsj = 0;
+}
+
+/* the source vertex nearest to p (brute force: only vertices with no recorded origin need it) */
+static int nearest_src(const Mesh *s, V3 p)
+{
+    int best = -1;
+    float bd = 1e30f;
+    for (int v = 0; v < s->nv; v++) {
+        V3 d = v3sub(s->p[v], p);
+        float dd = v3dot(d, d);
+        if (dd < bd) { bd = dd; best = v; }
+    }
+    return best;
+}
+
+/* weights for every vertex of b's mesh, from the source mesh (before compaction) */
+static void mb_weights(MB *b)
+{
+    const Mesh *s = b->src;
+    Mesh *m = &b->m;
+    if (!s || !s->ww || !s->nsj) return;
+    m->wj = xcalloc(m->nv + 1, 4);
+    m->ww = xcalloc(m->nv + 1, 4 * sizeof(float));
+    for (int v = 0; v < m->nv; v++) {
+        int a = v < b->nsrc ? v : b->pa[v], c = v < b->nsrc ? -1 : b->pb[v];
+        float t = v < b->nsrc ? 0 : b->pt[v];
+        if (a < 0 || a >= s->nv) { a = nearest_src(s, m->p[v]); c = -1; }
+        if (a < 0) continue;
+        for (int k = 0; k < 4; k++) if (s->ww[4 * a + k] > 0) skin_add(m->wj, m->ww, v, s->wj[4 * a + k], s->ww[4 * a + k] * (c >= 0 ? 1 - t : 1));
+        if (c >= 0 && c < s->nv)
+            for (int k = 0; k < 4; k++) if (s->ww[4 * c + k] > 0) skin_add(m->wj, m->ww, v, s->wj[4 * c + k], s->ww[4 * c + k] * t);
+        skin_normalize(m->wj, m->ww, v);
+    }
+    m->nsj = s->nsj;
+    m->sj = xrealloc(NULL, (s->nsj + 1) * sizeof(unsigned));
+    m->ibm = xrealloc(NULL, (s->nsj + 1) * 16 * sizeof(float));
+    memcpy(m->sj, s->sj, s->nsj * sizeof(unsigned));
+    memcpy(m->ibm, s->ibm, s->nsj * 16 * sizeof(float));
+}
+
 static Mesh mb_finish(MB *b)
 {
+    mb_weights(b);
+    free(b->pa); free(b->pb); free(b->pt);
+    b->pa = b->pb = NULL;
+    b->pt = NULL;
     Mesh m = b->m;
     if (!m.p) {
         m.p = xrealloc(NULL, sizeof(V3));
@@ -361,6 +453,7 @@ void mesh_free(Mesh *m)
     free(m->p); free(m->c); free(m->vs);
     free(m->fo); free(m->fi); free(m->fs);
     free(m->ev); free(m->ef); free(m->es); free(m->eh);
+    free(m->wj); free(m->ww); free(m->sj); free(m->ibm);
     memset(m, 0, sizeof *m);
 }
 
@@ -385,6 +478,14 @@ Mesh mesh_copy(const Mesh *s)
     m.ef = dup_mem(s->ef, 2 * s->ne * sizeof(int));
     m.es = dup_mem(s->es, s->ne);
     m.eh = s->eh ? dup_mem(s->eh, s->ne) : xcalloc(s->ne, 1);
+    if (s->ww) {
+        m.ww = dup_mem(s->ww, s->nv * 4 * sizeof(float));
+        m.wj = dup_mem(s->wj, s->nv * 4);
+        m.sj = dup_mem(s->sj, s->nsj * sizeof(unsigned));
+        m.ibm = dup_mem(s->ibm, s->nsj * 16 * sizeof(float));
+    } else {
+        m.ww = NULL; m.wj = NULL; m.sj = NULL; m.ibm = NULL; m.nsj = 0;
+    }
     return m;
 }
 
@@ -510,7 +611,9 @@ static MB mb_from_verts(const Mesh *m)
 {
     MB b;
     mb_init(&b);
+    if (m->ww) b.src = m;
     for (int v = 0; v < m->nv; v++) mb_vert(&b, m->p[v], m->c[v]);
+    b.nsrc = m->nv;
     return b;
 }
 
@@ -536,7 +639,7 @@ int mesh_extrude_faces(Mesh *m)
         if (!m->fs[f]) { mb_face(&b, m->fi + o, n, 0); continue; }
         for (int k = 0; k < n; k++) {
             int v = m->fi[o + k];
-            if (dup[v] < 0) dup[v] = mb_vert(&b, m->p[v], m->c[v]);
+            if (dup[v] < 0) dup[v] = mb_vert_from(&b, m->p[v], m->c[v], v, -1, 0);
             tmp[k] = dup[v];
             int a = v, c = m->fi[o + (k + 1) % n];
             if (a != c) { int *cnt = hm_get(&h, a, c); *cnt = *cnt < 0 ? 1 : *cnt + 1; }
@@ -583,8 +686,8 @@ int mesh_extrude_edges(Mesh *m)
         int o = m->fo[f], n = m->fo[f + 1] - o;
         for (int k = 0; k < n; k++)
             if (m->fi[o + k] == c && m->fi[o + (k + 1) % n] == a) { int t = a; a = c; c = t; break; }
-        if (dup[a] < 0) { dup[a] = mb_vert(&b, m->p[a], m->c[a]); b.m.vs[dup[a]] = 2; }
-        if (dup[c] < 0) { dup[c] = mb_vert(&b, m->p[c], m->c[c]); b.m.vs[dup[c]] = 2; }
+        if (dup[a] < 0) { dup[a] = mb_vert_from(&b, m->p[a], m->c[a], a, -1, 0); b.m.vs[dup[a]] = 2; }
+        if (dup[c] < 0) { dup[c] = mb_vert_from(&b, m->p[c], m->c[c], c, -1, 0); b.m.vs[dup[c]] = 2; }
         int q[4] = { c, a, dup[a], dup[c] };
         mb_face(&b, q, 4, 0);
         made++;
@@ -1459,7 +1562,7 @@ int mesh_cut(Mesh *m, const CutPt *pts, int n)
             else if (st[i] > t && st[i] < thi) { thi = st[i]; hi = sv[i]; }
         }
         if (id[k] >= 0) continue;
-        int x = mb_vert(&b, v3lerp(m->p[a], m->p[c], t), v3lerp(m->c[a], m->c[c], t));
+        int x = mb_vert_from(&b, v3lerp(m->p[a], m->p[c], t), v3lerp(m->c[a], m->c[c], t), a, c, t);
         pl_split_edge(&pl, lo, hi, x);
         if (m->eh[e]) { mb_hard(&b, lo, x, m->eh[e]); mb_hard(&b, x, hi, m->eh[e]); }
         se[ns] = e; st[ns] = t; sv[ns++] = x;
@@ -1482,7 +1585,7 @@ int mesh_cut(Mesh *m, const CutPt *pts, int n)
         }
         hm_free(&h);
     } else {
-        free(b.m.p); free(b.m.c); free(b.m.vs); free(b.m.fo); free(b.m.fs); free(b.m.fi); free(b.hp);
+        free(b.m.p); free(b.m.c); free(b.m.vs); free(b.m.fo); free(b.m.fs); free(b.m.fi); free(b.hp); free(b.pa); free(b.pb); free(b.pt);
     }
     hm_free(&eh);
     pl_free(&pl);
@@ -1526,7 +1629,7 @@ int mesh_bevel(Mesh *m, const unsigned char *emask, float width)
     int nc = m->fo[m->nf], *cv = xrealloc(NULL, (nc + 1) * sizeof(int));
     PL pl;
     memset(&pl, 0, sizeof pl);
-#define NEWV(pos, col, own) (iv_push(&owner, own), mb_vert(&b, pos, col))
+#define NEWV(pos, col, own) (iv_push(&owner, own), mb_vert_from(&b, pos, col, own, -1, 0))
     for (int f = 0; f < m->nf; f++) {
         int s = m->fo[f], n = m->fo[f + 1] - s;
         IV nf = { 0, 0, NULL };
@@ -1722,7 +1825,7 @@ int mesh_bridge(Mesh *m, const unsigned char *emask, int divs)
     for (int rr = 1; rr < rows - 1; rr++) {
         float t = (float)rr / (rows - 1);
         for (int i = 0; i < n; i++)
-            R[rr * n + i] = mb_vert(&b, v3lerp(m->p[A[i]], m->p[B[i]], t), v3lerp(m->c[A[i]], m->c[B[i]], t));
+            R[rr * n + i] = mb_vert_from(&b, v3lerp(m->p[A[i]], m->p[B[i]], t), v3lerp(m->c[A[i]], m->c[B[i]], t), A[i], B[i], t);
     }
     int segs = closed ? n : n - 1;
     for (int rr = 0; rr < rows - 1; rr++)
@@ -2343,7 +2446,7 @@ int mesh_slice(Mesh *m, int axis, float tol)
         int a = m->ev[2 * e], c = m->ev[2 * e + 1];
         if (sd[a] * sd[c] >= 0) continue;
         float ca = (&m->p[a].x)[axis], cc = (&m->p[c].x)[axis], t = ca / (ca - cc);
-        int x = mb_vert(&b, v3lerp(m->p[a], m->p[c], t), v3lerp(m->c[a], m->c[c], t));
+        int x = mb_vert_from(&b, v3lerp(m->p[a], m->p[c], t), v3lerp(m->c[a], m->c[c], t), a, c, t);
         (&b.m.p[x].x)[axis] = 0;
         sd[x] = 0;
         pl_split_edge(&pl, a, c, x);
@@ -2367,7 +2470,7 @@ int mesh_slice(Mesh *m, int axis, float tol)
         mesh_replace(m, &b);
     } else {
         for (int v = 0; v < m->nv; v++) m->p[v] = b.m.p[v];   /* only the snapping */
-        free(b.m.p); free(b.m.c); free(b.m.vs); free(b.m.fo); free(b.m.fs); free(b.m.fi); free(b.hp);
+        free(b.m.p); free(b.m.c); free(b.m.vs); free(b.m.fo); free(b.m.fs); free(b.m.fi); free(b.hp); free(b.pa); free(b.pb); free(b.pt);
     }
     pl_free(&pl);
     free(sd);
@@ -2411,7 +2514,7 @@ int mesh_mirror(Mesh *m, int axis, float tol, int keep)
             if (mv[v] < 0) {
                 V3 p = m->p[v];
                 (&p.x)[axis] = -(&p.x)[axis];
-                mv[v] = mb_vert(&b, p, m->c[v]);
+                mv[v] = mb_vert_from(&b, p, m->c[v], v, -1, 0);   /* (main.c swaps left / right joints) */
                 b.m.vs[mv[v]] = m->vs[v];
             }
             tmp[k] = mv[v];
@@ -2435,6 +2538,7 @@ static Mesh cc_step(const Mesh *m)
     int nv = m->nv, ne = m->ne, nf = m->nf;
     MB b;
     mb_init(&b);
+    if (m->ww) b.src = m;   /* weights: every new vertex says which old ones it came from */
     V3 *fp = xrealloc(NULL, (nf + 1) * sizeof(V3)), *fc = xrealloc(NULL, (nf + 1) * sizeof(V3));
     for (int f = 0; f < nf; f++) {
         V3 p = v3(0, 0, 0), c = v3(0, 0, 0);
@@ -2483,7 +2587,7 @@ static Mesh cc_step(const Mesh *m)
             np = v3mul(v3add(v3add(Q, v3mul(R, 2)), v3mul(P, n - 3)), 1.0f / n);
             nc = v3mul(v3add(v3add(Qc, v3mul(Rc, 2)), v3mul(C, n - 3)), 1.0f / n);
         } else { np = P; nc = C; }
-        vid[v] = mb_vert(&b, np, nc);
+        vid[v] = mb_vert_from(&b, np, nc, v, -1, 0);
         b.m.vs[vid[v]] = m->vs[v];
     }
     for (int e = 0; e < ne; e++) {
@@ -2493,9 +2597,12 @@ static Mesh cc_step(const Mesh *m)
             p = v3mul(v3add(v3add(m->p[a], m->p[c]), v3add(fp[f0], fp[f1])), 0.25f);
             col = v3mul(v3add(v3add(m->c[a], m->c[c]), v3add(fc[f0], fc[f1])), 0.25f);
         }
-        eid[e] = mb_vert(&b, p, col);
+        eid[e] = mb_vert_from(&b, p, col, a, c, .5f);
     }
-    for (int f = 0; f < nf; f++) fid[f] = mb_vert(&b, fp[f], fc[f]);
+    for (int f = 0; f < nf; f++) {
+        int s = m->fo[f], n = m->fo[f + 1] - s;
+        fid[f] = mb_vert_from(&b, fp[f], fc[f], m->fi[s], m->fi[s + n / 2], .5f);
+    }
     HMap h;
     edge_map(&h, m);
     for (int f = 0; f < nf; f++) {
