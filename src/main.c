@@ -3628,6 +3628,7 @@ static int skel_joints(unsigned root, unsigned *out, int max)
 static Obj *add_joint(const char *name, unsigned parent, V3 world)
 {
     Obj *o = obj_new_node(name, OK_JOINT);   /* may move ob */
+    if (!name_used(name)) snprintf(o->name, sizeof o->name, "%s", name);   /* rigs keep exact names (Roblox R15) */
     o->parent = parent;
     obj_set_world(o, m4_trs(world, v3(0, 0, 0), v3(1, 1, 1)));
     o->r = v3(0, 0, 0);
@@ -3742,6 +3743,7 @@ static void cmd_mirror_joints(void)
             unsigned par = ob[si].parent, nodef = ob[si].nodeform;
             for (int q = 0; q < nm && k; q++) if (from[q] == par) par = made[q];
             Obj *c = obj_new_node(name, OK_JOINT);   /* may move ob */
+            if (!name_used(name)) snprintf(c->name, sizeof c->name, "%s", name);
             c->parent = par;
             c->nodeform = nodef;
             obj_set_world(c, W);
