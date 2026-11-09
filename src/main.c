@@ -720,7 +720,12 @@ static DrawCache *cache_get(int i)
     if (c->gen == geoGen && c->key == m->p && c->nv == m->nv && c->nf == m->nf) return c;
     const Mesh *cage = m;
     Mesh sm;
-    if (o->smooth && m->nf) { sm = mesh_smooth(m, smoothLv); m = &sm; }   /* smooth preview: draw the subdivided surface */
+    if (o->smooth && m->nf) {
+        /* smooth preview: draw the subdivided surface (fewer levels on heavy meshes, about 1M faces at most) */
+        int lv = smoothLv;
+        while (lv > 0 && (double)m->fo[m->nf] * pow(4, lv - 1) > 1.2e6) lv--;
+        if (lv > 0) { sm = mesh_smooth(m, lv); m = &sm; }
+    }
     int tint = o->hil && shows(M_FACE), nt = 0;
     float alpha = xray ? 0.42f : 1;
     for (int f = 0; f < m->nf; f++) nt += m->fo[f + 1] - m->fo[f] - 2;
@@ -2670,8 +2675,13 @@ static void cmd_extrude(void)
         normalFrame = 1;
         lastHandle = H_Z;
     }
-    msg(faces ? "Extruded - drag the blue (Z) handle to pull, or set Thickness / Offset in the side panel"
-              : "Extruded the edges - drag to pull them out");
+    char b[160];
+    if (faces && (exThick != 0 || exOff != 0))
+        snprintf(b, sizeof b, "Extruded with Thickness %g, Offset %g (side panel; set them to 0 to pull by hand)", exThick, exOff);
+    else
+        snprintf(b, sizeof b, faces ? "Extruded - drag the blue (Z) handle to pull, or set Thickness / Offset in the side panel"
+                                    : "Extruded the edges - drag to pull them out");
+    msg(b);
     if (faces) liveCmd = CM_EXTRUDE;
 }
 
@@ -4487,6 +4497,10 @@ static const char *HELP_TEXT =
     "  Double-click an edge\tSelect its edge loop\n"
     "  > / <\tGrow / shrink selection\n"
     "  Ctrl+Shift+A / Ctrl+Shift+I\tSelect all / invert\n\n"
+    "  Double-click a face / vertex\tSelect its face loop / vertex loop\n\n"
+    "Symmetry and soft selection\n"
+    "  S\tSymmetry on/off (right-click the toolbar button for X / Y / Z, world)\n"
+    "  B\tSoft selection on/off; hold B and drag for its radius\n\n"
     "Tools\n"
     "  Q W E R\tSelect / move / rotate / scale\n"
     "  Handles\tArrow = 1 axis, square = 2 axes, center = all / view plane\n"
@@ -4506,6 +4520,9 @@ static const char *HELP_TEXT =
     "  Z, Ctrl+Z / Shift+Z, Ctrl+Y\tUndo / redo\n"
     "  G\tRepeat last command\n"
     "  4 / 5\tWireframe / shaded\n"
+    "  3 / 1\tSmooth preview on / off\n"
+    "  Ctrl+1\tIsolate select (again: show everything)\n"
+    "  Ctrl+Plus / Ctrl+Minus\tBigger / smaller UI\n"
     "  Ctrl+N / Ctrl+O / Ctrl+S\tNew / open / save (.tuff scene or OBJ)\n"
     "  Ctrl+Shift+O / Ctrl+Shift+S\tImport into the scene / save as\n"
     "  Ctrl+A\tToggle side panel\n"
@@ -4627,7 +4644,7 @@ static void do_cmd(int id)
     case CM_PLANE: cmd_create(PRIM_PLANE); break;
     case CM_SELALL: cmd_select_all(0); break;
     case CM_SELINV: cmd_select_all(1); break;
-    case CM_EXTRUDE: exThick = exOff = 0; cmd_extrude(); break;
+    case CM_EXTRUDE: cmd_extrude(); break;
     case CM_MERGE: cmd_merge(); break;
     case CM_FILLHOLE: cmd_fill_hole(); break;
     case CM_APPLYCOL: cmd_apply_color(); break;
@@ -5336,7 +5353,8 @@ static LRESULT CALLBACK PanelProc(HWND h, UINT m, WPARAM wp, LPARAM lp)
             int r = id - 2000;
             panel_commit(r, SendMessage(rChk[r], BM_GETCHECK, 0, 0) == BST_CHECKED);
             SetFocus(hView);
-        } else if (id >= 4000 && id < 4000 + 2 * NROW && code == BN_CLICKED && !building) {
+        } else if (id >= 4000 && id < 4000 + 2 * NROW && (code == BN_CLICKED || code == BN_DOUBLECLICKED) && !building) {
+            /* (quick repeated clicks arrive as double-clicks: each one counts) */
             /* - / + steppers next to whole numbers */
             int r = (id - 4000) % NROW, up = id >= 4000 + NROW;
             double v;
@@ -6329,8 +6347,10 @@ static void tip_show(Bar *b, int i)
         wc.lpfnWndProc = TipProc;
         wc.lpszClassName = "Tuff3DTip";
         RegisterClassExA(&wc);
-        hTip = CreateWindowExA(WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE, "Tuff3DTip", "", WS_POPUP,
-                               0, 0, 1, 1, hMain, NULL, wc.hInstance, NULL);
+        /* layered + transparent: clicks go straight through to whatever is underneath */
+        hTip = CreateWindowExA(WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE | WS_EX_LAYERED | WS_EX_TRANSPARENT,
+                               "Tuff3DTip", "", WS_POPUP, 0, 0, 1, 1, hMain, NULL, wc.hInstance, NULL);
+        SetLayeredWindowAttributes(hTip, 0, 245, LWA_ALPHA);
     }
     const Tool *t = &b->it[i];
     char hk[48];
@@ -6346,7 +6366,10 @@ static void tip_show(Bar *b, int i)
     DrawTextA(dc, tipBody, -1, &br, DT_CALCRECT | DT_WORDBREAK | DT_NOPREFIX);
     ReleaseDC(hTip, dc);
     int w = (hr.right > br.right ? hr.right : br.right) + 2 * pad, hh = hr.bottom + br.bottom + pad + (int)(6 * ds);
-    POINT pt = { b->vert ? b->rc[i].right + (int)(6 * ds) : b->rc[i].left, b->vert ? b->rc[i].top : b->rc[i].bottom + (int)(6 * ds) };
+    /* beside the toolbox, or under the whole shelf: never over other buttons */
+    RECT br_;
+    GetClientRect(b->h, &br_);
+    POINT pt = { b->vert ? br_.right + (int)(6 * ds) : b->rc[i].left, b->vert ? b->rc[i].top : br_.bottom + (int)(4 * ds) };
     ClientToScreen(b->h, &pt);
     RECT wa;
     SystemParametersInfoA(SPI_GETWORKAREA, 0, &wa, 0);
@@ -8066,8 +8089,13 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmd, int show)
 
     hMenu = build_menu();
     menu_keys();
+    RECT wa;
+    SystemParametersInfoA(SPI_GETWORKAREA, 0, &wa, 0);
+    int ww = (int)(1280 * dpiScale * 1.15f), wh = (int)(820 * dpiScale * 1.15f);
+    if (ww > (wa.right - wa.left) * 92 / 100) ww = (wa.right - wa.left) * 92 / 100;
+    if (wh > (wa.bottom - wa.top) * 92 / 100) wh = (wa.bottom - wa.top) * 92 / 100;
     hMain = CreateWindowA("Tuff3DMain", APP_NAME, WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN, CW_USEDEFAULT, CW_USEDEFAULT,
-                          (int)(1280 * dpiScale * 1.15f), (int)(820 * dpiScale * 1.15f), NULL, hMenu, inst, NULL);
+                          ww, wh, NULL, hMenu, inst, NULL);
     hBar = CreateWindowA("Tuff3DBar", "", WS_CHILD | WS_VISIBLE, 0, 0, 1, 1, hMain, NULL, inst, NULL);
     hBox = CreateWindowA("Tuff3DBar", "", WS_CHILD | WS_VISIBLE, 0, 0, 1, 1, hMain, NULL, inst, NULL);
     shelf.h = hBar;

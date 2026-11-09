@@ -1,7 +1,7 @@
 # tuff3d
 
 A small, minimalist polygon modeler for Windows with Autodesk Maya's navigation and hotkeys.
-It is one ~420 KB exe with no installer, and it only uses DLLs that ship with Windows
+It is one ~500 KB exe with no installer, and it only uses DLLs that ship with Windows
 (OpenGL 1.1, GDI, GDI+ for reference images, common dialogs, shell drag and drop). It redraws only when something changes, so
 it sits at 0% CPU when idle. Meshes are drawn from cached vertex arrays that are only rebuilt after
 an edit, so tumbling and hovering stay fast on dense meshes.
@@ -10,18 +10,39 @@ an edit, so tumbling and hovering stay fast on dense meshes.
 
 ## Features
 
+Symmetry and soft selection
+- Symmetry (S, or the butterfly button; right-click it for X / Y / Z and world space): select on one
+  side and the mirror image is picked too, then move, rotate, scale, extrude, type values or paint on
+  one side and the other side follows. Vertices on the plane stay on it. A tinted plane shows the
+  axis in the viewport. Symmetry Tolerance (side panel) sets how close a vertex must be to its mirror
+  image to count as its partner
+- Soft selection (tap B): moving a selection drags the vertices around it along with a smooth falloff,
+  shown as yellow-to-red dots. Hold B and drag to set the radius (or type it in the side panel).
+  Works together with symmetry
+- Mesh > Mirror (and the heart button; right-click for the axis): mirrors each selected object across
+  its own X, Y or Z plane and welds the seam. A half model becomes whole; a model that spans the plane
+  keeps its bigger side and copies it over the other, which makes a lopsided model symmetric again
+
 Modeling
-- Primitives with editable parameters (in the side panel until you edit the mesh's components)
+- Primitives with editable parameters (in the side panel until you edit the mesh's components);
+  whole numbers have - / + buttons, so picking the number of sides is one click each
   - Cube: width/height/depth, subdivisions per axis
-  - Cylinder: radius, height, sides, height divisions, cap divisions, top/bottom cap on/off
-  - Sphere: radius, columns, rows
-  - Plane: width/height, subdivisions per axis
+  - Sphere: sides, rings, radius
+  - Cylinder: sides, radius, height, height divisions, cap rings, top/bottom cap on/off
+  - Cone: sides, radius, height, height divisions, cap rings
+  - Torus: sides, tube sides, radius, tube radius
+  - Pipe: sides, radius, wall thickness, height, height divisions
+  - Plane: width/depth, subdivisions per axis
+- Mesh > Smooth: Catmull-Clark subdivision (every face splits in four and rounds off; open borders and
+  hard edges stay creased). Smooth preview (3 on, 1 off) shows the smoothed surface while you keep
+  editing the light cage; Preview Level 1-3 in the side panel
 - Move / rotate / scale manipulators: arrow = 1 axis, square = 2 axes, center = all 3. A faint line shows
   the axis a drag is locked to. Scaling components stops at 0, so dragging a handle past the pivot
   flattens them onto one plane (e.g. line up 2 vertices on X)
 - Snapping: hold X (grid), V (onto vertices, with a marker on the target) or J (15 degree rotation);
   Grid Snap and Point Snap are also toggle buttons
-- Extrude faces (kept together, then pull along the normal) and extrude edges; Merge to Center
+- Extrude faces (kept together, then pull along the normal) and extrude edges; Merge to Center.
+  Extrude Thickness and Offset (inset) in the side panel redo the last extrusion live
 - Bevel (Ctrl+B) the selected edges, the edges of selected faces, or whole objects; Bridge two open
   borders. Bevel Width and Bridge Divisions in the side panel redo the last bevel/bridge live
 - Insert Edge Loop tool: hover an edge for a yellow preview of the loop, click to add it
@@ -43,8 +64,11 @@ Selection
 - Objects, vertices, edges, faces, or Multi mode (F7): all three at once, like Maya's multi-component
   selection (a click picks a nearby vertex, then an edge, then the face under the cursor)
 - Click, marquee (only what's visible in shaded mode), Shift/Ctrl modifiers
-- Double-click an edge for its edge loop; grow / shrink (> / <); convert between vertices, edges and
-  faces (Ctrl+F9/F10/F11); select all / invert
+- Double-click an edge for its edge loop, a face for the face loop running across the edge nearest
+  the cursor, a vertex for its vertex loop; Select > Edge Ring; grow / shrink (> / <); convert
+  between vertices, edges and faces (Ctrl+F9/F10/F11); select all / invert
+- The side panel's Selection section shows the selected components' center and size: type a center
+  to move them there, or a size to scale them to it (symmetry and soft selection included)
 
 Feedback
 - Preselection highlight: whatever a click would pick (object, vertex, edge or face) lights up red
@@ -57,9 +81,15 @@ Feedback
 - Tips on an empty scene and in an empty side panel
 
 Comfort
-- Toolbar with the tools, modes, primitives and common commands, each labeled with its hotkey
-- Side panel: rename objects, type values, or drag a label left/right to scrub its value
-  (Shift fast, Ctrl fine)
+- Icon toolbars: a toolbox on the left for the tools and selection modes, and a shelf on top for
+  shapes, mesh operations, symmetry / soft selection / snapping and display toggles. The icons are
+  drawn anti-aliased in the theme's colors, short hotkeys sit in each button's corner, and hovering
+  a button shows a tooltip with its name, hotkey and what it does
+- Display > UI Size (Ctrl+Plus / Ctrl+Minus): 90% to 250%; buttons, panel, text and handles all scale.
+  The default is 125%
+- Side panel: rename objects, type values (Up / Down arrow keys step them), or drag a label
+  left/right to scrub its value (Shift fast, Ctrl fine). Choices are buttons (Off | X | Y | Z),
+  sections fold away when you click their header, and the mouse wheel scrolls the panel
 - Smooth camera moves for frame (F/A) and views; Home view, front/side/top views, and clicking
   X/Y/Z on the corner gizmo to look down that axis (click again for the opposite side)
 - File > Open Recent, drag and drop .obj files onto the window (Shift adds them to the scene), and
@@ -74,6 +104,8 @@ Comfort
   click to keep it, arrow keys to step through, R for a random one. Ctrl+Shift+T steps to the next
   theme. Themes color the viewport, side panel, toolbar, status bar, menu bar and (Windows 10/11)
   the title bar
+- X-Ray (see and select through surfaces), Backface Culling, Isolate Select (Ctrl+1: show only the
+  selection)
 - Hard Shade, Smooth Shade and Auto Smooth per object (Display menu and toolbar). Auto Smooth keeps
   edges sharper than the Normal Angle (default 30°, editable in the side panel) hard and smooths the
   rest; Harden / Soften Edge override single edges (hard ones draw thicker while editing)
@@ -81,7 +113,7 @@ Comfort
   perspective. Display > Image Planes puts a reference picture behind each of those views
 - Help > Hotkey Editor: change any command's keys (two per command); menus and toolbar follow
 - Save scenes as `.tuff` (File > Save): everything is kept, including hidden objects, primitive
-  settings, edge overrides, the camera and image planes. Autosave uses it too
+  settings, edge overrides, smooth preview, symmetry, the camera and image planes. Autosave uses it too
 - Export OBJ (world space, vertex colors written as `v x y z r g b`, shading written as `vn` normals)
   and open/import OBJ; Ctrl+S on an opened OBJ saves back to it. Shading comes back when you reopen the file, and smoothing groups from other
   apps' OBJs (`s 1` / `s off`) open smooth or hard
@@ -98,10 +130,12 @@ See [FEATURES.md](FEATURES.md) for a checklist of what's in and ideas for what c
 | Click X / Y / Z on the corner gizmo | Look down that axis |
 | Q W E R | Select / move / rotate / scale tool |
 | F8 / F9 / F10 / F11 / F7 | Object / vertex / edge / face / multi mode |
+| S | Symmetry on / off (right-click its button for the axis) |
+| B / hold B + drag | Soft selection on / off / its radius |
 | Ctrl+F9 / F10 / F11 | Convert selection to vertices / edges / faces |
 | RMB on object | Component mode menu |
 | Shift / Ctrl / Ctrl+Shift + click | Toggle / deselect / add |
-| Double-click an edge | Select its edge loop |
+| Double-click an edge / face / vertex | Select its edge / face / vertex loop |
 | > / < | Grow / shrink selection |
 | Ctrl+Shift+A / Ctrl+Shift+I | Select all / invert selection |
 | Ctrl + drag axis handle | Move / scale on the other two axes |
@@ -116,6 +150,9 @@ See [FEATURES.md](FEATURES.md) for a checklist of what's in and ideas for what c
 | Z or Ctrl+Z / Shift+Z or Ctrl+Y | Undo / redo |
 | G | Repeat last command |
 | 4 / 5 | Wireframe / shaded |
+| 3 / 1 | Smooth preview on / off |
+| Ctrl+1 | Isolate select |
+| Ctrl+Plus / Ctrl+Minus | Bigger / smaller UI |
 | B + LMB drag | Brush radius (paint tool) |
 | Ctrl+N / Ctrl+O / Ctrl+S | New / open / save (.tuff scene, or back to the open OBJ) |
 | Ctrl+Shift+O / Ctrl+Shift+S | Import into the scene / save as |
@@ -124,7 +161,7 @@ See [FEATURES.md](FEATURES.md) for a checklist of what's in and ideas for what c
 | F1 | Hotkey list |
 
 Tools without a Maya default hotkey (Paint, Target Weld, Insert Edge Loop, Multi-Cut, Bridge, Merge,
-...) are in the toolbar and the Mesh / Edit Mesh / Tools menus; Help > Hotkey Editor can give them keys.
+Mirror, Smooth, X-Ray, ...) are in the toolbar and the Mesh / Edit Mesh / Tools menus; Help > Hotkey Editor can give them keys.
 
 ## Maya LT scenes (.mlt)
 
@@ -190,5 +227,5 @@ The icon is `res/tuff3d.ico` (16 to 256 px), built from `res/tuff3d.png` with `p
 Geometry tests (any C compiler): `cc -Isrc tests/test_mesh.c src/mesh.c -lm && ./a.out`
 
 `src/mesh.c` is the platform-independent geometry core (primitives, extrude, merge, edge loops,
-selection grow/shrink/convert, OBJ).
+selection grow/shrink/convert, symmetry pairing, mirror, Catmull-Clark smoothing, OBJ).
 `src/main.c` is the Win32/OpenGL UI.
