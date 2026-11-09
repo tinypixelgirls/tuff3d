@@ -104,6 +104,10 @@ static void toast(const char *s);
 static void ui_size(int pct);
 static void ui_step(int up);
 static void obj_move_pivot(int i, V3 w);
+static HWND hOutl;
+static int panelTab;
+static void panel_build(void);
+static LRESULT CALLBACK OutlProc(HWND h, UINT m, WPARAM wp, LPARAM lp);
 static void rig_update(void);
 static int reparent(int i, unsigned p);
 static DWORD msgT;
@@ -133,8 +137,14 @@ static M4 parent_mat(const Obj *o)
     return m;
 }
 
-/* object to world, through the parents */
-static M4 obj_mat(const Obj *o) { return o->parent ? m4_mul(parent_mat(o), obj_local(o)) : obj_local(o); }
+static int skinned(const Obj *o);
+
+/* object to world, through the parents (a bound mesh sits still at the origin: its joints move it) */
+static M4 obj_mat(const Obj *o)
+{
+    if (skinned(o)) return m4_id();
+    return o->parent ? m4_mul(parent_mat(o), obj_local(o)) : obj_local(o);
+}
 
 /* is a an ancestor of object o? */
 static int is_ancestor(unsigned a, const Obj *o)
@@ -4879,6 +4889,15 @@ static int tuff_save(const char *path, int selOnly)
                 q->kr, q->kh, q->ksides, q->khseg, q->kcap, q->tr, q->tsec, q->tsides, q->tsegs,
                 q->ur, q->uh, q->ut, q->usides, q->uhseg);
         if (o->smooth) fprintf(f, "smooth 1\n");
+        fprintf(f, "id %u\nparent %u\nkind %d %d\n", o->id, o->parent, o->kind, o->nodeform);
+        if (o->rest)
+            fprintf(f, "rest %.9g %.9g %.9g %.9g %.9g %.9g %.9g %.9g %.9g\n", o->bt.x, o->bt.y, o->bt.z, o->br.x, o->br.y, o->br.z, o->bs.x, o->bs.y, o->bs.z);
+        if (o->kind == OK_IK) {
+            fprintf(f, "ik %u %u %u %.9g %.9g %.9g %.9g %.9g %.9g %.9g %.9g %.9g %d", o->ikA, o->ikB, o->ikC, o->ikPole.x, o->ikPole.y, o->ikPole.z,
+                    o->ikRa.x, o->ikRa.y, o->ikRa.z, o->ikRb.x, o->ikRb.y, o->ikRb.z, o->ikOrient);
+            for (int k = 0; k < 16; k++) fprintf(f, " %.9g", o->ikCw.m[k]);
+            fputc('\n', f);
+        }
         for (int v = 0; v < m->nv; v++)
             fprintf(f, "v %.9g %.9g %.9g %.6g %.6g %.6g\n", m->p[v].x, m->p[v].y, m->p[v].z, m->c[v].x, m->c[v].y, m->c[v].z);
         for (int fc = 0; fc < m->nf; fc++) {
@@ -4888,17 +4907,48 @@ static int tuff_save(const char *path, int selOnly)
         }
         for (int e = 0; e < m->ne; e++)
             if (m->eh[e]) fprintf(f, "e %d %d %d\n", m->ev[2 * e], m->ev[2 * e + 1], m->eh[e]);
+        if (skinned(o)) {
+            fprintf(f, "skin %d", m->nsj);
+            for (int k = 0; k < m->nsj; k++) fprintf(f, " %u", m->sj[k]);
+            fputc('\n', f);
+            for (int k = 0; k < m->nsj; k++) {
+                fprintf(f, "ibm %d", k);
+                for (int q = 0; q < 16; q++) fprintf(f, " %.9g", m->ibm[16 * k + q]);
+                fputc('\n', f);
+            }
+            for (int v = 0; v < m->nv; v++) {
+                fprintf(f, "w %d", v);
+                for (int q = 0; q < 4; q++) fprintf(f, " %d %.6g", m->wj[4 * v + q], m->ww[4 * v + q]);
+                fputc('\n', f);
+            }
+        }
         fprintf(f, "end\n");
         n++;
+    }
+    /* animation: clips, keys per object id */
+    fprintf(f, "fps %.9g\nframe %.9g %d\n", anim.fps, curFrame, anim.cur);
+    for (int c = 0; c < anim.n; c++) {
+        Clip *cl = &anim.c[c];
+        fprintf(f, "clip %d %d %s\n", cl->start, cl->end, cl->name);
+        for (int k = 0; k < cl->nt; k++) {
+            Track *t = &cl->t[k];
+            int oi = obj_index(t->obj);
+            if (oi < 0 || (selOnly && !active(&ob[oi])) || !t->n) continue;
+            fprintf(f, "track %u\n", t->obj);
+            for (int q = 0; q < t->n; q++) {
+                Key *e = &t->k[q];
+                fprintf(f, "k %.9g %.9g %.9g %.9g %.9g %.9g %.9g %.9g %.9g %.9g %d\n", e->f, e->t.x, e->t.y, e->t.z, e->r.x, e->r.y, e->r.z, e->s.x, e->s.y, e->s.z, e->ease);
+            }
+        }
     }
     int ok = !ferror(f);
     if (fclose(f)) ok = 0;
     return ok ? n : -1;
 }
 
-typedef struct { Obj o; int nv, nf, ni, ne, cv, cf, ci, ce; V3 *p, *c; int *fo, *fi, *eh; } TObj;
+typedef struct { Obj o; int nv, nf, ni, ne, cv, cf, ci, ce; V3 *p, *c; int *fo, *fi, *eh; int nsj; unsigned *sj; float *ibm, *ww; unsigned char *wj; int wv; } TObj;
 
-static void tobj_free(TObj *t) { free(t->p); free(t->c); free(t->fo); free(t->fi); free(t->eh); }
+static void tobj_free(TObj *t) { free(t->p); free(t->c); free(t->fo); free(t->fi); free(t->eh); free(t->sj); free(t->ibm); free(t->ww); free(t->wj); }
 
 /* reads a scene's objects into the scene; returns how many, or -1. camera / images: take those too */
 static int tuff_load(const char *path, int camera, int images)
@@ -4908,7 +4958,13 @@ static int tuff_load(const char *path, int camera, int images)
     static char line[1 << 16];
     if (!fgets(line, sizeof line, f) || strncmp(line, "tuff3d scene", 12)) { fclose(f); return -1; }
     TObj *t = NULL;
-    int nt = 0, bad = 0;
+    int nt = 0, bad = 0, curClip = -1, oldClips = anim.n;
+    Track *curTrack = NULL;
+    Anim la;   /* the file's clips; ids are remapped once the objects exist */
+    memset(&la, 0, sizeof la);
+    la.fps = 24;
+    float lframe = 0;
+    int lcur = 0;
     while (fgets(line, sizeof line, f)) {
         line[strcspn(line, "\r\n")] = 0;
         TObj *c = nt ? &t[nt - 1] : NULL;
@@ -4942,8 +4998,59 @@ static int tuff_load(const char *path, int camera, int images)
             float sz, ox, oy, op;
             if (images && sscanf(line + 6, "%d %f %f %f %f %n", &slot, &sz, &ox, &oy, &op, &pos) == 5 && slot >= 0 && slot < 3 && pos)
                 if (!img_set(slot, line + 6 + pos, sz, ox, oy, op)) bad |= 2;
+        } else if (!strncmp(line, "fps ", 4)) {
+            la.fps = (float)atof(line + 4);
+        } else if (!strncmp(line, "frame ", 6)) {
+            sscanf(line + 6, "%f %d", &lframe, &lcur);
+        } else if (!strncmp(line, "clip ", 5)) {
+            int a, b, pos = 0;
+            if (sscanf(line + 5, "%d %d %n", &a, &b, &pos) >= 2 && pos) { curClip = anim_add_clip(&la, line + 5 + pos, a, b); curTrack = NULL; }
+        } else if (!strncmp(line, "track ", 6)) {
+            curTrack = curClip >= 0 ? clip_track(&la.c[curClip], (unsigned)strtoul(line + 6, NULL, 10), 1) : NULL;
+        } else if (line[0] == 'k' && line[1] == ' ' && curTrack) {
+            Key q;
+            int e = 0;
+            if (sscanf(line + 2, "%f %f %f %f %f %f %f %f %f %f %d", &q.f, &q.t.x, &q.t.y, &q.t.z, &q.r.x, &q.r.y, &q.r.z, &q.s.x, &q.s.y, &q.s.z, &e) == 11)
+                track_set(curTrack, q.f, q.t, q.r, q.s, e);
         } else if (!c) {
             continue;
+        } else if (!strncmp(line, "id ", 3)) {
+            c->o.id = (unsigned)strtoul(line + 3, NULL, 10);
+        } else if (!strncmp(line, "parent ", 7)) {
+            c->o.parent = (unsigned)strtoul(line + 7, NULL, 10);
+        } else if (!strncmp(line, "kind ", 5)) {
+            sscanf(line + 5, "%d %d", &c->o.kind, &c->o.nodeform);
+            if (c->o.kind < OK_MESH || c->o.kind > OK_IK) c->o.kind = OK_MESH;
+        } else if (!strncmp(line, "rest ", 5)) {
+            Obj *o = &c->o;
+            o->rest = sscanf(line + 5, "%f %f %f %f %f %f %f %f %f", &o->bt.x, &o->bt.y, &o->bt.z, &o->br.x, &o->br.y, &o->br.z, &o->bs.x, &o->bs.y, &o->bs.z) == 9;
+        } else if (!strncmp(line, "ik ", 3)) {
+            Obj *o = &c->o;
+            int pos = 0;
+            if (sscanf(line + 3, "%u %u %u %f %f %f %f %f %f %f %f %f %d%n", &o->ikA, &o->ikB, &o->ikC, &o->ikPole.x, &o->ikPole.y, &o->ikPole.z,
+                       &o->ikRa.x, &o->ikRa.y, &o->ikRa.z, &o->ikRb.x, &o->ikRb.y, &o->ikRb.z, &o->ikOrient, &pos) == 13) {
+                char *q = line + 3 + pos;
+                for (int k = 0; k < 16; k++) o->ikCw.m[k] = strtof(q, &q);
+            }
+        } else if (!strncmp(line, "skin ", 5)) {
+            char *q = line + 5;
+            int n = (int)strtol(q, &q, 10);
+            if (n > 0 && n < 256) {
+                c->nsj = n;
+                c->sj = calloc(n, sizeof(unsigned));
+                c->ibm = calloc(n * 16, sizeof(float));
+                for (int k = 0; k < n; k++) c->sj[k] = (unsigned)strtoul(q, &q, 10);
+            }
+        } else if (!strncmp(line, "ibm ", 4) && c->ibm) {
+            char *q = line + 4;
+            int k = (int)strtol(q, &q, 10);
+            if (k >= 0 && k < c->nsj) for (int j = 0; j < 16; j++) c->ibm[16 * k + j] = strtof(q, &q);
+        } else if (line[0] == 'w' && line[1] == ' ' && c->nsj) {
+            char *q = line + 2;
+            int v = (int)strtol(q, &q, 10);
+            if (!c->ww) { c->wv = c->nv; c->ww = calloc(c->nv + 1, 4 * sizeof(float)); c->wj = calloc(c->nv + 1, 4); }
+            if (v >= 0 && v < c->wv)
+                for (int k = 0; k < 4; k++) { c->wj[4 * v + k] = (unsigned char)strtol(q, &q, 10); c->ww[4 * v + k] = strtof(q, &q); }
         } else if (!strncmp(line, "xform ", 6)) {
             Obj *o = &c->o;
             sscanf(line + 6, "%f %f %f %f %f %f %f %f %f", &o->t.x, &o->t.y, &o->t.z, &o->r.x, &o->r.y, &o->r.z, &o->s.x, &o->s.y, &o->s.z);
@@ -4992,23 +5099,70 @@ static int tuff_load(const char *path, int camera, int images)
         }
     }
     fclose(f);
-    int n = 0;
+    int n = 0, n0 = nob;
+    unsigned *fromId = calloc(nt + 1, sizeof(unsigned)), *toId = calloc(nt + 1, sizeof(unsigned));
+    int nmap = 0;
     for (int i = 0; i < nt; i++) {
         TObj *c = &t[i];
-        if (!c->nf) { tobj_free(c); continue; }
+        if (!c->nf && c->o.kind == OK_MESH) { tobj_free(c); continue; }
         int taken = name_used(c->o.name);
         Obj *o = obj_new(c->o.name);
         char nm[32];
+        unsigned id = o->id;
         memcpy(nm, o->name, 32);
         *o = c->o;
         memcpy(o->name, taken ? nm : c->o.name, 32);   /* keep the saved name unless it is in use */
+        o->id = id;   /* fresh ids: the file's are mapped over below */
+        if (c->o.id) { fromId[nmap] = c->o.id; toId[nmap++] = id; }
         o->m = mesh_from_arrays(c->nv, c->p, c->c, c->nf, c->fo, c->fi);
         if (c->ne) mesh_set_eh(&o->m, c->eh, c->ne);
+        if (c->nsj && c->ww && o->m.nv == c->wv) {
+            mesh_skin_alloc(&o->m, c->nsj);
+            memcpy(o->m.sj, c->sj, c->nsj * sizeof(unsigned));
+            memcpy(o->m.ibm, c->ibm, c->nsj * 16 * sizeof(float));
+            memcpy(o->m.ww, c->ww, c->wv * 4 * sizeof(float));
+            memcpy(o->m.wj, c->wj, c->wv * 4);
+        }
         o->sel = o->hil = 0;
         o->order = ++stamp;
         tobj_free(c);
         n++;
     }
+#define MAPID(x) do { unsigned m_ = 0; for (int q = 0; q < nmap; q++) if (fromId[q] == (x)) m_ = toId[q]; (x) = m_; } while (0)
+    for (int i = n0; i < nob; i++) {
+        MAPID(ob[i].parent);
+        MAPID(ob[i].ikA); MAPID(ob[i].ikB); MAPID(ob[i].ikC);
+        for (int k = 0; k < ob[i].m.nsj; k++) MAPID(ob[i].m.sj[k]);
+    }
+    if (la.n) {
+        /* clips: opening replaces them; importing adds the keys to clips of the same name */
+        for (int a = 0; a < la.n; a++)
+            for (int k = 0; k < la.c[a].nt; k++) MAPID(la.c[a].t[k].obj);
+        if (camera) {
+            anim_free(&anim);
+            anim = la;
+            anim.cur = lcur >= 0 && lcur < anim.n ? lcur : 0;
+            curFrame = lframe;
+            memset(&la, 0, sizeof la);
+        } else {
+            for (int a = 0; a < la.n; a++) {
+                int d = -1;
+                for (int b = 0; b < anim.n; b++) if (!strcmp(anim.c[b].name, la.c[a].name)) d = b;
+                if (d < 0) d = anim_add_clip(&anim, la.c[a].name, la.c[a].start, la.c[a].end);
+                for (int k = 0; k < la.c[a].nt; k++) {
+                    Track *s2 = &la.c[a].t[k], *dt = s2->obj ? clip_track(&anim.c[d], s2->obj, 1) : NULL;
+                    for (int q = 0; dt && q < s2->n; q++) track_set(dt, s2->k[q].f, s2->k[q].t, s2->k[q].r, s2->k[q].s, s2->k[q].ease);
+                }
+            }
+        }
+    }
+#undef MAPID
+    if (camera && !anim.n) anim_init(&anim);
+    if (camera && !la.n && oldClips) { anim_free(&anim); anim_init(&anim); curFrame = 0; }
+    anim_free(&la);
+    (void)oldClips;
+    free(fromId);
+    free(toId);
     free(t);
     if (bad & 2) msg("Some image plane pictures could not be found");
     return n;
@@ -6205,6 +6359,7 @@ static void do_cmd(int id)
     case CM_PASTEKEY: cmd_paste_pose(); break;
     case CM_EASESMOOTH: case CM_EASELINEAR: case CM_EASESTEP: cmd_ease(id - CM_EASESMOOTH); break;
     case CM_EXPORTGLB: cmd_export_glb(); break;
+    case CM_OUTLINER: panelTab = !panelTab; if (!panelOn) do_cmd(CM_PANEL); panel_build(); break;
     case CM_SHOWJOINTS: showJoints = !showJoints; msg(showJoints ? "Showing joints" : "Joints hidden (Display > Joints shows them)"); break;
     case CM_UISMALLER: ui_step(0); break;
     case CM_COMPTOG: set_mode(mode == M_OBJ ? lastComp : M_OBJ); break;
@@ -6330,7 +6485,7 @@ enum { RK_HEAD = 1, RK_FLOAT, RK_INT, RK_BOOL, RK_COLOR, RK_BUTTON, RK_NAME, RK_
 #define NROW 96
 typedef struct { int kind, id; char label[40]; const char *opts; int y, h; } Row;   /* opts: "Off|X|Y|Z" for RK_SEG */
 static Row rows[NROW];
-static int nrows, panelObj = -1, building, pScroll, pContent;
+static int nrows, panelObj = -1, building, pScroll, pContent, pTop;
 static HWND rLab[NROW], rEdit[NROW], rChk[NROW], rDec[NROW], rInc[NROW], rSeg[NROW], hSwatch, hApply;
 static WNDPROC editProc0;
 static char collapsed[24][40];   /* headers whose section is folded away */
@@ -6508,7 +6663,7 @@ static void panel_rows(void)
     panelObj = o ? (int)(o - ob) : -1;
     if (o) {
         add_row(RK_NAME, 0, "Name");
-        for (int i = 0; i < 9; i++) add_row(RK_FLOAT, PF_TX + i, trs[i]);
+        for (int i = 0; i < 9 && !skinned(o); i++) add_row(RK_FLOAT, PF_TX + i, trs[i]);
         if (o->kind == OK_MESH) add_row(RK_FLOAT, PF_NANGLE, "Normal Angle");
         if (o->kind == OK_JOINT) {
             add_row(RK_HEAD, 0, "Joint");
@@ -6651,7 +6806,13 @@ static void panel_build(void)
     RECT rc;
     GetClientRect(hPanel, &rc);
     int W = rc.right, rh = (int)(25 * ds), pad = (int)(8 * ds), lw = (int)(88 * ds), sb = (int)(5 * ds);
-    int ew = W - lw - 2 * pad - sb, bw = (int)(19 * ds);
+    int ew = W - lw - 2 * pad - sb, bw = (int)(19 * ds), tabH = (int)(32 * ds);
+    if (hOutl) {
+        MoveWindow(hOutl, 0, tabH, W, rc.bottom - tabH, TRUE);
+        ShowWindow(hOutl, panelTab ? SW_SHOW : SW_HIDE);
+        if (panelTab) InvalidateRect(hOutl, NULL, FALSE);
+    }
+    if (panelTab) nrows = 0;   /* the outliner shows instead of the rows */
     /* lay the rows out top to bottom, then scroll */
     int y = pad / 2, fold = 0;
     for (int r = 0; r < nrows; r++) {
@@ -6663,13 +6824,14 @@ static void panel_build(void)
         y += rows[r].h + (k == RK_HEAD ? (int)(3 * ds) : 0);
     }
     pContent = y + pad;
-    if (pScroll > pContent - rc.bottom) pScroll = pContent - rc.bottom;
+    pTop = tabH;   /* rows start under the tabs */
+    if (pScroll > pContent - (rc.bottom - tabH)) pScroll = pContent - (rc.bottom - tabH);
     if (pScroll < 0) pScroll = 0;
     HWND swatchShown = NULL, applyShown = NULL;
 #define PLACE(hw, x, yy, w, h, show) SetWindowPos(hw, NULL, x, yy, w, h, SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOREDRAW | ((show) ? SWP_SHOWWINDOW : SWP_HIDEWINDOW))
     for (int r = 0; r < NROW; r++) {
         int k = r < nrows && (rows[r].h || rows[r].kind == RK_HEAD) ? rows[r].kind : 0;
-        int yy = r < nrows ? rows[r].y - pScroll : 0, h = r < nrows ? rows[r].h : 0;
+        int yy = r < nrows ? rows[r].y + pTop - pScroll : 0, h = r < nrows ? rows[r].h : 0;
         int lab = k == RK_HEAD || k == RK_FLOAT || k == RK_INT || k == RK_COLOR || k == RK_TIP || k == RK_SEG || k == RK_TEXT;
         if (lab) {
             int wide = k == RK_HEAD || k == RK_TIP, ind = k == RK_HEAD ? (int)(16 * ds) : 0;
@@ -6791,7 +6953,7 @@ static void panel_set(int r, double v)
         if (id <= PF_SZ) {
             /* channel edits apply to every selected object */
             for (int i = 0; i < nob; i++)
-                if (active(&ob[i]) || i == panelObj) (&ob[i].t.x)[id - PF_TX] = (float)v;
+                if ((active(&ob[i]) || i == panelObj) && !skinned(&ob[i])) (&ob[i].t.x)[id - PF_TX] = (float)v;
             return;
         }
         if (id == PF_NANGLE) {
@@ -7063,6 +7225,13 @@ static LRESULT CALLBACK PanelProc(HWND h, UINT m, WPARAM wp, LPARAM lp)
     }
     case WM_LBUTTONDOWN: {
         int x = (short)LOWORD(lp), y = (short)HIWORD(lp), r = scrub_row(x, y);
+        if (y < pTop) {   /* a tab */
+            RECT cl;
+            GetClientRect(h, &cl);
+            int t = x < cl.right / 2 ? 0 : 1;
+            if (t != panelTab) { panelTab = t; panel_build(); InvalidateRect(h, NULL, TRUE); }
+            return 0;
+        }
         int hr = r < 0 ? row_at(x, y, 1) : -1;
         if (hr >= 0) { sec_toggle(rows[hr].label); panel_build(); return 0; }   /* fold / unfold a section */
         if (r < 0 || !panel_get(r, &scrub.v0)) return 0;
@@ -7087,8 +7256,9 @@ static LRESULT CALLBACK PanelProc(HWND h, UINT m, WPARAM wp, LPARAM lp)
         RECT rc;
         GetClientRect(h, &rc);
         int old = pScroll;
+        if (panelTab) { SendMessage(hOutl, m, wp, lp); return 0; }
         pScroll -= (short)HIWORD(wp) * (int)(25 * ds) * 3 / 120;
-        if (pScroll > pContent - rc.bottom) pScroll = pContent - rc.bottom;
+        if (pScroll > pContent - (rc.bottom - pTop)) pScroll = pContent - (rc.bottom - pTop);
         if (pScroll < 0) pScroll = 0;
         if (pScroll != old) panel_build();
         return 0;
@@ -7108,9 +7278,9 @@ static LRESULT CALLBACK PanelProc(HWND h, UINT m, WPARAM wp, LPARAM lp)
         COLORREF acc = th.sys ? GetSysColor(COLOR_HIGHLIGHT) : th.head;
         int pad = (int)(8 * ds), sb = (int)(5 * ds);
         for (int r = 0; r < nrows; r++) {
-            if (rows[r].kind != RK_HEAD) continue;
+            if (rows[r].kind != RK_HEAD || rows[r].y + pTop - pScroll < pTop - rows[r].h) continue;
             /* section band with a fold arrow */
-            RECT b = { pad / 2, rows[r].y - pScroll, cl.right - sb - pad / 2, rows[r].y - pScroll + rows[r].h };
+            RECT b = { pad / 2, rows[r].y + pTop - pScroll, cl.right - sb - pad / 2, rows[r].y + pTop - pScroll + rows[r].h };
             rrect(dc, b, (int)(6 * ds), th.hot, th.hot);
             HBRUSH ab = CreateSolidBrush(acc);
             HPEN ap = CreatePen(PS_SOLID, 1, acc);
@@ -7134,7 +7304,21 @@ static LRESULT CALLBACK PanelProc(HWND h, UINT m, WPARAM wp, LPARAM lp)
             InflateRect(&rc, (int)(2 * ds), (int)(2 * ds));
             rrect(dc, rc, (int)(5 * ds), th.field, GetFocus() == c ? acc : th.line);   /* the field being typed in */
         }
-        if (pContent > cl.bottom) {
+        {
+            /* the tabs: Attributes | Outliner */
+            static const char *tn[2] = { "Attributes", "Outliner" };
+            RECT bg = { 0, 0, cl.right, pTop };
+            FillRect(dc, &bg, brUi);
+            SetBkMode(dc, TRANSPARENT);
+            for (int t = 0; t < 2; t++) {
+                RECT r = { (int)(4 * ds) + t * (cl.right - (int)(8 * ds)) / 2, (int)(4 * ds), (int)(4 * ds) + (t + 1) * (cl.right - (int)(8 * ds)) / 2 - 2, pTop - (int)(4 * ds) };
+                rrect(dc, r, (int)(6 * ds), t == panelTab ? lerpc(th.ui, acc, .3f) : th.ui, t == panelTab ? acc : th.line);
+                SelectObject(dc, t == panelTab ? hBold : hFont);
+                SetTextColor(dc, t == panelTab ? th.text : mix(th.text, th.ui));
+                DrawTextA(dc, tn[t], -1, &r, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+            }
+        }
+        if (pContent > cl.bottom && !panelTab) {
             /* a slim scroll thumb (the wheel scrolls) */
             int th_ = cl.bottom * cl.bottom / pContent, ty = (cl.bottom - th_) * pScroll / (pContent - cl.bottom);
             RECT t = { cl.right - sb, ty, cl.right - (int)(1 * ds), ty + th_ };
@@ -7188,6 +7372,12 @@ static void panel_create(HINSTANCE inst)
     wc.lpfnWndProc = SegProc;
     wc.lpszClassName = "Tuff3DSeg";
     RegisterClassExA(&wc);
+    wc.lpfnWndProc = OutlProc;
+    wc.lpszClassName = "Tuff3DOutl";
+    wc.hCursor = LoadCursor(NULL, IDC_ARROW);
+    wc.style = CS_DBLCLKS;
+    RegisterClassExA(&wc);
+    hOutl = CreateWindowA("Tuff3DOutl", "", WS_CHILD, 0, 0, 1, 1, hPanel, NULL, inst, NULL);
     for (int r = 0; r < NROW; r++) {
         rLab[r] = CreateWindowA("STATIC", "", WS_CHILD | SS_LEFTNOWORDWRAP | SS_NOPREFIX, 0, 0, 1, 1, hPanel, NULL, inst, NULL);
         rEdit[r] = CreateWindowA("EDIT", "", WS_CHILD | ES_AUTOHSCROLL, 0, 0, 1, 1, hPanel, (HMENU)(INT_PTR)(1000 + r), inst, NULL);
@@ -8519,6 +8709,236 @@ static LRESULT CALLBACK BarProc(HWND h, UINT m, WPARAM wp, LPARAM lp)
     return DefWindowProc(h, m, wp, lp);
 }
 
+/* ================================================================ outliner
+
+   The side panel's second tab: every object as a tree. Click to select (Shift toggles, Ctrl
+   removes), drag onto another item to parent it there (or onto the empty space below to unparent),
+   the eye hides / shows, the arrow folds children, double-click renames. */
+
+static int oScroll, oDragFrom = -1, oDragOver = -2, oDragging, oPressY;
+static unsigned oFold[256];
+static int nOFold;
+static int oOrd[4096], oDep[4096], oN;
+
+static int ofolded(unsigned id)
+{
+    for (int i = 0; i < nOFold; i++) if (oFold[i] == id) return 1;
+    return 0;
+}
+
+static void ofold_toggle(unsigned id)
+{
+    for (int i = 0; i < nOFold; i++) if (oFold[i] == id) { oFold[i] = oFold[--nOFold]; return; }
+    if (nOFold < 256) oFold[nOFold++] = id;
+}
+
+static int has_kids(unsigned id)
+{
+    for (int i = 0; i < nob; i++) if (ob[i].parent == id) return 1;
+    return 0;
+}
+
+static void outl_add(int i, int d)
+{
+    if (oN >= 4096) return;
+    oOrd[oN] = i;
+    oDep[oN++] = d;
+    if (ofolded(ob[i].id)) return;
+    for (int k = 0; k < nob; k++) if (ob[k].parent == ob[i].id && k != i) outl_add(k, d + 1);
+}
+
+static void outl_build(void)
+{
+    oN = 0;
+    for (int i = 0; i < nob; i++) if (!ob[i].parent || obj_index(ob[i].parent) < 0) outl_add(i, 0);
+}
+
+static int orow_h(void) { return (int)(24 * ds); }
+
+static int outl_row_at(int y)
+{
+    int r = (y + oScroll) / orow_h();
+    return r >= 0 && r < oN ? r : -1;
+}
+
+static void outl_paint(HWND h)
+{
+    PAINTSTRUCT p;
+    RECT rc;
+    HDC wdc = BeginPaint(h, &p);
+    GetClientRect(h, &rc);
+    HDC dc = CreateCompatibleDC(wdc);
+    HBITMAP bm = CreateCompatibleBitmap(wdc, rc.right, rc.bottom), old = SelectObject(dc, bm);
+    FillRect(dc, &rc, brUi);
+    SetBkMode(dc, TRANSPARENT);
+    outl_build();
+    COLORREF acc = th.sys ? GetSysColor(COLOR_HIGHLIGHT) : th.head;
+    int rh = orow_h(), ind = (int)(14 * ds), isz = (int)(18 * ds);
+    ic.fg = ARGB_OF(255, th.text);
+    ic.acc = ARGB_OF(255, acc);
+    ic.soft = ARGB_OF(255, lerpc(th.ui, acc, .3f));
+    ic.bg = ARGB_OF(255, th.ui);
+    for (int r = 0; r < oN; r++) {
+        int y = r * rh - oScroll;
+        if (y + rh < 0 || y > rc.bottom) continue;
+        Obj *o = &ob[oOrd[r]];
+        RECT row = { (int)(4 * ds), y + 1, rc.right - (int)(4 * ds), y + rh - 1 };
+        if (oDragging && r == oDragOver) rrect(dc, row, (int)(5 * ds), lerpc(th.ui, acc, .5f), acc);
+        else if (active(o)) rrect(dc, row, (int)(5 * ds), lerpc(th.ui, acc, .28f), lerpc(th.ui, acc, .6f));
+        int x = (int)(8 * ds) + oDep[r] * ind;
+        ic_begin(dc);
+        if (has_kids(o->id)) {
+            float cx = x + 5 * ds, cy = y + rh * .5f, a = 3.5f * ds;
+            ic.x = 0; ic.y = 0; ic.k = 1;
+            if (ofolded(o->id)) { float t[] = { cx - a * .6f, cy - a, cx + a, cy, cx - a * .6f, cy + a }; ic_shape(t, 3, ic.acc, 0, 0, 1, 0); }
+            else { float t[] = { cx - a, cy - a * .6f, cx + a, cy - a * .6f, cx, cy + a }; ic_shape(t, 3, ic.acc, 0, 0, 1, 0); }
+        }
+        draw_icon(o->kind == OK_JOINT ? IC_JOINT : o->kind == OK_IK ? IC_IK : skinned(o) ? IC_BIND : IC_CUBE,
+                  (float)x + 13 * ds, (float)y + (rh - isz) * .5f, (float)isz);
+        /* the eye */
+        float ex = rc.right - 18 * ds, ey = y + rh * .5f;
+        ic.x = 0; ic.y = 0; ic.k = 1;
+        ic_ell(ex, ey, 7 * ds, 4 * ds, 0, o->hidden ? ARGB_OF(110, th.text) : ic.fg, 1.2f * ds);
+        if (!o->hidden) ic_ell(ex, ey, 2 * ds, 2 * ds, ic.acc, 0, 0);
+        else ic_line(ex - 7 * ds, ey + 4 * ds, ex + 7 * ds, ey - 4 * ds, ARGB_OF(160, th.text), 1.2f * ds);
+        ic_end();
+        RECT tr = { x + (int)(35 * ds), y, rc.right - (int)(30 * ds), y + rh };
+        SelectObject(dc, active(o) ? hBold : hFont);
+        SetTextColor(dc, o->hidden ? mix(th.text, th.ui) : th.text);
+        DrawTextA(dc, o->name, -1, &tr, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
+    }
+    if (!oN) {
+        RECT tr = { (int)(10 * ds), (int)(10 * ds), rc.right - (int)(10 * ds), rc.bottom };
+        SelectObject(dc, hFont);
+        SetTextColor(dc, mix(th.text, th.ui));
+        DrawTextA(dc, "The scene is empty.", -1, &tr, DT_LEFT | DT_TOP | DT_WORDBREAK);
+    } else if (oDragging && oDragOver == -1) {
+        RECT u = { (int)(4 * ds), oN * rh - oScroll + 2, rc.right - (int)(4 * ds), oN * rh - oScroll + (int)(4 * ds) };
+        rrect(dc, u, 2, acc, acc);
+    }
+    BitBlt(wdc, 0, 0, rc.right, rc.bottom, dc, 0, 0, SRCCOPY);
+    SelectObject(dc, old);
+    DeleteObject(bm);
+    DeleteDC(dc);
+    EndPaint(h, &p);
+}
+
+static void outl_select(int i, int mod)
+{
+    if (mode == M_OBJ) {
+        if (!mod) clear_sel();
+        select_obj_flag(&ob[i], mod);
+    } else {
+        if (!mod) for (int k = 0; k < nob; k++) ob[k].hil = 0;
+        ob[i].hil = mod == 2 ? 0 : mod == 1 ? !ob[i].hil : 1;
+        ob[i].order = ++stamp;
+    }
+}
+
+static LRESULT CALLBACK OutlProc(HWND h, UINT m, WPARAM wp, LPARAM lp)
+{
+    int x = (short)LOWORD(lp), y = (short)HIWORD(lp);
+    RECT rc;
+    GetClientRect(h, &rc);
+    switch (m) {
+    case WM_PAINT: outl_paint(h); return 0;
+    case WM_ERASEBKGND: return 1;
+    case WM_LBUTTONDOWN: {
+        int r = outl_row_at(y);
+        SetFocus(h);
+        if (r < 0) { if (!key(VK_SHIFT) && !key(VK_CONTROL)) { clear_sel(); refresh_all(); } return 0; }
+        int i = oOrd[r], ix = (int)(8 * ds) + oDep[r] * (int)(14 * ds);
+        if (x > rc.right - (int)(30 * ds)) {   /* the eye */
+            ob[i].hidden = !ob[i].hidden;
+            if (ob[i].hidden) ob[i].sel = ob[i].hil = 0;
+            refresh_all();
+            return 0;
+        }
+        if (x < ix + (int)(12 * ds) && has_kids(ob[i].id)) { ofold_toggle(ob[i].id); InvalidateRect(h, NULL, FALSE); return 0; }
+        int mod = key(VK_CONTROL) && key(VK_SHIFT) ? 3 : key(VK_SHIFT) ? 1 : key(VK_CONTROL) ? 2 : 0;
+        if (!(mod == 0 && active(&ob[i]))) outl_select(i, mod);   /* a plain click on the selection may start a drag */
+        oDragFrom = i;
+        oPressY = y;
+        oDragging = 0;
+        SetCapture(h);
+        refresh_all();
+        return 0;
+    }
+    case WM_MOUSEMOVE:
+        if (oDragFrom >= 0 && GetCapture() == h) {
+            if (!oDragging && abs(y - oPressY) > 4 * ds) oDragging = 1;
+            if (oDragging) {
+                int r = outl_row_at(y);
+                oDragOver = r >= 0 ? r : y + oScroll >= oN * orow_h() ? -1 : -2;
+                InvalidateRect(h, NULL, FALSE);
+            }
+        }
+        return 0;
+    case WM_LBUTTONUP: {
+        int from = oDragFrom;
+        oDragFrom = -1;
+        if (GetCapture() == h) ReleaseCapture();
+        if (from < 0 || from >= nob) return 0;
+        if (!oDragging) {   /* a plain click on something already selected: select just it */
+            if (!key(VK_SHIFT) && !key(VK_CONTROL)) { outl_select(from, 0); refresh_all(); }
+            return 0;
+        }
+        oDragging = 0;
+        unsigned to = oDragOver >= 0 ? ob[oOrd[oDragOver]].id : 0;
+        if (oDragOver == -2) { InvalidateRect(h, NULL, FALSE); return 0; }
+        int n = 0, many = active(&ob[from]);
+        undo_push(to ? "Parent" : "Unparent");
+        for (int i = 0; i < nob; i++)
+            if (many ? active(&ob[i]) : i == from) n += reparent(i, to);
+        if (!n) { undo_drop(); msg("Can't parent it there (it would loop, or it's a bound mesh)"); }
+        else msg(to ? "Parented (drag onto the empty space below to unparent)" : "Unparented");
+        refresh_all();
+        return 0;
+    }
+    case WM_LBUTTONDBLCLK: {
+        int r = outl_row_at(y);
+        if (r < 0) return 0;
+        outl_select(oOrd[r], 0);
+        panelTab = 0;
+        refresh_all();
+        for (int k = 0; k < nrows; k++)
+            if (rows[k].kind == RK_NAME) { SetFocus(rEdit[k]); SendMessage(rEdit[k], EM_SETSEL, 0, -1); break; }
+        return 0;
+    }
+    case WM_RBUTTONUP: {
+        int r = outl_row_at(y);
+        if (r >= 0 && !active(&ob[oOrd[r]])) { outl_select(oOrd[r], 0); refresh_all(); }
+        HMENU mm = CreatePopupMenu();
+        AppendMenuA(mm, MF_STRING, CM_DUP, "&Duplicate");
+        AppendMenuA(mm, MF_STRING, CM_DELETE, "D&elete");
+        AppendMenuA(mm, MF_STRING, CM_UNPARENT, "&Unparent");
+        AppendMenuA(mm, MF_STRING, CM_SELHIER, "Select &Hierarchy");
+        AppendMenuA(mm, MF_STRING, CM_HIDE, "&Hide");
+        AppendMenuA(mm, MF_STRING, CM_SHOWALL, "&Show All");
+        AppendMenuA(mm, MF_STRING, CM_FRAMESEL, "&Frame");
+        POINT pt = { x, y };
+        ClientToScreen(h, &pt);
+        int c = TrackPopupMenu(mm, TPM_RETURNCMD, pt.x, pt.y, 0, h, NULL);
+        DestroyMenu(mm);
+        if (c) do_cmd(c);
+        return 0;
+    }
+    case WM_MOUSEWHEEL: {
+        int mx = oN * orow_h() - rc.bottom;
+        oScroll -= (short)HIWORD(wp) * orow_h() * 3 / 120;
+        if (oScroll > mx) oScroll = mx;
+        if (oScroll < 0) oScroll = 0;
+        InvalidateRect(h, NULL, FALSE);
+        return 0;
+    }
+    case WM_KEYDOWN:
+        PostMessage(hView, m, wp, lp);
+        SetFocus(hView);
+        return 0;
+    }
+    return DefWindowProc(h, m, wp, lp);
+}
+
 /* ================================================================ timeline
 
    Under the viewport: play controls, a ruler to scrub (key diamonds show the selected objects'
@@ -8916,6 +9336,7 @@ static void refresh_all(void)
 {
     rig_update();
     geo_changed();
+    if (hOutl && panelTab) InvalidateRect(hOutl, NULL, FALSE);
     if (hvObj >= nob) hvObj = -1;
     panel_build();
     status_update();
@@ -10327,6 +10748,7 @@ static HMENU build_menu(void)
     AppendMenuA(m, MF_STRING, CM_FRAMESEL, "&Frame Selected\tF");
     AppendMenuA(m, MF_STRING, CM_FRAMEALL, "Frame &All\tA");
     AppendMenuA(m, MF_STRING, CM_PANEL, "Side &Panel\tCtrl+A");
+    AppendMenuA(m, MF_STRING, CM_OUTLINER, "&Outliner (side panel tab)");
     AppendMenuA(m, MF_STRING, CM_HUD, "&Heads-Up Display (poly count)");
     AppendMenuA(m, MF_SEPARATOR, 0, NULL);
     AppendMenuA(m, MF_STRING, CM_VHOME, "&Home View\tHome");
