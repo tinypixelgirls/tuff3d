@@ -4960,7 +4960,7 @@ static int tuff_load(const char *path, int camera, int images)
     static char line[1 << 16];
     if (!fgets(line, sizeof line, f) || strncmp(line, "tuff3d scene", 12)) { fclose(f); return -1; }
     TObj *t = NULL;
-    int nt = 0, bad = 0, curClip = -1, oldClips = anim.n;
+    int nt = 0, bad = 0, curClip = -1;
     Track *curTrack = NULL;
     Anim la;   /* the file's clips; ids are remapped once the objects exist */
     memset(&la, 0, sizeof la);
@@ -5136,6 +5136,7 @@ static int tuff_load(const char *path, int camera, int images)
         MAPID(ob[i].ikA); MAPID(ob[i].ikB); MAPID(ob[i].ikC);
         for (int k = 0; k < ob[i].m.nsj; k++) MAPID(ob[i].m.sj[k]);
     }
+    int hadClips = la.n > 0;
     if (la.n) {
         /* clips: opening replaces them; importing adds the keys to clips of the same name */
         for (int a = 0; a < la.n; a++)
@@ -5159,10 +5160,8 @@ static int tuff_load(const char *path, int camera, int images)
         }
     }
 #undef MAPID
-    if (camera && !anim.n) anim_init(&anim);
-    if (camera && !la.n && oldClips) { anim_free(&anim); anim_init(&anim); curFrame = 0; }
+    if (camera && !hadClips) { anim_free(&anim); anim_init(&anim); curFrame = 0; }   /* a file from before animation */
     anim_free(&la);
-    (void)oldClips;
     free(fromId);
     free(toId);
     free(t);
